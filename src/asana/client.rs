@@ -108,6 +108,34 @@ impl AsanaClient {
         Ok(all_tasks)
     }
 
+    /// タスクにコメントを投稿
+    pub async fn post_comment(&self, task_gid: &str, text: &str) -> Result<()> {
+        let url = format!("{}/tasks/{}/stories", ASANA_API_URL, task_gid);
+
+        let body = serde_json::json!({
+            "data": {
+                "text": text
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.pat))
+            .json(&body)
+            .send()
+            .await
+            .context("Asana API request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Asana API error ({}): {}", status, body);
+        }
+
+        Ok(())
+    }
+
     pub fn project_id(&self) -> &str {
         &self.config.project_id
     }
