@@ -35,6 +35,12 @@ pub struct AsanaUser {
 #[derive(Debug, Deserialize)]
 pub struct AsanaMembership {
     pub section: Option<AsanaSection>,
+    pub project: Option<AsanaProject>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AsanaProject {
+    pub gid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +140,30 @@ impl AsanaClient {
         }
 
         Ok(())
+    }
+
+    /// 個別タスクの詳細を取得
+    pub async fn get_task(&self, task_gid: &str) -> Result<AsanaTask> {
+        let url = format!("{}/tasks/{}", ASANA_API_URL, task_gid);
+        let opt_fields = "name,due_on,assignee.name,completed,notes,memberships.section.name,memberships.project.gid";
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.pat))
+            .query(&[("opt_fields", opt_fields)])
+            .send()
+            .await
+            .context("Asana API request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Asana API error ({}): {}", status, body);
+        }
+
+        let body: AsanaResponse<AsanaTask> = resp.json().await.context("Failed to parse Asana response")?;
+        Ok(body.data)
     }
 
     pub fn project_id(&self) -> &str {

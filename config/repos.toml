@@ -1,0 +1,12 @@
+[defaults]
+slack_channel = "C09F1T4C6F3"
+repos_base_dir = "/home/ec2-user/repos"
+claude_max_plan_turns = 10
+
+[[repo]]
+key = "slack-task-runner"
+github = "your-org/slack-task-runner"
+default_branch = "main"
+
+[repo.match]
+project_gid = "1209044193035773"

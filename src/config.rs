@@ -89,6 +89,33 @@ pub fn load_asana_config() -> Result<AsanaConfig> {
     })
 }
 
+pub struct ServerConfig {
+    pub port: u16,
+    pub asana_webhook_secret: Option<String>,
+    pub repos_config_path: PathBuf,
+    pub db_path: PathBuf,
+}
+
+pub fn load_server_config(port: u16, config_dir: Option<&str>) -> Result<ServerConfig> {
+    let env = load_credentials_env();
+
+    let base = config_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config/ambient-task-agent"));
+
+    let repos_config_path = base.join("repos.toml");
+    let db_path = base.join("agent.db");
+
+    let asana_webhook_secret = env.get("ASANA_WEBHOOK_SECRET").cloned();
+
+    Ok(ServerConfig {
+        port,
+        asana_webhook_secret,
+        repos_config_path,
+        db_path,
+    })
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)

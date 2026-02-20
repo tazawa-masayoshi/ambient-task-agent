@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-CACHE_DIR="$HOME/.config/ambient-task-agent"
+CACHE_DIR="$HOME/.config/wez-sidebar"
 LOG_FILE="$CACHE_DIR/sync.log"
 AGENT_BIN="$PROJECT_DIR/target/release/ambient-task-agent"
 
