@@ -166,11 +166,4 @@ impl AsanaClient {
         Ok(body.data)
     }
 
-    pub fn project_id(&self) -> &str {
-        &self.config.project_id
-    }
-
-    pub fn user_name(&self) -> &str {
-        &self.config.user_name
-    }
 }

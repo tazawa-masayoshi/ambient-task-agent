@@ -44,11 +44,6 @@ impl SlackClient {
         self.send_message(channel, text, Some(thread_ts)).await
     }
 
-    /// Post a message to the test channel.
-    pub async fn post_test(&self, text: &str) -> Result<String> {
-        self.post_message(&self.config.test_channel, text).await
-    }
-
     async fn send_message(
         &self,
         channel: &str,

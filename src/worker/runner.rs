@@ -81,7 +81,6 @@ impl Worker {
                 asana_project_id: self.asana_project_id.clone(),
                 asana_user_name: self.asana_user_name.clone(),
                 google_calendar: self.google_calendar.take(),
-                default_slack_channel: self.default_slack_channel.clone(),
             };
 
             if let Err(e) = scheduler::check_and_run(&mut ctx).await {

@@ -355,7 +355,7 @@ fn cmd_current() -> Result<()> {
 async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let server_config = load_server_config(port, config_dir)?;
+    let server_config = load_server_config(config_dir)?;
     let slack_config = load_slack_config()?;
     let asana_config = load_asana_config()?;
 

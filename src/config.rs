@@ -125,13 +125,12 @@ pub fn load_google_calendar_config() -> Option<GoogleCalendarConfig> {
 }
 
 pub struct ServerConfig {
-    pub port: u16,
     pub asana_webhook_secret: Option<String>,
     pub repos_config_path: PathBuf,
     pub db_path: PathBuf,
 }
 
-pub fn load_server_config(port: u16, config_dir: Option<&str>) -> Result<ServerConfig> {
+pub fn load_server_config(config_dir: Option<&str>) -> Result<ServerConfig> {
     let env = load_credentials_env();
 
     let base = config_dir
@@ -144,7 +143,6 @@ pub fn load_server_config(port: u16, config_dir: Option<&str>) -> Result<ServerC
     let asana_webhook_secret = env.get("ASANA_WEBHOOK_SECRET").cloned();
 
     Ok(ServerConfig {
-        port,
         asana_webhook_secret,
         repos_config_path,
         db_path,

@@ -10,6 +10,7 @@ pub struct Db {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CodingTask {
     pub id: i64,
     pub asana_task_gid: String,
@@ -29,6 +30,7 @@ pub struct CodingTask {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScheduledJob {
     pub id: i64,
     pub job_key: String,

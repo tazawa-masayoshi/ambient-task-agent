@@ -17,7 +17,6 @@ pub struct SchedulerContext {
     pub asana_project_id: String,
     pub asana_user_name: String,
     pub google_calendar: Option<GoogleCalendarClient>,
-    pub default_slack_channel: String,
 }
 
 /// repos.toml のスケジュール設定を DB に反映（起動時に呼ぶ）

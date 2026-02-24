@@ -25,6 +25,7 @@ fn default_max_plan_turns() -> u32 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct RepoEntry {
     pub key: String,
     pub github: String,
@@ -39,12 +40,14 @@ fn default_branch() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct MatchRule {
     pub project_gid: Option<String>,
     pub section_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ScheduleEntry {
     pub key: String,
     pub cron: String,
