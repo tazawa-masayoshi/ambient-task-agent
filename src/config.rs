@@ -89,6 +89,37 @@ pub fn load_asana_config() -> Result<AsanaConfig> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct GoogleCalendarConfig {
+    pub service_account_key_path: String,
+    pub calendar_id: String,
+}
+
+pub fn load_google_calendar_config() -> Option<GoogleCalendarConfig> {
+    let env = load_credentials_env();
+
+    let key_path = env
+        .get("GOOGLE_SERVICE_ACCOUNT_KEY")
+        .cloned()
+        .unwrap_or_else(|| {
+            home_dir()
+                .join(".credentials/Masayoshi.json")
+                .to_string_lossy()
+                .to_string()
+        });
+
+    if !std::path::Path::new(&key_path).exists() {
+        return None;
+    }
+
+    let calendar_id = env.get("GOOGLE_CALENDAR_ID").cloned()?;
+
+    Some(GoogleCalendarConfig {
+        service_account_key_path: key_path,
+        calendar_id,
+    })
+}
+
 pub struct ServerConfig {
     pub port: u16,
     pub asana_webhook_secret: Option<String>,

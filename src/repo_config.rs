@@ -7,6 +7,8 @@ pub struct ReposConfig {
     pub defaults: Defaults,
     #[serde(default)]
     pub repo: Vec<RepoEntry>,
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -15,6 +17,7 @@ pub struct Defaults {
     pub repos_base_dir: String,
     #[serde(default = "default_max_plan_turns")]
     pub claude_max_plan_turns: u32,
+    pub google_calendar_id: Option<String>,
 }
 
 fn default_max_plan_turns() -> u32 {
@@ -39,6 +42,22 @@ fn default_branch() -> String {
 pub struct MatchRule {
     pub project_gid: Option<String>,
     pub section_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScheduleEntry {
+    pub key: String,
+    pub cron: String,
+    pub job_type: String,
+    #[serde(default)]
+    pub prompt: String,
+    pub slack_channel: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl ReposConfig {

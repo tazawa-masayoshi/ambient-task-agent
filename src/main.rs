@@ -1,6 +1,7 @@
 mod asana;
 mod config;
 mod db;
+mod google;
 mod hook;
 mod repo_config;
 mod server;
@@ -12,11 +13,10 @@ mod worker;
 use anyhow::Result;
 use chrono::Local;
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::config::{load_asana_config, load_server_config, load_slack_config};
+use crate::config::{load_asana_config, load_google_calendar_config, load_server_config, load_slack_config};
 use crate::hook::CurrentTask;
 use crate::slack::client::SlackClient;
 use crate::sync::{cache_path, load_cache, CachedTask};
@@ -375,12 +375,37 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_user_name: asana_config.user_name.clone(),
     };
 
+    // Google Calendar クライアント初期化
+    let gcal_client = load_google_calendar_config().and_then(|gcal_config| {
+        let calendar_id = repos_config
+            .defaults
+            .google_calendar_id
+            .as_deref()
+            .unwrap_or(&gcal_config.calendar_id);
+        match google::calendar::GoogleCalendarClient::new(
+            &gcal_config.service_account_key_path,
+            calendar_id,
+        ) {
+            Ok(c) => {
+                tracing::info!("Google Calendar client initialized (calendar: {})", calendar_id);
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!("Google Calendar not available: {}", e);
+                None
+            }
+        }
+    });
+
     // ワーカーを別タスクで起動
     let worker = worker::runner::Worker::new(
         db,
         repos_config,
         slack_client,
-        asana_config.pat,
+        asana_config.pat.clone(),
+        asana_config.project_id.clone(),
+        asana_config.user_name.clone(),
+        gcal_client,
         default_channel,
     );
     tokio::spawn(async move {

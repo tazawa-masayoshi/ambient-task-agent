@@ -10,3 +10,32 @@ default_branch = "main"
 
 [repo.match]
 project_gid = "1209044193035773"
+
+# ── スケジュールジョブ ──────────────────────
+# cron 式: "sec min hour day_of_month month day_of_week year"
+
+[[schedule]]
+key = "morning_briefing"
+cron = "0 0 9 * * Mon-Fri *"    # 平日 9:00
+job_type = "morning_briefing"
+prompt = """\
+あなたはAI Scrum Masterです。Asanaタスクとカレンダーを分析し、
+今日やるべきことを提案してください。期限超過→本日期限→MTG準備→優先度順。
+簡潔にSlack mrkdwnで日本語出力。"""
+
+[[schedule]]
+key = "evening_summary"
+cron = "0 0 18 * * Mon-Fri *"   # 平日 18:00
+job_type = "evening_summary"
+prompt = """\
+あなたはAI Scrum Masterです。本日の振り返りをまとめてください。
+- 今日完了したタスク
+- 進行中の作業
+- 明日に持ち越すべきタスクと推奨アクション
+簡潔にSlack mrkdwnで日本語出力。"""
+
+[[schedule]]
+key = "meeting_reminder"
+cron = "0 */5 8-20 * * Mon-Fri *"   # 平日 8-20時、5分間隔
+job_type = "meeting_reminder"
+prompt = ""
