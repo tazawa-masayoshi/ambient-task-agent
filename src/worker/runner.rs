@@ -101,21 +101,31 @@ impl Worker {
             .as_deref()
             .unwrap_or(&self.default_slack_channel);
 
-        // Step 1: Slack 親メッセージ送信
-        let parent_msg = format!(
-            ":inbox_tray: タスクを受信しました\n*{}*\nhttps://app.asana.com/0/0/{}",
-            task.asana_task_name, task.asana_task_gid
-        );
-        let thread_ts = match self.slack.post_message(channel, &parent_msg).await {
-            Ok(ts) => {
-                self.db.update_slack_thread(task.id, channel, &ts)?;
-                ts
-            }
-            Err(e) => {
-                tracing::error!("Failed to post Slack message: {}", e);
-                self.db
-                    .set_error(task.id, &format!("Slack post failed: {}", e))?;
-                return Err(e);
+        // Step 1: Slack 親メッセージ送信（再生成時は既存スレッドを再利用）
+        let thread_ts = if let Some(ref existing_ts) = task.slack_thread_ts {
+            // 再生成: 既存スレッドに「再生成中」メッセージ
+            self.slack
+                .reply_thread(channel, existing_ts, ":arrows_counterclockwise: プラン再生成中...")
+                .await
+                .ok();
+            existing_ts.clone()
+        } else {
+            // 新規: 親メッセージ送信
+            let parent_msg = format!(
+                ":inbox_tray: タスクを受信しました\n*{}*\nhttps://app.asana.com/0/0/{}",
+                task.asana_task_name, task.asana_task_gid
+            );
+            match self.slack.post_message(channel, &parent_msg).await {
+                Ok(ts) => {
+                    self.db.update_slack_thread(task.id, channel, &ts)?;
+                    ts
+                }
+                Err(e) => {
+                    tracing::error!("Failed to post Slack message: {}", e);
+                    self.db
+                        .set_error(task.id, &format!("Slack post failed: {}", e))?;
+                    return Err(e);
+                }
             }
         };
 
@@ -177,14 +187,18 @@ impl Worker {
                 self.db.update_status(task.id, "plan_posted")?;
 
                 let plan_msg = format!(
-                    ":white_check_mark: プランが完成しました\n\n```\n{}\n```",
-                    truncate_for_slack(&plan, 3800)
+                    ":white_check_mark: プランが完成しました\n✅ 承認 / ❌ 却下 / 🔄 再生成 をスタンプで選択してください\n\n```\n{}\n```",
+                    truncate_for_slack(&plan, 3700)
                 );
-                self.slack
+                let plan_ts = self
+                    .slack
                     .reply_thread(channel, &thread_ts, &plan_msg)
                     .await?;
 
-                tracing::info!("Plan posted for task {}", task.asana_task_gid);
+                // プランメッセージの ts を保存（スタンプ操作の対象特定用）
+                self.db.update_plan_ts(task.id, &plan_ts)?;
+
+                tracing::info!("Plan posted for task {} (plan_ts: {})", task.asana_task_gid, plan_ts);
             }
             Err(e) => {
                 let err_msg = format!("Plan generation failed: {}", e);

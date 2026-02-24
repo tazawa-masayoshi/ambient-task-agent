@@ -1,4 +1,5 @@
 mod asana;
+mod claude;
 mod config;
 mod db;
 mod google;
@@ -370,6 +371,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_webhook_secret: server_config.asana_webhook_secret,
         slack_bot_token: slack_config.bot_token.clone(),
         slack_channel: default_channel.clone(),
+        slack_signing_secret: slack_config.signing_secret.clone(),
         asana_pat: asana_config.pat.clone(),
         asana_project_id: asana_config.project_id.clone(),
         asana_user_name: asana_config.user_name.clone(),

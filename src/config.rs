@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct SlackConfig {
     pub bot_token: String,
     pub test_channel: String,
+    pub signing_secret: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,11 +57,14 @@ pub fn load_slack_config() -> Result<SlackConfig> {
         .context("SLACK_TEST_CHANNEL not found in .env")?
         .clone();
 
+    let signing_secret = env.get("SLACK_SIGNING_SECRET").cloned();
+
     anyhow::ensure!(!bot_token.is_empty(), "SLACK_BOT_TOKEN is empty");
 
     Ok(SlackConfig {
         bot_token,
         test_channel,
+        signing_secret,
     })
 }
 

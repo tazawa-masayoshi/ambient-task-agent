@@ -20,6 +20,7 @@ pub struct CodingTask {
     pub plan_text: Option<String>,
     pub slack_channel: Option<String>,
     pub slack_thread_ts: Option<String>,
+    pub slack_plan_ts: Option<String>,
     pub pr_url: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
@@ -70,6 +71,7 @@ impl Db {
                 plan_text       TEXT,
                 slack_channel   TEXT,
                 slack_thread_ts TEXT,
+                slack_plan_ts   TEXT,
                 pr_url          TEXT,
                 error_message   TEXT,
                 retry_count     INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +110,32 @@ impl Db {
             );
             ",
         )?;
+
+        // v4 migration: slack_plan_ts カラム追加（既存DBへの後方互換）
+        self.add_column_if_not_exists(&conn, "coding_tasks", "slack_plan_ts", "TEXT")?;
+
+        Ok(())
+    }
+
+    fn add_column_if_not_exists(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        col_type: &str,
+    ) -> Result<()> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !columns.iter().any(|c| c == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table, column, col_type
+            ))?;
+            tracing::info!("Added column {}.{}", table, column);
+        }
         Ok(())
     }
 
@@ -123,7 +151,7 @@ impl Db {
     pub fn get_pending_task(&self) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, pr_url, error_message, retry_count, created_at, updated_at
+            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
              FROM coding_tasks WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
         )?;
         let task = stmt
@@ -138,11 +166,12 @@ impl Db {
                     plan_text: row.get(6)?,
                     slack_channel: row.get(7)?,
                     slack_thread_ts: row.get(8)?,
-                    pr_url: row.get(9)?,
-                    error_message: row.get(10)?,
-                    retry_count: row.get(11)?,
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    slack_plan_ts: row.get(9)?,
+                    pr_url: row.get(10)?,
+                    error_message: row.get(11)?,
+                    retry_count: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             })
             .ok();
@@ -192,6 +221,104 @@ impl Db {
             params![event_type, resource_gid, payload],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_plan_ts(&self, id: i64, plan_ts: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET slack_plan_ts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![plan_ts, id],
+        )?;
+        Ok(())
+    }
+
+    /// slack_thread_ts または slack_plan_ts でタスクを検索
+    pub fn find_task_by_slack_ts(&self, channel: &str, ts: &str) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
+             FROM coding_tasks
+             WHERE slack_channel = ?1 AND (slack_thread_ts = ?2 OR slack_plan_ts = ?2)
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let task = stmt
+            .query_row(params![channel, ts], |row| {
+                Ok(CodingTask {
+                    id: row.get(0)?,
+                    asana_task_gid: row.get(1)?,
+                    asana_task_name: row.get(2)?,
+                    repo_key: row.get(3)?,
+                    branch_name: row.get(4)?,
+                    status: row.get(5)?,
+                    plan_text: row.get(6)?,
+                    slack_channel: row.get(7)?,
+                    slack_thread_ts: row.get(8)?,
+                    slack_plan_ts: row.get(9)?,
+                    pr_url: row.get(10)?,
+                    error_message: row.get(11)?,
+                    retry_count: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })
+            .ok();
+        Ok(task)
+    }
+
+    /// 再生成用: status=pending, plan_text=NULL, slack_plan_ts=NULL にリセット
+    pub fn reset_for_regeneration(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET status = 'pending', plan_text = NULL, slack_plan_ts = NULL, error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// slack_thread_ts でタスクを検索（スレッド内メッセージ用）
+    pub fn find_task_by_thread_ts(&self, channel: &str, thread_ts: &str) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
+             FROM coding_tasks
+             WHERE slack_channel = ?1 AND slack_thread_ts = ?2
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let task = stmt
+            .query_row(params![channel, thread_ts], |row| {
+                Ok(CodingTask {
+                    id: row.get(0)?,
+                    asana_task_gid: row.get(1)?,
+                    asana_task_name: row.get(2)?,
+                    repo_key: row.get(3)?,
+                    branch_name: row.get(4)?,
+                    status: row.get(5)?,
+                    plan_text: row.get(6)?,
+                    slack_channel: row.get(7)?,
+                    slack_thread_ts: row.get(8)?,
+                    slack_plan_ts: row.get(9)?,
+                    pr_url: row.get(10)?,
+                    error_message: row.get(11)?,
+                    retry_count: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })
+            .ok();
+        Ok(task)
+    }
+
+    /// coding_tasks の集計（status ごとの件数）
+    pub fn count_tasks_by_status(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM coding_tasks GROUP BY status ORDER BY status",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     pub fn task_exists_for_gid(&self, asana_task_gid: &str) -> Result<bool> {

@@ -149,7 +149,7 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
         format!("{}\n\n{}", job.prompt_template, context_block)
     };
 
-    match run_claude_prompt(&prompt, 3).await {
+    match crate::claude::run_claude_prompt(&prompt, 3).await {
         Ok(ai_output) => {
             ctx.slack
                 .post_message(&job.slack_channel, &ai_output)
@@ -216,7 +216,7 @@ async fn run_evening_summary(job: &ScheduledJob, ctx: &mut SchedulerContext) -> 
         format!("{}\n\n{}", job.prompt_template, context_block)
     };
 
-    match run_claude_prompt(&prompt, 3).await {
+    match crate::claude::run_claude_prompt(&prompt, 3).await {
         Ok(ai_output) => {
             ctx.slack
                 .post_message(&job.slack_channel, &ai_output)
@@ -338,32 +338,6 @@ async fn fetch_today_events_safe(
         },
         None => Vec::new(),
     }
-}
-
-/// claude -p でプロンプトを実行して出力を得る
-async fn run_claude_prompt(prompt: &str, max_turns: u32) -> Result<String> {
-    use tokio::process::Command;
-
-    tracing::info!("Running claude -p for scheduled job (max_turns={})", max_turns);
-
-    let output = Command::new("claude")
-        .args([
-            "-p",
-            prompt,
-            "--max-turns",
-            &max_turns.to_string(),
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute claude -p: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude -p failed (exit {}): {}", output.status, stderr);
-    }
-
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(result)
 }
 
 fn format_tasks_for_prompt(cache: &TasksCache) -> String {
