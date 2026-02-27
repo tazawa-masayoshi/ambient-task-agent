@@ -21,6 +21,7 @@ pub struct AppState {
     pub asana_pat: String,
     pub asana_project_id: String,
     pub asana_user_name: String,
+    pub slack_workspace: Option<String>,
 }
 
 pub async fn run_server(state: AppState, port: u16) -> Result<()> {

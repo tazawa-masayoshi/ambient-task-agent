@@ -375,6 +375,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_pat: asana_config.pat.clone(),
         asana_project_id: asana_config.project_id.clone(),
         asana_user_name: asana_config.user_name.clone(),
+        slack_workspace: slack_config.workspace.clone(),
     };
 
     // Google Calendar クライアント初期化
@@ -409,6 +410,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_config.user_name.clone(),
         gcal_client,
         default_channel,
+        slack_config.workspace.clone(),
     );
     tokio::spawn(async move {
         worker.run().await;

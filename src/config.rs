@@ -8,6 +8,7 @@ pub struct SlackConfig {
     pub bot_token: String,
     pub test_channel: String,
     pub signing_secret: Option<String>,
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,7 @@ pub fn load_slack_config() -> Result<SlackConfig> {
         .clone();
 
     let signing_secret = env.get("SLACK_SIGNING_SECRET").cloned();
+    let workspace = env.get("SLACK_WORKSPACE").cloned();
 
     anyhow::ensure!(!bot_token.is_empty(), "SLACK_BOT_TOKEN is empty");
 
@@ -65,6 +67,7 @@ pub fn load_slack_config() -> Result<SlackConfig> {
         bot_token,
         test_channel,
         signing_secret,
+        workspace,
     })
 }
 

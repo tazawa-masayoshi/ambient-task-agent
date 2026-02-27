@@ -20,6 +20,7 @@ pub struct Worker {
     asana_user_name: String,
     google_calendar: Option<GoogleCalendarClient>,
     default_slack_channel: String,
+    slack_workspace: Option<String>,
 }
 
 impl Worker {
@@ -32,6 +33,7 @@ impl Worker {
         asana_user_name: String,
         google_calendar: Option<GoogleCalendarClient>,
         default_slack_channel: String,
+        slack_workspace: Option<String>,
     ) -> Self {
         Self {
             db,
@@ -42,6 +44,7 @@ impl Worker {
             asana_user_name,
             google_calendar,
             default_slack_channel,
+            slack_workspace,
         }
     }
 
@@ -117,6 +120,32 @@ impl Worker {
             match self.slack.post_message(channel, &parent_msg).await {
                 Ok(ts) => {
                     self.db.update_slack_thread(task.id, channel, &ts)?;
+
+                    // Asana タスクに Slack スレッド URL をコメント投稿
+                    if let Some(ref workspace) = self.slack_workspace {
+                        let slack_url = format!(
+                            "https://{}.slack.com/archives/{}/p{}",
+                            workspace,
+                            channel,
+                            ts.replace('.', "")
+                        );
+                        let asana_config = AsanaConfig {
+                            pat: self.asana_pat.clone(),
+                            project_id: String::new(),
+                            user_name: String::new(),
+                        };
+                        let asana_client = AsanaClient::new(asana_config);
+                        if let Err(e) = asana_client
+                            .post_comment(
+                                &task.asana_task_gid,
+                                &format!("🔗 Slack スレッド: {}", slack_url),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Failed to post Asana comment with Slack URL: {}", e);
+                        }
+                    }
+
                     ts
                 }
                 Err(e) => {

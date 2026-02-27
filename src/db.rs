@@ -323,6 +323,39 @@ impl Db {
         Ok(rows)
     }
 
+    /// asana_task_gid でアクティブなタスクを検索
+    pub fn find_task_by_gid(&self, asana_task_gid: &str) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
+             FROM coding_tasks
+             WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'archived')
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let task = stmt
+            .query_row(params![asana_task_gid], |row| {
+                Ok(CodingTask {
+                    id: row.get(0)?,
+                    asana_task_gid: row.get(1)?,
+                    asana_task_name: row.get(2)?,
+                    repo_key: row.get(3)?,
+                    branch_name: row.get(4)?,
+                    status: row.get(5)?,
+                    plan_text: row.get(6)?,
+                    slack_channel: row.get(7)?,
+                    slack_thread_ts: row.get(8)?,
+                    slack_plan_ts: row.get(9)?,
+                    pr_url: row.get(10)?,
+                    error_message: row.get(11)?,
+                    retry_count: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })
+            .ok();
+        Ok(task)
+    }
+
     pub fn task_exists_for_gid(&self, asana_task_gid: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(

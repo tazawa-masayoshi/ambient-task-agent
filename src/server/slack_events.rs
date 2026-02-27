@@ -334,12 +334,6 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         return Ok(());
     }
 
-    // スレッド返信のみ対象
-    let thread_ts = match event.get("thread_ts").and_then(|t| t.as_str()) {
-        Some(ts) => ts,
-        None => return Ok(()), // トップレベルメッセージは無視
-    };
-
     let channel = event
         .get("channel")
         .and_then(|c| c.as_str())
@@ -347,9 +341,23 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     let text = event
         .get("text")
         .and_then(|t| t.as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
+        .unwrap_or_default();
+    let message_ts = event
+        .get("ts")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    // Asana URL 自動リンク（トップレベルメッセージのみ）
+    let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
+    if thread_ts.is_none() {
+        if let Some(task_gid) = extract_asana_task_gid(text) {
+            handle_asana_url_link(state, channel, message_ts, &task_gid).await?;
+        }
+        return Ok(());
+    }
+
+    let thread_ts = thread_ts.unwrap();
+    let text_lower = text.trim().to_lowercase();
 
     // thread_ts でタスクを検索
     let task = match state.db.find_task_by_thread_ts(channel, thread_ts)? {
@@ -359,7 +367,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
 
     let slack = build_slack_client(state);
 
-    match text.as_str() {
+    match text_lower.as_str() {
         "sleep" => {
             if task.status == "sleeping" || task.status == "archived" || task.status == "completed" {
                 slack
@@ -412,6 +420,104 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     Ok(())
 }
 
+/// Asana URL からタスク GID を抽出
+/// https://app.asana.com/0/{project_id}/{task_gid} or .../f
+fn extract_asana_task_gid(text: &str) -> Option<String> {
+    // Slack はURLを <url> や <url|label> 形式で囲む場合がある
+    for segment in text.split_whitespace() {
+        let url = segment
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .split('|')
+            .next()
+            .unwrap_or("");
+        if let Some(path) = url.strip_prefix("https://app.asana.com/0/") {
+            // path = "{project_id}/{task_gid}" or "{project_id}/{task_gid}/f"
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() >= 2 && !parts[1].is_empty() && parts[1].chars().all(|c| c.is_ascii_digit()) {
+                return Some(parts[1].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Asana URL を検出してタスクと Slack スレッドを自動リンク
+async fn handle_asana_url_link(
+    state: &Arc<AppState>,
+    channel: &str,
+    message_ts: &str,
+    task_gid: &str,
+) -> Result<()> {
+    let task = match state.db.find_task_by_gid(task_gid)? {
+        Some(t) => t,
+        None => return Ok(()), // DB にないタスクは無視
+    };
+
+    // 既に Slack スレッドがリンク済みなら返信で通知
+    if task.slack_thread_ts.is_some() {
+        let slack = build_slack_client(state);
+        slack
+            .reply_thread(
+                channel,
+                message_ts,
+                &format!(
+                    ":link: このタスクは既に Slack スレッドにリンクされています（*{}*）",
+                    task.asana_task_name
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // Slack スレッド未設定 → このメッセージをスレッドとしてリンク
+    state.db.update_slack_thread(task.id, channel, message_ts)?;
+
+    let slack = build_slack_client(state);
+    slack
+        .reply_thread(
+            channel,
+            message_ts,
+            &format!(
+                ":link: タスク *{}* をこのスレッドにリンクしました\nステータス: `{}`",
+                task.asana_task_name, task.status
+            ),
+        )
+        .await?;
+
+    tracing::info!(
+        "Auto-linked task {} ({}) to Slack thread {} in {}",
+        task.asana_task_gid,
+        task.asana_task_name,
+        message_ts,
+        channel
+    );
+
+    // Asana タスクにも Slack URL をコメント（workspace 設定あり時）
+    if let Some(ref workspace) = state.slack_workspace {
+        let slack_url = format!(
+            "https://{}.slack.com/archives/{}/p{}",
+            workspace,
+            channel,
+            message_ts.replace('.', "")
+        );
+        let asana_config = crate::config::AsanaConfig {
+            pat: state.asana_pat.clone(),
+            project_id: String::new(),
+            user_name: String::new(),
+        };
+        let asana_client = crate::asana::client::AsanaClient::new(asana_config);
+        if let Err(e) = asana_client
+            .post_comment(task_gid, &format!("🔗 Slack スレッド: {}", slack_url))
+            .await
+        {
+            tracing::warn!("Failed to post Asana comment with Slack URL: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -421,6 +527,7 @@ fn build_slack_client(state: &AppState) -> SlackClient {
         bot_token: state.slack_bot_token.clone(),
         test_channel: state.slack_channel.clone(),
         signing_secret: state.slack_signing_secret.clone(),
+        workspace: state.slack_workspace.clone(),
     };
     SlackClient::new(config)
 }
