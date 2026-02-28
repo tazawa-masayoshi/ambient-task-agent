@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +10,7 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct CodingTask {
     pub id: i64,
@@ -25,6 +26,19 @@ pub struct CodingTask {
     pub pr_url: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub home_cwd: String,
+    pub tty: String,
+    pub status: String,
+    pub active_task: Option<String>,
+    pub tasks_completed: i32,
+    pub tasks_total: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -95,6 +109,18 @@ impl Db {
                 event_date  TEXT NOT NULL,
                 notified_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 UNIQUE(event_id, event_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id      TEXT PRIMARY KEY,
+                home_cwd        TEXT NOT NULL,
+                tty             TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'running',
+                active_task     TEXT,
+                tasks_completed INTEGER NOT NULL DEFAULT 0,
+                tasks_total     INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
@@ -467,5 +493,145 @@ impl Db {
             [],
         )?;
         Ok(())
+    }
+
+    // ========================================================================
+    // Sessions
+    // ========================================================================
+
+    pub fn upsert_session(&self, session: &SessionRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, home_cwd, tty, status, active_task, tasks_completed, tasks_total, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(session_id) DO UPDATE SET
+                home_cwd = excluded.home_cwd,
+                tty = CASE WHEN excluded.tty = '' THEN sessions.tty ELSE excluded.tty END,
+                status = excluded.status,
+                active_task = excluded.active_task,
+                tasks_completed = excluded.tasks_completed,
+                tasks_total = excluded.tasks_total,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            params![
+                session.session_id,
+                session.home_cwd,
+                session.tty,
+                session.status,
+                session.active_task,
+                session.tasks_completed,
+                session.tasks_total,
+                session.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, home_cwd, tty, status, active_task, tasks_completed, tasks_total, created_at, updated_at
+             FROM sessions WHERE session_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![session_id], |row| {
+                Ok(SessionRow {
+                    session_id: row.get(0)?,
+                    home_cwd: row.get(1)?,
+                    tty: row.get(2)?,
+                    status: row.get(3)?,
+                    active_task: row.get(4)?,
+                    tasks_completed: row.get(5)?,
+                    tasks_total: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .ok();
+        Ok(row)
+    }
+
+    /// stopped 以外 + 24h以内の stopped を返す
+    pub fn list_active_sessions(&self) -> Result<Vec<SessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, home_cwd, tty, status, active_task, tasks_completed, tasks_total, created_at, updated_at
+             FROM sessions
+             WHERE status != 'stopped'
+                OR updated_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SessionRow {
+                    session_id: row.get(0)?,
+                    home_cwd: row.get(1)?,
+                    tty: row.get(2)?,
+                    status: row.get(3)?,
+                    active_task: row.get(4)?,
+                    tasks_completed: row.get(5)?,
+                    tasks_total: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// 24h超の stopped セッションを削除
+    pub fn cleanup_stale_sessions(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE status = 'stopped' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
+    // ========================================================================
+    // Coding Tasks (list)
+    // ========================================================================
+
+    /// coding_tasks をフィルタ付きで一覧取得
+    pub fn list_tasks(&self, status_filter: Option<&str>) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, filter_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status_filter {
+            Some(status) => (
+                "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
+                 FROM coding_tasks WHERE status = ?1 ORDER BY updated_at DESC".to_string(),
+                vec![Box::new(status.to_string())],
+            ),
+            None => (
+                "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
+                 FROM coding_tasks ORDER BY updated_at DESC".to_string(),
+                vec![],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = filter_params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(CodingTask {
+                    id: row.get(0)?,
+                    asana_task_gid: row.get(1)?,
+                    asana_task_name: row.get(2)?,
+                    repo_key: row.get(3)?,
+                    branch_name: row.get(4)?,
+                    status: row.get(5)?,
+                    plan_text: row.get(6)?,
+                    slack_channel: row.get(7)?,
+                    slack_thread_ts: row.get(8)?,
+                    slack_plan_ts: row.get(9)?,
+                    pr_url: row.get(10)?,
+                    error_message: row.get(11)?,
+                    retry_count: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 }

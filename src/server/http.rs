@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use crate::db::Db;
 use crate::repo_config::ReposConfig;
 
-use super::{slack_webhook, webhook};
+use super::{api, hooks, slack_webhook, webhook};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +29,10 @@ pub async fn run_server(state: AppState, port: u16) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/hooks/event", post(hooks::handle_hook_event))
+        .route("/api/sessions", get(api::list_sessions))
+        .route("/api/tasks", get(api::list_tasks))
+        .route("/api/tasks/summary", get(api::tasks_summary))
         .route("/webhook/asana", post(webhook::handle_asana_webhook))
         .route("/webhook/slack", post(slack_webhook::handle_slack_webhook))
         .with_state(shared);
