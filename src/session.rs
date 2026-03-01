@@ -29,6 +29,8 @@ pub struct Session {
     pub tasks_completed: i32,
     #[serde(default)]
     pub tasks_total: i32,
+    #[serde(default)]
+    pub is_yolo: bool,
 }
 
 fn sessions_path() -> PathBuf {
@@ -84,6 +86,39 @@ pub fn get_tty_from_ancestors() -> String {
     }
 
     String::new()
+}
+
+pub fn detect_yolo_mode() -> bool {
+    let mut ppid = std::os::unix::process::parent_id() as i32;
+
+    for _ in 0..5 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &ppid.to_string()])
+            .output();
+
+        if let Ok(out) = output {
+            let args = String::from_utf8_lossy(&out.stdout);
+            if args.contains("--dangerously-skip-permissions") {
+                return true;
+            }
+        }
+
+        let output = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &ppid.to_string()])
+            .output();
+
+        if let Ok(out) = output {
+            if let Ok(new_ppid) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() {
+                ppid = new_ppid;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    false
 }
 
 pub fn find_wezterm_pane_by_tty(tty: &str) -> Option<(i32, i32)> {
@@ -188,6 +223,7 @@ pub fn update_session(
     cwd: &str,
     tty: &str,
     notification_type: Option<&str>,
+    is_yolo: bool,
 ) -> Result<String> {
     let mut store = read_session_store();
     let now_utc = Utc::now();
@@ -205,7 +241,7 @@ pub fn update_session(
         }
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s.updated_at) {
             let age = now_utc.signed_duration_since(dt.with_timezone(&Utc));
-            age < chrono::Duration::hours(24)
+            age < chrono::Duration::hours(12)
         } else {
             true
         }
@@ -242,6 +278,7 @@ pub fn update_session(
             active_task,
             tasks_completed,
             tasks_total,
+            is_yolo,
         },
     );
 

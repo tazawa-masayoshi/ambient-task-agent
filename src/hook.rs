@@ -63,6 +63,7 @@ pub async fn cmd_hook(event_name: &str) -> Result<()> {
     }
 
     let tty = session::get_tty_from_ancestors();
+    let is_yolo = session::detect_yolo_mode();
 
     let cwd = payload
         .cwd
@@ -75,6 +76,7 @@ pub async fn cmd_hook(event_name: &str) -> Result<()> {
         &cwd,
         &tty,
         payload.notification_type.as_deref(),
+        is_yolo,
     ) {
         Ok(status) => status,
         Err(e) => {
