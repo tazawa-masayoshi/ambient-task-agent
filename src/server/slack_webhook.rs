@@ -101,7 +101,7 @@ pub async fn handle_slack_webhook(
 /// Slack の署名を検証
 /// sig_basestring = "v0:{timestamp}:{body}"
 /// expected = "v0=" + hmac_sha256(secret, sig_basestring)
-fn verify_slack_signature(secret: &str, timestamp: &str, body: &[u8], expected: &str) -> bool {
+pub fn verify_slack_signature(secret: &str, timestamp: &str, body: &[u8], expected: &str) -> bool {
     // タイムスタンプが5分以上古い場合は拒否
     if let Ok(ts) = timestamp.parse::<i64>() {
         let now = chrono::Utc::now().timestamp();
@@ -120,5 +120,17 @@ fn verify_slack_signature(secret: &str, timestamp: &str, body: &[u8], expected: 
     mac.update(body);
 
     let computed = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
-    computed == expected
+    constant_time_eq(computed.as_bytes(), expected.as_bytes())
+}
+
+/// 定数時間の比較（タイミング攻撃対策）
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

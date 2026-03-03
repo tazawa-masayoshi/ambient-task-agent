@@ -9,6 +9,8 @@ use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 use crate::sync::{load_cache, TasksCache};
 
+use super::context;
+
 /// スケジューラが各ジョブ実行時に使うコンテキスト
 pub struct SchedulerContext {
     pub db: Db,
@@ -17,6 +19,8 @@ pub struct SchedulerContext {
     pub asana_project_id: String,
     pub asana_user_name: String,
     pub google_calendar: Option<GoogleCalendarClient>,
+    pub repos_base_dir: String,
+    pub stagnation_threshold_hours: i64,
 }
 
 /// repos.toml のスケジュール設定を DB に反映（起動時に呼ぶ）
@@ -91,6 +95,8 @@ async fn execute_job(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<(
         "morning_briefing" => run_morning_briefing(job, ctx).await,
         "evening_summary" => run_evening_summary(job, ctx).await,
         "meeting_reminder" => run_meeting_reminder(job, ctx).await,
+        "stagnation_check" => run_stagnation_check(job, ctx).await,
+        "weekly_pm_review" => run_weekly_pm_review(job, ctx).await,
         other => {
             tracing::warn!("Unknown job type: {}", other);
             Ok(())
@@ -135,14 +141,50 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
     let events_text = format_events_for_prompt(&events);
     let today = Local::now().format("%Y-%m-%d (%A)").to_string();
 
-    let context_block = format!(
-        "## 日付\n{}\n\n## Asanaタスク\n{}\n\n## 今日のカレンダー\n{}",
-        today, tasks_text, events_text,
-    );
+    // 作業履歴・メモ・soul/skill を注入
+    let work_context = context::read_context(&ctx.repos_base_dir);
+    let work_memory = context::read_memory(&ctx.repos_base_dir);
+    let soul = context::read_soul(&ctx.repos_base_dir);
+
+    let mut context_parts = vec![
+        format!("## 日付\n{}", today),
+        format!("## Asanaタスク\n{}", tasks_text),
+        format!("## 今日のカレンダー\n{}", events_text),
+    ];
+    if !work_context.is_empty() {
+        context_parts.push(format!("## 直近の作業履歴\n{}", work_context));
+    }
+    if !work_memory.is_empty() {
+        context_parts.push(format!("## 過去の学び・メモ\n{}", work_memory));
+    }
+
+    // 停滞タスク情報を追加
+    let threshold = ctx.stagnation_threshold_hours;
+    if let Ok(stagnant) = ctx.db.get_stagnant_tasks(threshold) {
+        if !stagnant.is_empty() {
+            let stagnant_lines: Vec<String> = stagnant
+                .iter()
+                .map(|t| format!("- #{} {} (status: {}, 最終更新: {})", t.id, t.asana_task_name, t.status, t.updated_at))
+                .collect();
+            context_parts.push(format!(
+                "## 停滞タスク（{}時間以上未更新）\n{}",
+                threshold,
+                stagnant_lines.join("\n")
+            ));
+        }
+    }
+
+    let context_block = context_parts.join("\n\n");
+
+    let base_prompt = if !soul.is_empty() {
+        soul
+    } else {
+        "あなたはAI Scrum Masterです。".to_string()
+    };
 
     let prompt = if job.prompt_template.is_empty() {
         format!(
-            "あなたはAI Scrum Masterです。以下の情報を分析し、今日やるべきことを提案してください。\n期限超過→本日期限→MTG準備→優先度順。簡潔にSlack mrkdwnで日本語出力。\n\n{context_block}"
+            "{base_prompt}\n以下の情報を分析し、今日やるべきことを提案してください。\n期限超過→本日期限→MTG準備→停滞タスク対処→優先度順。簡潔にSlack mrkdwnで日本語出力。\n\n{context_block}"
         )
     } else {
         format!("{}\n\n{}", job.prompt_template, context_block)
@@ -202,14 +244,33 @@ async fn run_evening_summary(job: &ScheduledJob, ctx: &mut SchedulerContext) -> 
     let events_text = format_events_for_prompt(&events);
     let today = Local::now().format("%Y-%m-%d (%A)").to_string();
 
-    let context_block = format!(
-        "## 日付\n{}\n\n## Asanaタスク\n{}\n\n## 今日のカレンダー\n{}",
-        today, tasks_text, events_text,
-    );
+    // 作業履歴・メモ・soul を注入
+    let work_context = context::read_context(&ctx.repos_base_dir);
+    let work_memory = context::read_memory(&ctx.repos_base_dir);
+    let soul = context::read_soul(&ctx.repos_base_dir);
+
+    let mut context_parts = vec![
+        format!("## 日付\n{}", today),
+        format!("## Asanaタスク\n{}", tasks_text),
+        format!("## 今日のカレンダー\n{}", events_text),
+    ];
+    if !work_context.is_empty() {
+        context_parts.push(format!("## 直近の作業履歴\n{}", work_context));
+    }
+    if !work_memory.is_empty() {
+        context_parts.push(format!("## 過去の学び・メモ\n{}", work_memory));
+    }
+    let context_block = context_parts.join("\n\n");
+
+    let base_prompt = if !soul.is_empty() {
+        soul
+    } else {
+        "あなたはAI Scrum Masterです。".to_string()
+    };
 
     let prompt = if job.prompt_template.is_empty() {
         format!(
-            "あなたはAI Scrum Masterです。以下の情報から本日の振り返りをまとめてください。\n完了タスク、進行中の作業、明日に持ち越すものを整理。簡潔にSlack mrkdwnで日本語出力。\n\n{context_block}"
+            "{base_prompt}\n以下の情報から本日の振り返りをまとめてください。\n完了タスク、進行中の作業、明日に持ち越すものを整理。簡潔にSlack mrkdwnで日本語出力。\n\n{context_block}"
         )
     } else {
         format!("{}\n\n{}", job.prompt_template, context_block)
@@ -505,6 +566,151 @@ fn build_morning_message(
 
     msg
 }
+
+// ============================================================================
+// Stagnation Check
+// ============================================================================
+
+async fn run_stagnation_check(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<()> {
+    let threshold = ctx.stagnation_threshold_hours;
+    let tasks = ctx.db.get_stagnant_tasks(threshold)?;
+
+    if tasks.is_empty() {
+        tracing::info!("No stagnant tasks found (threshold: {}h)", threshold);
+        return Ok(());
+    }
+
+    let tasks_text: Vec<String> = tasks
+        .iter()
+        .map(|t| {
+            format!(
+                "- #{} {} (status: {}, 最終更新: {})",
+                t.id, t.asana_task_name, t.status, t.updated_at
+            )
+        })
+        .collect();
+
+    let soul = context::read_soul(&ctx.repos_base_dir);
+    let base_prompt = if !soul.is_empty() {
+        soul
+    } else {
+        "あなたはAI Scrum Masterです。".to_string()
+    };
+
+    let prompt = format!(
+        "{}\n\n以下のタスクが{}時間以上停滞しています。各タスクについて：\n\
+         1. 考えられる停滞原因（ブロッカー、優先度不明、スコープ過大等）\n\
+         2. 推奨アクション（分割、優先度変更、キャンセル等）\n\
+         を簡潔に診断してください。Slack mrkdwnで日本語出力。\n\n{}",
+        base_prompt,
+        threshold,
+        tasks_text.join("\n")
+    );
+
+    match crate::claude::run_claude_prompt(&prompt, 3).await {
+        Ok(ai_output) => {
+            let message = format!(":warning: *停滞タスク診断* ({}時間以上未更新)\n\n{}", threshold, ai_output);
+            ctx.slack.post_message(&job.slack_channel, &message).await?;
+        }
+        Err(e) => {
+            tracing::error!("AI stagnation check failed: {}", e);
+            // フォールバック: 静的リスト投稿
+            let message = format!(
+                ":warning: *停滞タスク* ({}時間以上未更新: {}件)\n{}",
+                threshold,
+                tasks.len(),
+                tasks_text.join("\n")
+            );
+            ctx.slack.post_message(&job.slack_channel, &message).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Weekly PM Review
+// ============================================================================
+
+async fn run_weekly_pm_review(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<()> {
+    let since = (Utc::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let completed = ctx.db.count_completed_since(&since)?;
+    let active = ctx.db.get_active_tasks()?;
+    let threshold = ctx.stagnation_threshold_hours;
+    let stagnant = ctx.db.get_stagnant_tasks(threshold)?;
+
+    let active_lines: Vec<String> = active
+        .iter()
+        .take(20)
+        .map(|t| format!("- #{} {} (status: {})", t.id, t.asana_task_name, t.status))
+        .collect();
+
+    let stagnant_lines: Vec<String> = stagnant
+        .iter()
+        .map(|t| {
+            format!(
+                "- #{} {} (status: {}, 最終更新: {})",
+                t.id, t.asana_task_name, t.status, t.updated_at
+            )
+        })
+        .collect();
+
+    let soul = context::read_soul(&ctx.repos_base_dir);
+    let base_prompt = if !soul.is_empty() {
+        soul
+    } else {
+        "あなたはAI Scrum Masterです。".to_string()
+    };
+
+    let prompt = format!(
+        "{}\n\n週次プロジェクトレビューを作成してください。\n\
+         - 今週の完了タスク: {}件\n\
+         - アクティブタスク: {}件\n\
+         - 停滞タスク: {}件\n\n\
+         ## アクティブタスク\n{}\n\n\
+         ## 停滞タスク\n{}\n\n\
+         以下の観点で分析してください:\n\
+         1. 今週の成果サマリー\n\
+         2. ボトルネックと改善案\n\
+         3. 来週の優先事項提案\n\n\
+         簡潔にSlack mrkdwnで日本語出力。",
+        base_prompt,
+        completed,
+        active.len(),
+        stagnant.len(),
+        if active_lines.is_empty() { "なし".to_string() } else { active_lines.join("\n") },
+        if stagnant_lines.is_empty() { "なし".to_string() } else { stagnant_lines.join("\n") },
+    );
+
+    match crate::claude::run_claude_prompt(&prompt, 3).await {
+        Ok(ai_output) => {
+            let message = format!(":bar_chart: *週次PMレビュー*\n\n{}", ai_output);
+            ctx.slack.post_message(&job.slack_channel, &message).await?;
+        }
+        Err(e) => {
+            tracing::error!("AI weekly PM review failed: {}", e);
+            let message = format!(
+                ":bar_chart: *週次PMレビュー*\n\
+                 - 完了: {}件\n\
+                 - アクティブ: {}件\n\
+                 - 停滞: {}件\n\n\
+                 _AI分析は利用できませんでした_",
+                completed,
+                active.len(),
+                stagnant.len()
+            );
+            ctx.slack.post_message(&job.slack_channel, &message).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Fallback static messages
+// ============================================================================
 
 fn build_evening_message(cache: &TasksCache, today: &str) -> String {
     let completed_today: Vec<_> = cache.tasks.iter().filter(|t| t.completed).collect();

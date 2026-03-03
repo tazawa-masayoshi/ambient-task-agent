@@ -4,7 +4,6 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use super::http::AppState;
-use crate::slack::client::SlackClient;
 
 #[derive(Debug, Deserialize)]
 struct ReactionAddedEvent {
@@ -60,84 +59,49 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
         channel
     );
 
-    // message_ts でタスクを検索（slack_thread_ts or slack_plan_ts）
-    let task = match state.db.find_task_by_slack_ts(channel, message_ts)? {
-        Some(t) => t,
-        None => {
-            // 👍 のような汎用スタンプはタスク以外にも押される
-            if event.reaction == "+1" {
-                // タスク外のメッセージ → 「了解」返信
-                let slack = build_slack_client(state);
-                slack.reply_thread(channel, message_ts, "👍 了解！").await.ok();
-            }
-            return Ok(());
-        }
-    };
-
-    let slack = build_slack_client(state);
-    let thread_ts = task.slack_thread_ts.as_deref().unwrap_or(message_ts);
-
     match event.reaction.as_str() {
-        // ✅ 承認
-        "white_check_mark" => {
-            if task.status != "plan_posted" {
-                tracing::debug!("Task {} is not in plan_posted status, ignoring ✅", task.id);
-                return Ok(());
-            }
-            state.db.update_status(task.id, "approved")?;
-            slack
-                .reply_thread(
-                    channel,
-                    thread_ts,
-                    ":white_check_mark: プランが承認されました！",
-                )
-                .await?;
-            tracing::info!("Task {} approved via reaction", task.id);
-        }
-
-        // ❌ 却下
-        "x" => {
-            if task.status != "plan_posted" {
-                tracing::debug!("Task {} is not in plan_posted status, ignoring ❌", task.id);
-                return Ok(());
-            }
-            state.db.update_status(task.id, "rejected")?;
-            slack
-                .reply_thread(channel, thread_ts, ":x: プランが却下されました。")
-                .await?;
-            tracing::info!("Task {} rejected via reaction", task.id);
-        }
-
-        // 🔄 再生成
-        "arrows_counterclockwise" => {
-            if task.status != "plan_posted" {
+        // 🤖 自動実行（proposed → auto_approved）
+        "robot_face" => {
+            let task = match state.db.find_task_by_slack_ts(channel, message_ts)? {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            if task.status != "proposed" {
                 tracing::debug!(
-                    "Task {} is not in plan_posted status, ignoring 🔄",
-                    task.id
+                    "Task {} is not in proposed status ({}), ignoring 🤖",
+                    task.id,
+                    task.status
                 );
                 return Ok(());
             }
-            state.db.reset_for_regeneration(task.id)?;
+            state.db.update_status(task.id, "auto_approved")?;
+            let slack = state.slack_client();
+            let thread_ts = task.slack_thread_ts.as_deref().unwrap_or(message_ts);
             slack
                 .reply_thread(
                     channel,
                     thread_ts,
-                    ":arrows_counterclockwise: プランを再生成します...",
+                    ":robot_face: 自動実行モードで承認されました！実行を開始します...",
                 )
                 .await?;
-            tracing::info!("Task {} queued for regeneration via reaction", task.id);
+            tracing::info!("Task {} auto_approved via 🤖 reaction", task.id);
+            state.wake_worker();
         }
 
-        // 👍 了解
+        // 👍 了解（承認操作は Block Kit ボタンに移行済み）
         "+1" => {
-            slack
-                .reply_thread(channel, thread_ts, "👍 了解！")
-                .await?;
+            let slack = state.slack_client();
+            let task = state.db.find_task_by_slack_ts(channel, message_ts)?;
+            let thread_ts = task
+                .as_ref()
+                .and_then(|t| t.slack_thread_ts.as_deref())
+                .unwrap_or(message_ts);
+            if let Err(e) = slack.reply_thread(channel, thread_ts, "👍 了解！").await {
+                tracing::warn!("Failed to reply for +1 reaction: {}", e);
+            }
         }
 
-        _ => {
-            tracing::debug!("Unhandled reaction: {}", event.reaction);
-        }
+        _ => {}
     }
 
     Ok(())
@@ -166,7 +130,7 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
     let command = extract_command(text);
     tracing::info!("App mention command: '{}' in {}", command, channel);
 
-    let slack = build_slack_client(state);
+    let slack = state.slack_client();
 
     match command.to_lowercase().trim() {
         "sync" => {
@@ -365,7 +329,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         None => return Ok(()), // タスクスレッドでなければ無視
     };
 
-    let slack = build_slack_client(state);
+    let slack = state.slack_client();
 
     match text_lower.as_str() {
         "sleep" => {
@@ -397,11 +361,12 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                     .await?;
                 return Ok(());
             }
-            state.db.update_status(task.id, "pending")?;
+            state.db.update_status(task.id, "new")?;
             slack
                 .reply_thread(channel, thread_ts, ":sunny: タスクを再開しました")
                 .await?;
             tracing::info!("Task {} woken up via thread message", task.id);
+            state.wake_worker();
         }
 
         "archive" => {
@@ -456,7 +421,7 @@ async fn handle_asana_url_link(
 
     // 既に Slack スレッドがリンク済みなら返信で通知
     if task.slack_thread_ts.is_some() {
-        let slack = build_slack_client(state);
+        let slack = state.slack_client();
         slack
             .reply_thread(
                 channel,
@@ -473,7 +438,7 @@ async fn handle_asana_url_link(
     // Slack スレッド未設定 → このメッセージをスレッドとしてリンク
     state.db.update_slack_thread(task.id, channel, message_ts)?;
 
-    let slack = build_slack_client(state);
+    let slack = state.slack_client();
     slack
         .reply_thread(
             channel,
@@ -521,16 +486,6 @@ async fn handle_asana_url_link(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-fn build_slack_client(state: &AppState) -> SlackClient {
-    let config = crate::config::SlackConfig {
-        bot_token: state.slack_bot_token.clone(),
-        test_channel: state.slack_channel.clone(),
-        signing_secret: state.slack_signing_secret.clone(),
-        workspace: state.slack_workspace.clone(),
-    };
-    SlackClient::new(config)
-}
 
 /// メンションテキストからコマンド部分を抽出
 /// "<@U12345> sync" → "sync"

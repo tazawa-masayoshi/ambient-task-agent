@@ -44,6 +44,84 @@ impl SlackClient {
         self.send_message(channel, text, Some(thread_ts)).await
     }
 
+    /// Block Kit ブロック付きでスレッドに投稿
+    pub async fn post_blocks(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        blocks: &serde_json::Value,
+        text: &str,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "blocks": blocks,
+            "text": text,
+        });
+
+        let resp = self
+            .client
+            .post("https://slack.com/api/chat.postMessage")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Slack API request failed")?;
+
+        let status = resp.status();
+        let data: SlackResponse = resp.json().await.context("Failed to parse Slack response")?;
+
+        if !data.ok {
+            anyhow::bail!(
+                "Slack API error ({}): {}",
+                status,
+                data.error.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
+        Ok(data.ts.unwrap_or_default())
+    }
+
+    /// Block Kit メッセージを更新
+    pub async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        blocks: &serde_json::Value,
+        text: &str,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "blocks": blocks,
+            "text": text,
+        });
+
+        let resp = self
+            .client
+            .post("https://slack.com/api/chat.update")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Slack API request failed")?;
+
+        let status = resp.status();
+        let data: SlackResponse = resp.json().await.context("Failed to parse Slack response")?;
+
+        if !data.ok {
+            anyhow::bail!(
+                "Slack API error ({}): {}",
+                status,
+                data.error.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
+        Ok(())
+    }
+
     async fn send_message(
         &self,
         channel: &str,

@@ -2,6 +2,7 @@
 slack_channel = "C09F1T4C6F3"
 repos_base_dir = "/home/ec2-user/repos"
 claude_max_plan_turns = 10
+claude_max_execute_turns = 20
 
 [[repo]]
 key = "slack-task-runner"
@@ -38,4 +39,16 @@ prompt = """\
 key = "meeting_reminder"
 cron = "0 */5 8-20 * * Mon-Fri *"   # 平日 8-20時、5分間隔
 job_type = "meeting_reminder"
+prompt = ""
+
+[[schedule]]
+key = "stagnation_check"
+cron = "0 0 14 * * Mon-Fri *"       # 平日 14:00
+job_type = "stagnation_check"
+prompt = ""
+
+[[schedule]]
+key = "weekly_pm_review"
+cron = "0 0 17 * * Fri *"           # 毎週金曜 17:00
+job_type = "weekly_pm_review"
 prompt = ""

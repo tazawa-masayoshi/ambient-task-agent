@@ -16,16 +16,28 @@ pub struct CodingTask {
     pub id: i64,
     pub asana_task_gid: String,
     pub asana_task_name: String,
+    pub description: Option<String>,
     pub repo_key: Option<String>,
     pub branch_name: Option<String>,
     pub status: String,
     pub plan_text: Option<String>,
+    pub analysis_text: Option<String>,
+    pub subtasks_json: Option<String>,
     pub slack_channel: Option<String>,
     pub slack_thread_ts: Option<String>,
     pub slack_plan_ts: Option<String>,
     pub pr_url: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
+    pub summary: Option<String>,
+    pub memory_note: Option<String>,
+    pub priority_score: Option<f64>,
+    pub progress_percent: Option<i32>,
+    pub started_at_task: Option<String>,
+    pub completed_at: Option<String>,
+    pub estimated_minutes: Option<i32>,
+    pub actual_minutes: Option<i32>,
+    pub retrospective_note: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -55,6 +67,40 @@ pub struct ScheduledJob {
     pub enabled: bool,
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
+}
+
+const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, created_at, updated_at";
+
+fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
+    Ok(CodingTask {
+        id: row.get(0)?,
+        asana_task_gid: row.get(1)?,
+        asana_task_name: row.get(2)?,
+        description: row.get(3)?,
+        repo_key: row.get(4)?,
+        branch_name: row.get(5)?,
+        status: row.get(6)?,
+        plan_text: row.get(7)?,
+        analysis_text: row.get(8)?,
+        subtasks_json: row.get(9)?,
+        slack_channel: row.get(10)?,
+        slack_thread_ts: row.get(11)?,
+        slack_plan_ts: row.get(12)?,
+        pr_url: row.get(13)?,
+        error_message: row.get(14)?,
+        retry_count: row.get(15)?,
+        summary: row.get(16)?,
+        memory_note: row.get(17)?,
+        priority_score: row.get(18)?,
+        progress_percent: row.get(19)?,
+        started_at_task: row.get(20)?,
+        completed_at: row.get(21)?,
+        estimated_minutes: row.get(22)?,
+        actual_minutes: row.get(23)?,
+        retrospective_note: row.get(24)?,
+        created_at: row.get(25)?,
+        updated_at: row.get(26)?,
+    })
 }
 
 impl Db {
@@ -139,70 +185,106 @@ impl Db {
             ",
         )?;
 
-        // v4 migration: slack_plan_ts カラム追加（既存DBへの後方互換）
-        self.add_column_if_not_exists(&conn, "coding_tasks", "slack_plan_ts", "TEXT")?;
+        // v4-v8: 不足カラムを一括追加（PRAGMA table_info は1回のみ）
+        self.add_missing_columns(&conn, "coding_tasks", &[
+            ("slack_plan_ts", "TEXT"),      // v4
+            ("summary", "TEXT"),            // v5
+            ("memory_note", "TEXT"),        // v5
+            ("description", "TEXT"),        // v6
+            ("analysis_text", "TEXT"),      // v7
+            ("subtasks_json", "TEXT"),      // v7
+            ("priority_score", "REAL"),     // v8
+            ("progress_percent", "INTEGER"),// v8
+            ("started_at", "TEXT"),         // v8
+            ("completed_at", "TEXT"),       // v8
+            ("estimated_minutes", "INTEGER"),// v8
+            ("actual_minutes", "INTEGER"),  // v8
+            ("retrospective_note", "TEXT"), // v8
+        ])?;
+
+        // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
+        let legacy_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coding_tasks WHERE status IN ('pending','plan_posted','planning')",
+            [],
+            |r| r.get(0),
+        )?;
+        if legacy_count > 0 {
+            conn.execute_batch(
+                "
+                UPDATE coding_tasks SET status = 'new' WHERE status = 'pending';
+                UPDATE coding_tasks SET status = 'proposed' WHERE status = 'plan_posted';
+                UPDATE coding_tasks SET status = 'analyzing' WHERE status = 'planning';
+                ",
+            )?;
+            tracing::info!("Migrated {} legacy status values", legacy_count);
+        }
 
         Ok(())
     }
 
-    fn add_column_if_not_exists(
+    /// 不足カラムを一括追加（内部利用専用: table/col/col_type は定数のみ渡すこと）
+    fn add_missing_columns(
         &self,
         conn: &Connection,
         table: &str,
-        column: &str,
-        col_type: &str,
+        cols: &[(&str, &str)],
     ) -> Result<()> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-        let columns: Vec<String> = stmt
+        let existing: std::collections::HashSet<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(|r| r.ok())
             .collect();
-        if !columns.iter().any(|c| c == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE {} ADD COLUMN {} {}",
-                table, column, col_type
-            ))?;
-            tracing::info!("Added column {}.{}", table, column);
+        for (col, col_type) in cols {
+            if !existing.contains(*col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    table, col, col_type
+                ))?;
+                tracing::info!("Added column {}.{}", table, col);
+            }
         }
         Ok(())
     }
 
-    pub fn insert_task(&self, asana_task_gid: &str, asana_task_name: &str, repo_key: Option<&str>, slack_channel: Option<&str>) -> Result<i64> {
+    pub fn insert_task(&self, asana_task_gid: &str, asana_task_name: &str, description: Option<&str>, repo_key: Option<&str>, slack_channel: Option<&str>) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, repo_key, slack_channel) VALUES (?1, ?2, ?3, ?4)",
-            params![asana_task_gid, asana_task_name, repo_key, slack_channel],
+            "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, description, repo_key, slack_channel, status) VALUES (?1, ?2, ?3, ?4, ?5, 'new')",
+            params![asana_task_gid, asana_task_name, description, repo_key, slack_channel],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn get_pending_task(&self) -> Result<Option<CodingTask>> {
+    pub fn get_new_task(&self) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-             FROM coding_tasks WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
-        )?;
-        let task = stmt
-            .query_row([], |row| {
-                Ok(CodingTask {
-                    id: row.get(0)?,
-                    asana_task_gid: row.get(1)?,
-                    asana_task_name: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    branch_name: row.get(4)?,
-                    status: row.get(5)?,
-                    plan_text: row.get(6)?,
-                    slack_channel: row.get(7)?,
-                    slack_thread_ts: row.get(8)?,
-                    slack_plan_ts: row.get(9)?,
-                    pr_url: row.get(10)?,
-                    error_message: row.get(11)?,
-                    retry_count: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })
-            .ok();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'new' ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
+        Ok(task)
+    }
+
+    pub fn get_approved_task(&self) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'approved' ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
+        Ok(task)
+    }
+
+    pub fn get_auto_approved_task(&self) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'auto_approved' ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
         Ok(task)
     }
 
@@ -215,6 +297,25 @@ impl Db {
         Ok(())
     }
 
+    pub fn update_analysis(&self, id: i64, analysis_text: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET analysis_text = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![analysis_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_subtasks(&self, id: i64, subtasks_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET subtasks_json = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![subtasks_json, id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn update_plan(&self, id: i64, plan_text: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -242,6 +343,16 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub fn update_summary(&self, id: i64, summary: &str, memory_note: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET summary = ?1, memory_note = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+            params![summary, memory_note, id],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_webhook_event(&self, event_type: &str, resource_gid: &str, payload: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -263,41 +374,20 @@ impl Db {
     /// slack_thread_ts または slack_plan_ts でタスクを検索
     pub fn find_task_by_slack_ts(&self, channel: &str, ts: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-             FROM coding_tasks
-             WHERE slack_channel = ?1 AND (slack_thread_ts = ?2 OR slack_plan_ts = ?2)
-             ORDER BY id DESC LIMIT 1",
-        )?;
-        let task = stmt
-            .query_row(params![channel, ts], |row| {
-                Ok(CodingTask {
-                    id: row.get(0)?,
-                    asana_task_gid: row.get(1)?,
-                    asana_task_name: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    branch_name: row.get(4)?,
-                    status: row.get(5)?,
-                    plan_text: row.get(6)?,
-                    slack_channel: row.get(7)?,
-                    slack_thread_ts: row.get(8)?,
-                    slack_plan_ts: row.get(9)?,
-                    pr_url: row.get(10)?,
-                    error_message: row.get(11)?,
-                    retry_count: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })
-            .ok();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE slack_channel = ?1 AND (slack_thread_ts = ?2 OR slack_plan_ts = ?2) ORDER BY id DESC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row(params![channel, ts], row_to_task).ok();
         Ok(task)
     }
 
-    /// 再生成用: status=pending, plan_text=NULL, slack_plan_ts=NULL にリセット
+    /// 再生成用: status=new, analysis_text=NULL にリセット
     pub fn reset_for_regeneration(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE coding_tasks SET status = 'pending', plan_text = NULL, slack_plan_ts = NULL, error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            "UPDATE coding_tasks SET status = 'new', analysis_text = NULL, plan_text = NULL, subtasks_json = NULL, slack_plan_ts = NULL, error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -306,33 +396,12 @@ impl Db {
     /// slack_thread_ts でタスクを検索（スレッド内メッセージ用）
     pub fn find_task_by_thread_ts(&self, channel: &str, thread_ts: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-             FROM coding_tasks
-             WHERE slack_channel = ?1 AND slack_thread_ts = ?2
-             ORDER BY id DESC LIMIT 1",
-        )?;
-        let task = stmt
-            .query_row(params![channel, thread_ts], |row| {
-                Ok(CodingTask {
-                    id: row.get(0)?,
-                    asana_task_gid: row.get(1)?,
-                    asana_task_name: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    branch_name: row.get(4)?,
-                    status: row.get(5)?,
-                    plan_text: row.get(6)?,
-                    slack_channel: row.get(7)?,
-                    slack_thread_ts: row.get(8)?,
-                    slack_plan_ts: row.get(9)?,
-                    pr_url: row.get(10)?,
-                    error_message: row.get(11)?,
-                    retry_count: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })
-            .ok();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE slack_channel = ?1 AND slack_thread_ts = ?2 ORDER BY id DESC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row(params![channel, thread_ts], row_to_task).ok();
         Ok(task)
     }
 
@@ -352,40 +421,19 @@ impl Db {
     /// asana_task_gid でアクティブなタスクを検索
     pub fn find_task_by_gid(&self, asana_task_gid: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-             FROM coding_tasks
-             WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'archived')
-             ORDER BY id DESC LIMIT 1",
-        )?;
-        let task = stmt
-            .query_row(params![asana_task_gid], |row| {
-                Ok(CodingTask {
-                    id: row.get(0)?,
-                    asana_task_gid: row.get(1)?,
-                    asana_task_name: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    branch_name: row.get(4)?,
-                    status: row.get(5)?,
-                    plan_text: row.get(6)?,
-                    slack_channel: row.get(7)?,
-                    slack_thread_ts: row.get(8)?,
-                    slack_plan_ts: row.get(9)?,
-                    pr_url: row.get(10)?,
-                    error_message: row.get(11)?,
-                    retry_count: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })
-            .ok();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'archived', 'done') ORDER BY id DESC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row(params![asana_task_gid], row_to_task).ok();
         Ok(task)
     }
 
     pub fn task_exists_for_gid(&self, asana_task_gid: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed')",
+            "SELECT COUNT(*) FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'done')",
             params![asana_task_gid],
             |row| row.get(0),
         )?;
@@ -550,14 +598,14 @@ impl Db {
         Ok(row)
     }
 
-    /// stopped 以外 + 24h以内の stopped を返す
+    /// アクティブ + 2h以内の stopped セッションを返す
     pub fn list_active_sessions(&self) -> Result<Vec<SessionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT session_id, home_cwd, tty, status, active_task, tasks_completed, tasks_total, created_at, updated_at
              FROM sessions
              WHERE status != 'stopped'
-                OR updated_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')
+                OR updated_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours')
              ORDER BY updated_at DESC",
         )?;
         let rows = stmt
@@ -579,11 +627,11 @@ impl Db {
         Ok(rows)
     }
 
-    /// 24h超の stopped セッションを削除
+    /// 2h超の stopped セッションを削除
     pub fn cleanup_stale_sessions(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute(
-            "DELETE FROM sessions WHERE status = 'stopped' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')",
+            "DELETE FROM sessions WHERE status = 'stopped' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours')",
             [],
         )?;
         Ok(deleted)
@@ -598,40 +646,192 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let (sql, filter_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status_filter {
             Some(status) => (
-                "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-                 FROM coding_tasks WHERE status = ?1 ORDER BY updated_at DESC".to_string(),
+                format!("SELECT {} FROM coding_tasks WHERE status = ?1 ORDER BY updated_at DESC", TASK_COLUMNS),
                 vec![Box::new(status.to_string())],
             ),
             None => (
-                "SELECT id, asana_task_gid, asana_task_name, repo_key, branch_name, status, plan_text, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, created_at, updated_at
-                 FROM coding_tasks ORDER BY updated_at DESC".to_string(),
+                format!("SELECT {} FROM coding_tasks ORDER BY updated_at DESC", TASK_COLUMNS),
                 vec![],
             ),
         };
         let mut stmt = conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::types::ToSql> = filter_params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(CodingTask {
-                    id: row.get(0)?,
-                    asana_task_gid: row.get(1)?,
-                    asana_task_name: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    branch_name: row.get(4)?,
-                    status: row.get(5)?,
-                    plan_text: row.get(6)?,
-                    slack_channel: row.get(7)?,
-                    slack_thread_ts: row.get(8)?,
-                    slack_plan_ts: row.get(9)?,
-                    pr_url: row.get(10)?,
-                    error_message: row.get(11)?,
-                    retry_count: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })?
+            .query_map(params_refs.as_slice(), row_to_task)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// 指定時間以上 updated_at が更新されていないアクティブタスクを取得
+    pub fn get_stagnant_tasks(&self, threshold_hours: i64) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status IN ('ready', 'in_progress') AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{} hours') ORDER BY updated_at ASC",
+            TASK_COLUMNS, threshold_hours
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_task)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// 指定日時以降に完了したタスク数
+    pub fn count_completed_since(&self, since: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coding_tasks WHERE status = 'done' AND updated_at >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// アクティブなタスク一覧（new〜in_progress）
+    pub fn get_active_tasks(&self) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status NOT IN ('done', 'failed', 'archived') ORDER BY updated_at DESC",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_task)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    // ========================================================================
+    // PM Layer: Priority / Progress / Subtask Management
+    // ========================================================================
+
+    /// サブタスクのステータスを更新し、progress_percent を再計算
+    pub fn update_subtask_status(&self, id: i64, subtask_index: u32, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let json_str: Option<String> = conn.query_row(
+            "SELECT subtasks_json FROM coding_tasks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        let json_str = json_str.ok_or_else(|| anyhow::anyhow!("No subtasks_json for task {}", id))?;
+        let mut subtasks: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut found = false;
+        for s in subtasks.iter_mut() {
+            if s.get("index").and_then(|v| v.as_u64()) == Some(subtask_index as u64) {
+                s["status"] = serde_json::Value::String(status.to_string());
+                if status == "in_progress" && s.get("started_at").and_then(|v| v.as_str()).is_none() {
+                    s["started_at"] = serde_json::Value::String(now.clone());
+                }
+                if status == "done" {
+                    s["completed_at"] = serde_json::Value::String(now.clone());
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            anyhow::bail!("Subtask index {} not found in task {}", subtask_index, id);
+        }
+
+        let done_count = subtasks.iter().filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("done")).count();
+        let progress = if subtasks.is_empty() { 0 } else { ((done_count as f64 / subtasks.len() as f64) * 100.0).round() as i32 };
+
+        let new_json = serde_json::to_string(&subtasks)?;
+        conn.execute(
+            "UPDATE coding_tasks SET subtasks_json = ?1, progress_percent = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+            params![new_json, progress, id],
+        )?;
+        Ok(())
+    }
+
+    /// 優先度スコアを更新
+    pub fn update_priority_score(&self, id: i64, score: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET priority_score = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![score, id],
+        )?;
+        Ok(())
+    }
+
+    /// 進捗率を更新
+    pub fn update_progress(&self, id: i64, percent: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET progress_percent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![percent, id],
+        )?;
+        Ok(())
+    }
+
+    /// タスクを開始（started_at を記録、COALESCE で既存値を保持）
+    pub fn start_task(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET status = 'in_progress', started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// タスクを完了（actual_minutes を自動計算、retrospective_note を記録）
+    pub fn complete_task_with_retrospective(&self, id: i64, note: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // started_at から actual_minutes を計算
+        let started_at: Option<String> = conn.query_row(
+            "SELECT started_at FROM coding_tasks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        let actual_minutes: Option<i32> = started_at.and_then(|started| {
+            DateTime::parse_from_rfc3339(&started).ok().or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(&started, "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .ok()
+                    .map(|ndt| ndt.and_utc().fixed_offset())
+            })
+        }).map(|started| {
+            let elapsed = Utc::now().signed_duration_since(started);
+            elapsed.num_minutes() as i32
+        });
+
+        conn.execute(
+            "UPDATE coding_tasks SET status = 'done', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), actual_minutes = ?1, progress_percent = 100, retrospective_note = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+            params![actual_minutes, note, id],
+        )?;
+        Ok(())
+    }
+
+    /// 優先度スコア降順でタスクを取得
+    pub fn get_tasks_by_priority(&self) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status NOT IN ('done', 'failed', 'archived') ORDER BY COALESCE(priority_score, 0) DESC",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_task)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// ID でタスクを取得
+    pub fn get_task_by_id(&self, id: i64) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE id = ?1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row(params![id], row_to_task).ok();
+        Ok(task)
     }
 }

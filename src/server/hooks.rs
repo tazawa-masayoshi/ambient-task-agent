@@ -6,10 +6,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::asana::client::AsanaClient;
-use crate::config::{AsanaConfig, SlackConfig};
+use crate::config::AsanaConfig;
 use crate::db::SessionRow;
 use crate::session;
-use crate::slack::client::SlackClient;
 
 use super::http::AppState;
 
@@ -108,13 +107,7 @@ pub async fn handle_hook_event(
             project_name, session_suffix
         );
 
-        let slack_config = SlackConfig {
-            bot_token: state.slack_bot_token.clone(),
-            test_channel: state.slack_channel.clone(),
-            signing_secret: None,
-            workspace: None,
-        };
-        let slack = SlackClient::new(slack_config);
+        let slack = state.slack_client();
         let channel = state.slack_channel.clone();
         tokio::spawn(async move {
             if let Err(e) = slack.post_message(&channel, &message).await {

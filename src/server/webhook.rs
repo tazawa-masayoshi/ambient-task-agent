@@ -163,9 +163,11 @@ async fn enqueue_task(state: &AppState, task_gid: &str) -> anyhow::Result<()> {
     let id = state.db.insert_task(
         task_gid,
         &task.name,
+        task.notes.as_deref(),
         repo_key,
         Some(&state.slack_channel),
     )?;
+    state.wake_worker();
 
     tracing::info!(
         "Queued task: id={}, gid={}, name={}, repo={:?}",

@@ -17,11 +17,30 @@ pub struct Defaults {
     pub repos_base_dir: String,
     #[serde(default = "default_max_plan_turns")]
     pub claude_max_plan_turns: u32,
+    #[allow(dead_code)]
+    #[serde(default = "default_max_execute_turns")]
+    pub claude_max_execute_turns: u32,
+    #[serde(default = "default_heartbeat_secs")]
+    pub worker_heartbeat_secs: u64,
     pub google_calendar_id: Option<String>,
+    #[serde(default = "default_stagnation_hours")]
+    pub stagnation_threshold_hours: i64,
 }
 
 fn default_max_plan_turns() -> u32 {
     10
+}
+
+fn default_max_execute_turns() -> u32 {
+    20
+}
+
+fn default_heartbeat_secs() -> u64 {
+    60
+}
+
+fn default_stagnation_hours() -> i64 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +52,9 @@ pub struct RepoEntry {
     pub default_branch: String,
     #[serde(rename = "match")]
     pub match_rule: Option<MatchRule>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    pub max_execute_turns: Option<u32>,
 }
 
 fn default_branch() -> String {
@@ -80,6 +102,10 @@ impl ReposConfig {
                 .and_then(|m| m.project_gid.as_deref())
                 == Some(project_gid)
         })
+    }
+
+    pub fn find_repo_by_key(&self, key: &str) -> Option<&RepoEntry> {
+        self.repo.iter().find(|r| r.key == key)
     }
 
     pub fn repo_local_path(&self, repo: &RepoEntry) -> PathBuf {

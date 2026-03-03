@@ -77,6 +77,22 @@ enum Commands {
         #[arg(long)]
         config_dir: Option<String>,
     },
+    /// タスク詳細を表示
+    Task {
+        id: i64,
+        /// in_progress に遷移して作業開始（started_at 記録）
+        #[arg(long)]
+        start: bool,
+        /// done に遷移して完了記録（actual_minutes 自動計算）
+        #[arg(long)]
+        done: bool,
+        /// サブタスク N を in_progress に
+        #[arg(long)]
+        subtask_start: Option<u32>,
+        /// サブタスク N を done に
+        #[arg(long)]
+        subtask_done: Option<u32>,
+    },
 }
 
 #[tokio::main]
@@ -93,6 +109,7 @@ async fn main() -> Result<()> {
         Commands::Start { query, gid } => cmd_start(query, gid)?,
         Commands::Current => cmd_current()?,
         Commands::Serve { port, config_dir } => cmd_serve(port, config_dir.as_deref()).await?,
+        Commands::Task { id, start, done, subtask_start, subtask_done } => cmd_task(id, start, done, subtask_start, subtask_done)?,
     }
 
     Ok(())
@@ -349,6 +366,73 @@ fn cmd_current() -> Result<()> {
 }
 
 // ============================================================================
+// Task
+// ============================================================================
+
+fn cmd_task(id: i64, start: bool, done: bool, subtask_start: Option<u32>, subtask_done: Option<u32>) -> Result<()> {
+    let server_config = load_server_config(None)?;
+    let repos_config = repo_config::ReposConfig::load(&server_config.repos_config_path)?;
+    let base_dir = &repos_config.defaults.repos_base_dir;
+
+    if start {
+        let db = db::Db::open(&server_config.db_path)?;
+        db.start_task(id)?;
+        eprintln!("Task #{} を in_progress に遷移しました（started_at 記録済み）", id);
+    }
+
+    if done {
+        let db = db::Db::open(&server_config.db_path)?;
+        db.complete_task_with_retrospective(id, None)?;
+        // context.md に完了タスク情報を追記
+        if let Ok(Some(t)) = db.get_task_by_id(id) {
+            worker::context::append_completed_task(base_dir, &t);
+        }
+        eprintln!("Task #{} を done に遷移しました（actual_minutes 自動計算済み）", id);
+    }
+
+    if let Some(index) = subtask_start {
+        let db = db::Db::open(&server_config.db_path)?;
+        db.update_subtask_status(id, index, "in_progress")?;
+        eprintln!("Task #{} サブタスク #{} を in_progress に遷移しました", id, index);
+    }
+
+    if let Some(index) = subtask_done {
+        let db = db::Db::open(&server_config.db_path)?;
+        db.update_subtask_status(id, index, "done")?;
+        eprintln!("Task #{} サブタスク #{} を done に遷移しました", id, index);
+    }
+
+    match worker::task_file::read_task_file(base_dir, id) {
+        Ok(content) => {
+            println!("{}", content);
+        }
+        Err(_) => {
+            // タスクファイルがない場合、DB から直接表示
+            let db = db::Db::open(&server_config.db_path)?;
+            match db.get_task_by_id(id)? {
+                Some(task) => {
+                    println!("# Task #{}: {}", task.id, task.asana_task_name);
+                    println!("repo: {}", task.repo_key.as_deref().unwrap_or("unknown"));
+                    println!("status: {}", task.status);
+                    if let Some(ref analysis) = task.analysis_text {
+                        println!("\n## 要件\n{}", analysis);
+                    }
+                    if let Some(ref desc) = task.description {
+                        println!("\n## 説明\n{}", desc);
+                    }
+                }
+                None => {
+                    eprintln!("Task #{} が見つかりません", id);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Serve
 // ============================================================================
 
@@ -365,6 +449,8 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     let slack_client = SlackClient::new(slack_config.clone());
     let default_channel = repos_config.defaults.slack_channel.clone();
 
+    let worker_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
     let app_state = server::http::AppState {
         db: db.clone(),
         repos_config: repos_config.clone(),
@@ -376,6 +462,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_project_id: asana_config.project_id.clone(),
         asana_user_name: asana_config.user_name.clone(),
         slack_workspace: slack_config.workspace.clone(),
+        worker_notify: worker_notify.clone(),
     };
 
     // Google Calendar クライアント初期化
@@ -410,7 +497,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_config.user_name.clone(),
         gcal_client,
         default_channel,
-        slack_config.workspace.clone(),
+        worker_notify,
     );
     tokio::spawn(async move {
         worker.run().await;
