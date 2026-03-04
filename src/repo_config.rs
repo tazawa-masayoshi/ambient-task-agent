@@ -1,6 +1,16 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    Deny,
+    #[default]
+    Normal,
+    DryRun,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReposConfig {
@@ -25,6 +35,24 @@ pub struct Defaults {
     pub google_calendar_id: Option<String>,
     #[serde(default = "default_stagnation_hours")]
     pub stagnation_threshold_hours: i64,
+    #[serde(default = "default_timeout_secs")]
+    pub claude_timeout_secs: u64,
+    #[serde(default = "default_max_output_bytes")]
+    pub claude_max_output_bytes: usize,
+    #[serde(default)]
+    pub claude_exec_mode: ExecMode,
+    #[serde(default = "default_max_concurrent")]
+    pub claude_max_concurrent: usize,
+    #[serde(default = "default_allowed_env")]
+    pub claude_allowed_env: Vec<String>,
+    #[serde(default)]
+    pub module_policy: HashMap<String, ModulePolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModulePolicy {
+    pub exec_mode: Option<ExecMode>,
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_max_plan_turns() -> u32 {
@@ -43,6 +71,29 @@ fn default_stagnation_hours() -> i64 {
     24
 }
 
+fn default_timeout_secs() -> u64 {
+    600
+}
+
+fn default_max_output_bytes() -> usize {
+    100_000
+}
+
+fn default_max_concurrent() -> usize {
+    2
+}
+
+fn default_allowed_env() -> Vec<String> {
+    vec![
+        "PATH".to_string(),
+        "HOME".to_string(),
+        "USER".to_string(),
+        "SHELL".to_string(),
+        "LANG".to_string(),
+        "LC_ALL".to_string(),
+    ]
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct RepoEntry {
@@ -55,6 +106,9 @@ pub struct RepoEntry {
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     pub max_execute_turns: Option<u32>,
+    pub ops_channel: Option<String>,
+    #[serde(default)]
+    pub ops_skills: Option<Vec<String>>,
 }
 
 fn default_branch() -> String {
@@ -85,6 +139,24 @@ fn default_enabled() -> bool {
     true
 }
 
+impl Defaults {
+    /// モジュール固有ポリシーを解決して (ExecMode, timeout_secs) を返す
+    pub fn resolve_for_module(&self, module: &str) -> (ExecMode, u64) {
+        let mp = self.module_policy.get(module);
+        // global Deny は常に勝つ
+        let exec_mode = if self.claude_exec_mode == ExecMode::Deny {
+            ExecMode::Deny
+        } else {
+            mp.and_then(|p| p.exec_mode.clone())
+                .unwrap_or(self.claude_exec_mode.clone())
+        };
+        let timeout = mp
+            .and_then(|p| p.timeout_secs)
+            .unwrap_or(self.claude_timeout_secs);
+        (exec_mode, timeout)
+    }
+}
+
 impl ReposConfig {
     pub fn load(path: &PathBuf) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -102,6 +174,13 @@ impl ReposConfig {
                 .and_then(|m| m.project_gid.as_deref())
                 == Some(project_gid)
         })
+    }
+
+    /// ops_channel から対応するリポジトリを検索
+    pub fn find_repo_by_ops_channel(&self, channel: &str) -> Option<&RepoEntry> {
+        self.repo
+            .iter()
+            .find(|r| r.ops_channel.as_deref() == Some(channel))
     }
 
     pub fn find_repo_by_key(&self, key: &str) -> Option<&RepoEntry> {

@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::claude::ClaudeRunner;
 use super::http::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -215,9 +217,26 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
                 .reply_thread(channel, thread_ts, ":brain: 考え中...")
                 .await?;
 
-            match crate::claude::run_claude_prompt(other, 3).await {
-                Ok(response) => {
-                    slack.reply_thread(channel, thread_ts, &response).await?;
+            let log_dir = log_dir_from_state(state);
+            match ClaudeRunner::new("mention", other)
+                .max_turns(3)
+                .log_dir(&log_dir)
+                .with_context(&state.runner_ctx)
+                .non_blocking()
+                .run()
+                .await
+            {
+                Ok(result) if result.success => {
+                    slack.reply_thread(channel, thread_ts, &result.stdout).await?;
+                }
+                Ok(result) => {
+                    slack
+                        .reply_thread(
+                            channel,
+                            thread_ts,
+                            &format!(":x: 応答生成失敗: {}", result.stderr),
+                        )
+                        .await?;
                 }
                 Err(e) => {
                     slack
@@ -275,12 +294,25 @@ async fn generate_briefing_response(state: &Arc<AppState>) -> Result<String> {
         .collect();
 
     let prompt = format!(
-        "あなたはAI Scrum Masterです。以下のタスク情報から今日やるべきことを簡潔に提案してください。Slack mrkdwnで日本語出力。\n\n## 日付\n{}\n\n## タスク\n{}",
+        "あなたはサーバント型PMです。以下のタスク情報から今日やるべきことを簡潔に提案してください。Slack mrkdwnで日本語出力。\n\n## 日付\n{}\n\n## タスク\n{}",
         today,
         tasks_text.join("\n")
     );
 
-    crate::claude::run_claude_prompt(&prompt, 3).await
+    let log_dir = log_dir_from_state(state);
+    let result = ClaudeRunner::new("briefing", &prompt)
+        .max_turns(3)
+        .log_dir(&log_dir)
+        .with_context(&state.runner_ctx)
+        .non_blocking()
+        .run()
+        .await?;
+
+    if !result.success {
+        anyhow::bail!("briefing failed: {}", result.stderr);
+    }
+
+    Ok(result.stdout.trim().to_string())
 }
 
 // ============================================================================
@@ -311,9 +343,64 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         .and_then(|t| t.as_str())
         .unwrap_or_default();
 
-    // Asana URL 自動リンク（トップレベルメッセージのみ）
+    // トップレベルメッセージの処理
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
     if thread_ts.is_none() {
+        // ops チャンネル検知 → スキル自動実行
+        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+            let ops_skills = match &repo_entry.ops_skills {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => return Ok(()),
+            };
+
+            let slack = state.slack_client();
+            slack.reply_thread(channel, message_ts, ":gear: 処理中...").await.ok();
+
+            let files = extract_slack_files(event);
+            let repo_path = state.repos_config.repo_local_path(repo_entry);
+            let soul = crate::worker::context::read_soul(&state.repos_config.defaults.repos_base_dir);
+            let max_turns = state.repos_config.defaults.claude_max_execute_turns;
+
+            let req = crate::worker::ops::OpsRequest {
+                message_text: text.to_string(),
+                files,
+            };
+
+            let channel = channel.to_string();
+            let message_ts = message_ts.to_string();
+            let log_dir = log_dir_from_state(state);
+            let runner_ctx = state.runner_ctx.clone();
+
+            tokio::spawn(async move {
+                // ファイルダウンロード（spawn 内で実行し、イベントハンドラをブロックしない）
+                if !req.files.is_empty() {
+                    let images_dir = repo_path.join("images");
+                    for f in &req.files {
+                        let dest = images_dir.join(&f.name);
+                        if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
+                            tracing::warn!("Failed to download file {}: {}", f.name, e);
+                        }
+                    }
+                }
+
+                match crate::worker::ops::execute_ops(&req, &repo_path, &ops_skills, &soul, max_turns, Some(&log_dir), &runner_ctx).await {
+                    Ok(output) => {
+                        let truncated = crate::worker::runner::truncate_for_slack(&output, 3700);
+                        let suffix = if truncated.len() < output.len() { "\n... (truncated)" } else { "" };
+                        let msg = format!(":white_check_mark: 完了\n```\n{}{}\n```", truncated, suffix);
+                        slack.reply_thread(&channel, &message_ts, &msg).await.ok();
+                    }
+                    Err(e) => {
+                        let msg = format!(":x: 失敗: {}", e);
+                        slack.reply_thread(&channel, &message_ts, &msg).await.ok();
+                    }
+                }
+            });
+
+            return Ok(());
+        }
+
+        // Asana URL 自動リンク
         if let Some(task_gid) = extract_asana_task_gid(text) {
             handle_asana_url_link(state, channel, message_ts, &task_gid).await?;
         }
@@ -486,6 +573,34 @@ async fn handle_asana_url_link(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Slack イベントの files 配列から SlackFile を抽出
+fn extract_slack_files(event: &serde_json::Value) -> Vec<crate::worker::ops::SlackFile> {
+    event
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| {
+                    let name = f.get("name")?.as_str()?.to_string();
+                    let url = f.get("url_private_download")?.as_str()?.to_string();
+                    Some(crate::worker::ops::SlackFile {
+                        name,
+                        url_private_download: url,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// ログ出力先ディレクトリを AppState から計算
+fn log_dir_from_state(state: &Arc<AppState>) -> PathBuf {
+    PathBuf::from(&state.repos_config.defaults.repos_base_dir)
+        .join(".agent")
+        .join("logs")
+}
 
 /// メンションテキストからコマンド部分を抽出
 /// "<@U12345> sync" → "sync"

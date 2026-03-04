@@ -96,6 +96,7 @@ mod tests {
             estimated_minutes: None,
             actual_minutes: None,
             retrospective_note: None,
+            complexity: None,
             created_at: "2026-01-01T00:00:00.000Z".into(),
             updated_at: updated_at.into(),
         }

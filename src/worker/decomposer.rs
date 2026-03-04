@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tokio::process::Command;
+
+use crate::claude::ClaudeRunner;
+use crate::execution::RunnerContext;
+use super::context::WorkContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subtask {
@@ -57,60 +60,40 @@ fn build_system_prompt(soul: &str, skill: &str) -> String {
 pub async fn decompose_task(
     task_name: &str,
     analysis: &str,
-    repo_path: &Path,
-    max_turns: u32,
-    soul: &str,
-    skill: &str,
-    context: &str,
-    memory: &str,
+    wc: &WorkContext,
+    log_dir: Option<&Path>,
+    runner_ctx: &RunnerContext,
 ) -> Result<Vec<Subtask>> {
-    let system_prompt = build_system_prompt(soul, skill);
+    let system_prompt = build_system_prompt(&wc.soul, &wc.skill);
 
     let mut prompt_parts = vec![
         format!("## タスク\n{}", task_name),
         format!("## 要件定義\n{}", analysis),
     ];
 
-    if !context.is_empty() {
-        prompt_parts.push(format!("## 直近の作業履歴\n{}", context));
+    if !wc.context.is_empty() {
+        prompt_parts.push(format!("## 直近の作業履歴\n{}", wc.context));
     }
-    if !memory.is_empty() {
-        prompt_parts.push(format!("## 過去の学び・メモ\n{}", memory));
+    if !wc.memory.is_empty() {
+        prompt_parts.push(format!("## 過去の学び・メモ\n{}", wc.memory));
     }
 
     let prompt = prompt_parts.join("\n\n");
 
-    tracing::info!(
-        "Running decomposer claude -p in {} (max_turns={})",
-        repo_path.display(),
-        max_turns
-    );
+    let result = ClaudeRunner::new("decomposer", &prompt)
+        .system_prompt(&system_prompt)
+        .max_turns(wc.max_turns)
+        .cwd(&wc.repo_path)
+        .optional_log_dir(log_dir)
+        .with_context(runner_ctx)
+        .run()
+        .await?;
 
-    let output = Command::new("claude")
-        .args([
-            "-p",
-            &prompt,
-            "--system-prompt",
-            &system_prompt,
-            "--max-turns",
-            &max_turns.to_string(),
-        ])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .context("Failed to execute claude -p for decomposition")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "claude -p decomposition failed (exit {}): {}",
-            output.status,
-            stderr
-        );
+    if !result.success {
+        anyhow::bail!("claude -p decomposition failed: {}", result.error_output());
     }
 
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    parse_subtasks(&raw)
+    parse_subtasks(&result.stdout)
 }
 
 /// JSON 配列をパース（コードブロックで囲まれている場合も対応）

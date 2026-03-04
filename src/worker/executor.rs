@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
-use tokio::process::Command;
 
+use crate::claude::ClaudeRunner;
+use crate::execution::RunnerContext;
 use crate::repo_config::RepoEntry;
+use super::context::WorkContext;
 
 const DEFAULT_CODING_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep";
 const DEFAULT_GENERAL_TOOLS: &str = "Read,Bash,Glob,Grep,WebFetch,WebSearch";
@@ -53,21 +55,19 @@ pub async fn execute_task(
     plan_text: &str,
     repo_entry: Option<&RepoEntry>,
     repo_path: Option<&Path>,
-    max_turns: u32,
-    soul: &str,
-    skill: &str,
-    context: &str,
-    memory: &str,
+    wc: &WorkContext,
+    log_dir: Option<&Path>,
+    runner_ctx: &RunnerContext,
 ) -> Result<ExecutionResult> {
     let (system_prompt, allowed_tools, cwd) = if let Some(path) = repo_path {
         let tools = repo_entry
             .and_then(|r| r.allowed_tools.as_ref())
             .map(|t| t.join(","))
             .unwrap_or_else(|| DEFAULT_CODING_TOOLS.to_string());
-        (build_system_prompt(soul, skill, true), tools, Some(path))
+        (build_system_prompt(&wc.soul, &wc.skill, true), tools, Some(path))
     } else {
         (
-            build_system_prompt(soul, skill, false),
+            build_system_prompt(&wc.soul, &wc.skill, false),
             DEFAULT_GENERAL_TOOLS.to_string(),
             None,
         )
@@ -75,65 +75,45 @@ pub async fn execute_task(
 
     let mut prompt_parts = vec![format!("## タスク\n{}\n\n## 承認済みプラン\n{}", task_name, plan_text)];
 
-    if !context.is_empty() {
-        prompt_parts.push(format!("## 直近の作業履歴\n{}", context));
+    if !wc.context.is_empty() {
+        prompt_parts.push(format!("## 直近の作業履歴\n{}", wc.context));
     }
-    if !memory.is_empty() {
-        prompt_parts.push(format!("## 過去の学び・メモ\n{}", memory));
+    if !wc.memory.is_empty() {
+        prompt_parts.push(format!("## 過去の学び・メモ\n{}", wc.memory));
     }
 
     let prompt = prompt_parts.join("\n\n");
 
     let turns = repo_entry
         .and_then(|r| r.max_execute_turns)
-        .unwrap_or(max_turns);
+        .unwrap_or(wc.max_turns);
 
-    tracing::info!(
-        "Executing task: {} (max_turns={}, tools={}, cwd={:?})",
-        task_name,
-        turns,
-        allowed_tools,
-        cwd.map(|p| p.display().to_string()),
-    );
-
-    let mut cmd = Command::new("claude");
-    cmd.args([
-        "-p",
-        &prompt,
-        "--system-prompt",
-        &system_prompt,
-        "--max-turns",
-        &turns.to_string(),
-        "--allowedTools",
-        &allowed_tools,
-    ]);
+    let mut runner = ClaudeRunner::new("executor", &prompt)
+        .system_prompt(&system_prompt)
+        .max_turns(turns)
+        .allowed_tools(&allowed_tools)
+        .optional_log_dir(log_dir)
+        .with_context(runner_ctx);
 
     if let Some(path) = cwd {
-        cmd.current_dir(path);
+        runner = runner.cwd(path);
     }
 
-    let output = cmd
-        .output()
-        .await
-        .context("Failed to execute claude -p")?;
+    let result = runner.run().await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
+    if result.success {
         Ok(ExecutionResult {
             success: true,
-            output: stdout,
+            output: result.stdout,
         })
     } else {
-        tracing::warn!(
-            "claude -p exited with {}: {}",
-            output.status,
-            stderr
-        );
         Ok(ExecutionResult {
             success: false,
-            output: if stderr.is_empty() { stdout } else { format!("{}\n\nSTDERR:\n{}", stdout, stderr) },
+            output: if result.stderr.is_empty() {
+                result.stdout
+            } else {
+                format!("{}\n\nSTDERR:\n{}", result.stdout, result.stderr)
+            },
         })
     }
 }

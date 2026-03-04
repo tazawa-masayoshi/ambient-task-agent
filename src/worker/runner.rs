@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ pub struct Worker {
     google_calendar: Option<GoogleCalendarClient>,
     default_slack_channel: String,
     notify: Arc<Notify>,
+    runner_ctx: crate::execution::RunnerContext,
 }
 
 impl Worker {
@@ -37,6 +39,7 @@ impl Worker {
         google_calendar: Option<GoogleCalendarClient>,
         default_slack_channel: String,
         notify: Arc<Notify>,
+        runner_ctx: crate::execution::RunnerContext,
     ) -> Self {
         Self {
             db,
@@ -48,7 +51,15 @@ impl Worker {
             google_calendar,
             default_slack_channel,
             notify,
+            runner_ctx,
         }
+    }
+
+    /// 実行ログの出力先ディレクトリ
+    fn log_dir(&self) -> PathBuf {
+        PathBuf::from(&self.repos_config.defaults.repos_base_dir)
+            .join(".agent")
+            .join("logs")
     }
 
     /// リポジトリパスを解決（共通ヘルパー）
@@ -182,6 +193,7 @@ impl Worker {
 
     /// スケジューラージョブを実行。エラーがあれば true を返す
     async fn run_scheduler(&mut self) -> bool {
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
         let mut ctx = scheduler::SchedulerContext {
             db: self.db.clone(),
             slack: self.slack.clone(),
@@ -189,8 +201,12 @@ impl Worker {
             asana_project_id: self.asana_project_id.clone(),
             asana_user_name: self.asana_user_name.clone(),
             google_calendar: self.google_calendar.take(),
-            repos_base_dir: self.repos_config.defaults.repos_base_dir.clone(),
+            repos_base_dir: base_dir.clone(),
             stagnation_threshold_hours: self.repos_config.defaults.stagnation_threshold_hours,
+            soul: context::read_soul(base_dir),
+            skill: context::read_skill(base_dir),
+            log_dir: self.log_dir(),
+            runner_ctx: self.runner_ctx.clone(),
         };
 
         let had_error = if let Err(e) = scheduler::check_and_run(&mut ctx).await {
@@ -261,26 +277,32 @@ impl Worker {
             .ok();
 
         let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let soul = context::read_soul(base_dir);
-        let skill = context::read_skill(base_dir);
-        let work_context = context::read_context(base_dir);
-        let work_memory = context::read_memory(base_dir);
-        let max_turns = self.repos_config.defaults.claude_max_plan_turns;
+        let (work_context, work_memory) = prepare_repo_context(base_dir, &repo_path);
+        let wc = context::WorkContext {
+            repo_path: repo_path.clone(),
+            max_turns: self.repos_config.defaults.claude_max_plan_turns,
+            soul: context::read_soul(base_dir),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        };
 
+        let log_dir = self.log_dir();
         match analyzer::analyze_task(
             &task.asana_task_name,
             notes,
-            &repo_path,
-            max_turns,
-            &soul,
-            &skill,
-            &work_context,
-            &work_memory,
+            &wc,
+            Some(&log_dir),
+            &self.runner_ctx,
         )
         .await
         {
-            Ok(analysis) => {
+            Ok((analysis, complexity)) => {
                 self.db.update_analysis(task.id, &analysis)?;
+                if let Some(ref c) = complexity {
+                    self.db.update_complexity(task.id, c)?;
+                    tracing::info!("Task {} complexity: {}", task.id, c);
+                }
                 self.db.update_status(task.id, "proposed")?;
 
                 // Block Kit ボタン付きで Slack に投稿
@@ -325,6 +347,38 @@ impl Worker {
             .unwrap_or(&self.default_slack_channel);
         let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
 
+        // simple タスクは分解をスキップして直接 ready に
+        if task.complexity.as_deref() == Some("simple") {
+            tracing::info!("Task {} is simple, skipping decomposition", task.id);
+            self.db.update_status(task.id, "decomposing")?;
+
+            let auto_subtask = vec![decomposer::Subtask {
+                index: 1,
+                title: task.asana_task_name.clone(),
+                detail: task.analysis_text.clone().unwrap_or_default(),
+                depends_on: vec![],
+                estimated_minutes: task.estimated_minutes.and_then(|m| u32::try_from(m).ok()),
+                status: "pending".to_string(),
+                started_at: None,
+                completed_at: None,
+                actual_minutes: None,
+            }];
+            let json = serde_json::to_string(&auto_subtask)?;
+            self.db.update_subtasks(task.id, &json)?;
+            self.db.update_status(task.id, "ready")?;
+
+            self.slack
+                .reply_thread(
+                    channel,
+                    thread_ts,
+                    ":zap: simpleタスクのため分解をスキップしました",
+                )
+                .await
+                .ok();
+
+            return Ok(());
+        }
+
         // Step 1: status → decomposing
         self.db.update_status(task.id, "decomposing")?;
         self.slack
@@ -343,22 +397,31 @@ impl Worker {
 
         let analysis = task.analysis_text.as_deref().unwrap_or("");
         let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let soul = context::read_soul(base_dir);
-        let skill = context::read_skill(base_dir);
-        let work_context = context::read_context(base_dir);
-        let work_memory = context::read_memory(base_dir);
-        let max_turns = self.repos_config.defaults.claude_max_plan_turns;
+        let (work_context, work_memory) = prepare_repo_context(base_dir, &repo_path);
+
+        // complex タスクは max_turns を増やす
+        let plan_turns = match task.complexity.as_deref() {
+            Some("complex") => self.repos_config.defaults.claude_max_plan_turns.saturating_mul(2),
+            _ => self.repos_config.defaults.claude_max_plan_turns,
+        };
+
+        let wc = context::WorkContext {
+            repo_path: repo_path.clone(),
+            max_turns: plan_turns,
+            soul: context::read_soul(base_dir),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        };
 
         // Step 3: claude -p でサブタスク生成
+        let log_dir = self.log_dir();
         match decomposer::decompose_task(
             &task.asana_task_name,
             analysis,
-            &repo_path,
-            max_turns,
-            &soul,
-            &skill,
-            &work_context,
-            &work_memory,
+            &wc,
+            Some(&log_dir),
+            &self.runner_ctx,
         )
         .await
         {
@@ -406,6 +469,15 @@ impl Worker {
                     task.id
                 );
                 self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
+
+                // per-repo context にも記録
+                let entry = format!(
+                    "[DECOMPOSED] #{} {} ({}件のサブタスク)",
+                    task.id, task.asana_task_name, subtasks.len()
+                );
+                if let Err(e) = context::append_repo_context(&repo_path, &entry) {
+                    tracing::warn!("Failed to append to repo context: {}", e);
+                }
 
                 tracing::info!(
                     "Task {} decomposed into {} subtasks",
@@ -456,30 +528,50 @@ impl Worker {
 
         // analysis_text をプランとして使う
         let plan_text = task.analysis_text.as_deref().unwrap_or("");
-        let max_turns = self.repos_config.defaults.claude_max_execute_turns;
         let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let soul = context::read_soul(base_dir);
-        let skill = context::read_skill(base_dir);
-        let work_context = context::read_context(base_dir);
-        let work_memory = context::read_memory(base_dir);
+        let (work_context, work_memory) = if let Some(ref rp) = repo_path {
+            prepare_repo_context(base_dir, rp)
+        } else {
+            (
+                context::merged_context(base_dir, None),
+                context::merged_memory(base_dir, None),
+            )
+        };
+        // complex タスクは max_turns を増やす
+        let execute_turns = match task.complexity.as_deref() {
+            Some("complex") => self.repos_config.defaults.claude_max_execute_turns.saturating_mul(2),
+            _ => self.repos_config.defaults.claude_max_execute_turns,
+        };
+
+        let wc = context::WorkContext {
+            repo_path: repo_path.clone().unwrap_or_else(|| std::path::PathBuf::from(base_dir)),
+            max_turns: execute_turns,
+            soul: context::read_soul(base_dir),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        };
 
         // Step 3: executor 呼び出し
+        let log_dir = self.log_dir();
         let result = executor::execute_task(
             &task.asana_task_name,
             plan_text,
             repo_entry,
             repo_path.as_deref(),
-            max_turns,
-            &soul,
-            &skill,
-            &work_context,
-            &work_memory,
+            &wc,
+            Some(&log_dir),
+            &self.runner_ctx,
         )
         .await?;
 
         // Step 4: 結果を Slack に投稿
         if result.success {
             self.db.update_status(task.id, "done")?;
+
+            // context.md に完了記録（global + per-repo）
+            let base_dir = &self.repos_config.defaults.repos_base_dir;
+            context::append_completed_task(base_dir, &task, repo_path.as_deref());
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
@@ -548,14 +640,52 @@ fn build_proposal_blocks(task_id: i64, analysis_text: &str) -> serde_json::Value
     ])
 }
 
-fn truncate_for_slack(text: &str, max_len: usize) -> &str {
-    if text.len() <= max_len {
-        text
-    } else {
-        let mut end = max_len;
-        while !text.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        &text[..end]
+/// リポジトリの初期セットアップ + merged context/memory を返す
+fn prepare_repo_context(base_dir: &str, repo_path: &Path) -> (String, String) {
+    // .agent/ ディレクトリ作成（create_dir_all は冪等）
+    let agent_dir = repo_path.join(".agent");
+    if let Err(e) = std::fs::create_dir_all(&agent_dir) {
+        tracing::warn!("Failed to create repo .agent dir: {}", e);
     }
+
+    // .claude/rules/agent.md が無ければデフォルトルールを生成
+    ensure_repo_agent_rules(repo_path);
+
+    (
+        context::merged_context(base_dir, Some(repo_path)),
+        context::merged_memory(base_dir, Some(repo_path)),
+    )
+}
+
+/// .claude/rules/agent.md が無ければデフォルトルールを生成
+fn ensure_repo_agent_rules(repo_path: &Path) {
+    let agent_rules = repo_path.join(".claude").join("rules").join("agent.md");
+    if agent_rules.exists() {
+        return;
+    }
+    if let Some(parent) = agent_rules.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("Failed to create .claude/rules dir: {}", e);
+            return;
+        }
+    }
+
+    let default_rules = "\
+# エージェント向けルール
+
+- CLAUDE.md に記載されたプロジェクト規約に従うこと
+- 既存のコードパターン・命名規則・ディレクトリ構造を尊重すること
+- スコープ外の変更は禁止（依頼された範囲のみ変更すること）
+- 変更後はテストを実行して通ることを確認すること
+";
+
+    if let Err(e) = std::fs::write(&agent_rules, default_rules) {
+        tracing::warn!("Failed to write default agent rules: {}", e);
+    } else {
+        tracing::info!("Generated default .claude/rules/agent.md at {}", agent_rules.display());
+    }
+}
+
+pub(crate) fn truncate_for_slack(text: &str, max_len: usize) -> &str {
+    crate::claude::truncate_str(text, max_len)
 }

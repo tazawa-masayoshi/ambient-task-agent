@@ -38,6 +38,7 @@ pub struct CodingTask {
     pub estimated_minutes: Option<i32>,
     pub actual_minutes: Option<i32>,
     pub retrospective_note: Option<String>,
+    pub complexity: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -69,7 +70,7 @@ pub struct ScheduledJob {
     pub next_run_at: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, created_at, updated_at";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
     Ok(CodingTask {
@@ -98,8 +99,9 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
         estimated_minutes: row.get(22)?,
         actual_minutes: row.get(23)?,
         retrospective_note: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        complexity: row.get(25)?,
+        created_at: row.get(26)?,
+        updated_at: row.get(27)?,
     })
 }
 
@@ -200,6 +202,7 @@ impl Db {
             ("estimated_minutes", "INTEGER"),// v8
             ("actual_minutes", "INTEGER"),  // v8
             ("retrospective_note", "TEXT"), // v8
+            ("complexity", "TEXT"),         // v9
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -293,6 +296,15 @@ impl Db {
         conn.execute(
             "UPDATE coding_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_complexity(&self, id: i64, complexity: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET complexity = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![complexity, id],
         )?;
         Ok(())
     }

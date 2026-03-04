@@ -2,6 +2,7 @@ mod asana;
 mod claude;
 mod config;
 mod db;
+mod execution;
 mod google;
 mod hook;
 mod repo_config;
@@ -383,9 +384,12 @@ fn cmd_task(id: i64, start: bool, done: bool, subtask_start: Option<u32>, subtas
     if done {
         let db = db::Db::open(&server_config.db_path)?;
         db.complete_task_with_retrospective(id, None)?;
-        // context.md に完了タスク情報を追記
+        // context.md に完了タスク情報を追記（global + per-repo）
         if let Ok(Some(t)) = db.get_task_by_id(id) {
-            worker::context::append_completed_task(base_dir, &t);
+            let repo_path = t.repo_key.as_deref().and_then(|key| {
+                repos_config.find_repo_by_key(key).map(|r| repos_config.repo_local_path(r))
+            });
+            worker::context::append_completed_task(base_dir, &t, repo_path.as_deref());
         }
         eprintln!("Task #{} を done に遷移しました（actual_minutes 自動計算済み）", id);
     }
@@ -446,10 +450,39 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     let db = db::Db::open(&server_config.db_path)?;
     let repos_config = repo_config::ReposConfig::load(&server_config.repos_config_path)?;
 
+    // 旧パス → .agent/ へのマイグレーション
+    if let Err(e) = worker::context::migrate_context_files(&repos_config.defaults.repos_base_dir) {
+        tracing::warn!("Context migration failed (non-fatal): {}", e);
+    }
+
     let slack_client = SlackClient::new(slack_config.clone());
     let default_channel = repos_config.defaults.slack_channel.clone();
 
     let worker_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        repos_config.defaults.claude_max_concurrent,
+    ));
+
+    // ExecutionRegistry + HookRegistry 構築
+    let registry = std::sync::Arc::new(execution::ExecutionRegistry::new());
+    let mut hook_registry = execution::HookRegistry::new();
+    hook_registry.register(execution::LoopDetectionHook::new(registry.clone()));
+    let hooks = std::sync::Arc::new(hook_registry);
+
+    let resolved_env: Vec<(String, String)> = repos_config
+        .defaults
+        .claude_allowed_env
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
+        .collect();
+
+    let runner_ctx = execution::RunnerContext {
+        defaults: repos_config.defaults.clone(),
+        semaphore: semaphore.clone(),
+        registry: registry.clone(),
+        hooks: hooks.clone(),
+        resolved_env,
+    };
 
     let app_state = server::http::AppState {
         db: db.clone(),
@@ -463,6 +496,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         asana_user_name: asana_config.user_name.clone(),
         slack_workspace: slack_config.workspace.clone(),
         worker_notify: worker_notify.clone(),
+        runner_ctx: runner_ctx.clone(),
     };
 
     // Google Calendar クライアント初期化
@@ -498,6 +532,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         gcal_client,
         default_channel,
         worker_notify,
+        runner_ctx,
     );
     tokio::spawn(async move {
         worker.run().await;

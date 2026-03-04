@@ -23,6 +23,7 @@ pub struct AppState {
     pub asana_user_name: String,
     pub slack_workspace: Option<String>,
     pub worker_notify: std::sync::Arc<tokio::sync::Notify>,
+    pub runner_ctx: crate::execution::RunnerContext,
 }
 
 impl AppState {

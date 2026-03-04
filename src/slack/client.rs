@@ -122,6 +122,35 @@ impl SlackClient {
         Ok(())
     }
 
+    /// Slack ファイルをダウンロードしてローカルに保存
+    pub async fn download_file(&self, url: &str, dest: &std::path::Path) -> Result<()> {
+        let resp = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .send()
+            .await
+            .context("Failed to download Slack file")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Slack file download failed: HTTP {}", resp.status());
+        }
+
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
+        }
+
+        let bytes = resp.bytes().await.context("Failed to read file bytes")?;
+        tokio::fs::write(dest, &bytes)
+            .await
+            .with_context(|| format!("Failed to write file: {}", dest.display()))?;
+
+        tracing::info!("Downloaded Slack file to {}", dest.display());
+        Ok(())
+    }
+
     async fn send_message(
         &self,
         channel: &str,
