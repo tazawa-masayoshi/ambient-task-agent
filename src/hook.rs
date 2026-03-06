@@ -5,13 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::asana::client::AsanaClient;
 use crate::config::load_asana_config;
-use crate::session;
 
 #[derive(Debug, Deserialize)]
 struct HookPayload {
+    #[allow(dead_code)]
     session_id: String,
     cwd: Option<String>,
-    notification_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,23 +19,9 @@ pub struct CurrentTask {
     pub name: String,
 }
 
-const VALID_HOOK_EVENTS: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "Notification",
-    "Stop",
-    "UserPromptSubmit",
-];
-
 pub async fn cmd_hook(event_name: &str) -> Result<()> {
-    let event = if event_name.eq_ignore_ascii_case("stop") && event_name != "Stop" {
-        "Stop"
-    } else {
-        event_name
-    };
-
-    if !VALID_HOOK_EVENTS.contains(&event) {
-        eprintln!("未知のhookイベント: {}", event);
+    // Stop イベント以外は何もしない（セッション管理は wez-sidebar 側で処理）
+    if !event_name.eq_ignore_ascii_case("stop") {
         print!("{{}}");
         return Ok(());
     }
@@ -57,78 +42,14 @@ pub async fn cmd_hook(event_name: &str) -> Result<()> {
         }
     };
 
-    if payload.session_id.is_empty() {
-        print!("{{}}");
-        return Ok(());
-    }
-
-    let tty = session::get_tty_from_ancestors();
-    let is_yolo = session::detect_yolo_mode();
-
     let cwd = payload
         .cwd
-        .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
 
-    let new_status = match session::update_session(
-        event,
-        &payload.session_id,
-        &cwd,
-        &tty,
-        payload.notification_type.as_deref(),
-        is_yolo,
-    ) {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!("セッション更新失敗: {}", e);
-            String::new()
-        }
-    };
-
-    // waiting_input 時のデスクトップ通知
-    if new_status == "waiting_input" {
-        send_desktop_notification(&cwd, &tty);
-    }
-
-    // Stop 時: Asana コメント投稿
-    if event == "Stop" {
-        post_stop_comment(&cwd).await;
-    }
+    post_stop_comment(&cwd).await;
 
     print!("{{}}");
     Ok(())
-}
-
-fn send_desktop_notification(cwd: &str, tty: &str) {
-    let dir_name = PathBuf::from(cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let (activate_cmd, approve_cmd) = match session::find_wezterm_pane_by_tty(tty) {
-        Some((tab_id, pane_id)) => {
-            let activate = format!(
-                "/opt/homebrew/bin/wezterm cli activate-tab --tab-id {} && /opt/homebrew/bin/wezterm cli activate-pane --pane-id {}",
-                tab_id, pane_id
-            );
-            let approve = format!(
-                "{} && /opt/homebrew/bin/wezterm cli send-text --pane-id {} --no-paste $'\\n'",
-                activate, pane_id
-            );
-            (activate, approve)
-        }
-        None => ("open -a WezTerm".to_string(), "open -a WezTerm".to_string()),
-    };
-
-    let script = format!(
-        r#"result=$(/opt/homebrew/bin/terminal-notifier -title 'Claude Code' -message '許可待ち: {}' -sound Tink -actions '承認' -sender com.github.wez.wezterm); if [ "$result" = "@ACTIONCLICKED" ]; then {}; elif [ "$result" = "@CONTENTCLICKED" ]; then {}; fi"#,
-        dir_name, approve_cmd, activate_cmd
-    );
-
-    let _ = std::process::Command::new("bash")
-        .args(["-c", &script])
-        .spawn();
 }
 
 async fn post_stop_comment(cwd: &str) {
