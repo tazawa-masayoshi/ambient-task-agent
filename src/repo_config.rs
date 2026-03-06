@@ -33,6 +33,8 @@ pub struct Defaults {
     #[serde(default = "default_heartbeat_secs")]
     pub worker_heartbeat_secs: u64,
     pub google_calendar_id: Option<String>,
+    /// wez-sidebar 用タスクキャッシュファイルのパス
+    pub tasks_cache_file: Option<String>,
     #[serde(default = "default_stagnation_hours")]
     pub stagnation_threshold_hours: i64,
     #[serde(default = "default_timeout_secs")]

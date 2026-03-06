@@ -188,6 +188,13 @@ impl Worker {
             }
         }
 
+        // wez-sidebar タスクキャッシュ同期
+        if let Some(ref cache_path) = self.repos_config.defaults.tasks_cache_file {
+            if let Err(e) = task_file::sync_tasks_cache(&self.db, cache_path) {
+                tracing::warn!("Failed to sync tasks cache: {}", e);
+            }
+        }
+
         had_error
     }
 

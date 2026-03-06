@@ -6,6 +6,7 @@ claude_max_execute_turns = 20
 # claude_timeout_secs = 600
 # claude_max_output_bytes = 100000
 # claude_exec_mode = "normal"
+tasks_cache_file = "/home/ec2-user/.config/wez-sidebar/tasks-cache.json"
 # claude_max_concurrent = 2
 # claude_allowed_env = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL"]
 

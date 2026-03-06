@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::db::CodingTask;
+use crate::db::{CodingTask, Db};
 
 use super::decomposer::Subtask;
 
@@ -110,6 +111,72 @@ pub fn cleanup_done_tasks(repos_base_dir: &str, done_ids: &[i64]) -> Result<()> 
             tracing::info!("Cleaned up task file: {}", path.display());
         }
     }
+    Ok(())
+}
+
+// ── wez-sidebar タスクキャッシュ同期 ──
+
+/// wez-sidebar の TasksFile 形式
+#[derive(Serialize)]
+struct WezTasksFile {
+    tasks: Vec<WezTask>,
+}
+
+/// wez-sidebar の Task 形式
+#[derive(Serialize)]
+struct WezTask {
+    id: String,
+    title: String,
+    status: String,
+    priority: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due_on: Option<String>,
+}
+
+/// CodingTask のステータスを wez-sidebar 用に変換
+fn to_wez_status(status: &str) -> &str {
+    match status {
+        "done" => "completed",
+        "approved" | "decomposing" | "ready" | "executing" | "auto_approved" => "in_progress",
+        _ => "pending", // new, analyzing, proposed, error, rejected
+    }
+}
+
+/// priority_score を wez-sidebar の priority (1=high, 2=medium, 3=low) に変換
+fn to_wez_priority(score: Option<f64>) -> i32 {
+    match score {
+        Some(s) if s >= 7.0 => 1,
+        Some(s) if s >= 4.0 => 2,
+        _ => 3,
+    }
+}
+
+/// DB のアクティブタスクを wez-sidebar 形式の JSON に書き出す
+pub fn sync_tasks_cache(db: &Db, cache_path: &str) -> Result<()> {
+    let tasks = db.get_active_tasks()?;
+
+    let wez_tasks: Vec<WezTask> = tasks
+        .iter()
+        .map(|t| WezTask {
+            id: t.asana_task_gid.clone(),
+            title: t.asana_task_name.clone(),
+            status: to_wez_status(&t.status).to_string(),
+            priority: to_wez_priority(t.priority_score),
+            due_on: None,
+        })
+        .collect();
+
+    let file = WezTasksFile { tasks: wez_tasks };
+    let json = serde_json::to_string_pretty(&file)?;
+
+    let path = PathBuf::from(cache_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, json)
+        .with_context(|| format!("Failed to write tasks cache: {}", path.display()))?;
+
+    tracing::debug!("Tasks cache synced: {}", path.display());
     Ok(())
 }
 
