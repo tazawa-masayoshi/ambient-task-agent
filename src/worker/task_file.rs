@@ -118,19 +118,19 @@ pub fn cleanup_done_tasks(repos_base_dir: &str, done_ids: &[i64]) -> Result<()> 
 
 /// wez-sidebar の TasksFile 形式
 #[derive(Serialize)]
-struct WezTasksFile {
-    tasks: Vec<WezTask>,
+pub struct WezTasksFile {
+    pub tasks: Vec<WezTask>,
 }
 
 /// wez-sidebar の Task 形式
 #[derive(Serialize)]
-struct WezTask {
-    id: String,
-    title: String,
-    status: String,
-    priority: i32,
+pub struct WezTask {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub priority: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    due_on: Option<String>,
+    pub due_on: Option<String>,
 }
 
 /// CodingTask のステータスを wez-sidebar 用に変換
@@ -151,11 +151,9 @@ fn to_wez_priority(score: Option<f64>) -> i32 {
     }
 }
 
-/// DB のアクティブタスクを wez-sidebar 形式の JSON に書き出す
-pub fn sync_tasks_cache(db: &Db, cache_path: &str) -> Result<()> {
-    let tasks = db.get_active_tasks()?;
-
-    let wez_tasks: Vec<WezTask> = tasks
+/// CodingTask リストを wez-sidebar 形式に変換
+pub fn to_wez_tasks_file(tasks: &[CodingTask]) -> WezTasksFile {
+    let wez_tasks = tasks
         .iter()
         .map(|t| WezTask {
             id: t.asana_task_gid.clone(),
@@ -165,8 +163,13 @@ pub fn sync_tasks_cache(db: &Db, cache_path: &str) -> Result<()> {
             due_on: None,
         })
         .collect();
+    WezTasksFile { tasks: wez_tasks }
+}
 
-    let file = WezTasksFile { tasks: wez_tasks };
+/// DB のアクティブタスクを wez-sidebar 形式の JSON に書き出す
+pub fn sync_tasks_cache(db: &Db, cache_path: &str) -> Result<()> {
+    let tasks = db.get_active_tasks()?;
+    let file = to_wez_tasks_file(&tasks);
     let json = serde_json::to_string_pretty(&file)?;
 
     let path = PathBuf::from(cache_path);

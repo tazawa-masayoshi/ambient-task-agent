@@ -5,7 +5,7 @@ description: "Asanaからタスクを取得してJSONキャッシュに書き出
 # /asana-sync - Asanaタスク同期
 
 Asana MCPを使ってタスクを取得し、ローカルJSONキャッシュに書き出します。
-wez-sidebarやcronからの定期実行で使用。
+wez-sidebarのtasks_file形式に準拠。
 
 ## 実行手順
 
@@ -21,42 +21,39 @@ limit: 100
 
 ### 2. JSON整形・書き出し
 
-取得したタスクを以下の形式に整形し、`~/.config/ambient-task-agent/tasks-cache.json` に書き出してください。
+取得したタスクを **wez-sidebar の TasksFile 形式** に整形し、`~/.config/wez-sidebar/tasks-cache.json` に書き出してください。
 ディレクトリが無ければ作成してください。
 
 ```json
 {
-  "synced_at": "2026-02-06T10:00:00+09:00",
-  "project": {
-    "gid": "1210220399981871",
-    "name": "レボリューションズ"
-  },
   "tasks": [
     {
-      "gid": "1234567890",
-      "name": "タスク名",
-      "assignee": "田澤雅義",
-      "due_on": "2026-02-28",
-      "completed": false,
-      "section": "セクション名",
-      "notes_preview": "最初の100文字..."
+      "id": "1234567890",
+      "title": "タスク名",
+      "status": "pending",
+      "priority": 2,
+      "due_on": "2026-02-28"
     }
-  ],
-  "summary": {
-    "total": 10,
-    "incomplete": 8,
-    "my_tasks": 5,
-    "overdue": 1
-  }
+  ]
 }
 ```
+
+**フィールド変換ルール:**
+
+| Asana フィールド | tasks-cache フィールド | 変換 |
+|---|---|---|
+| `gid` | `id` | そのまま |
+| `name` | `title` | そのまま |
+| `completed` | `status` | `true` → `"completed"`, `false` → `"pending"` |
+| （なし） | `priority` | セクション名で判定: "高優先" → `1`, "進行中" → `2`(status=`"in_progress"`), その他 → `3` |
+| `due_on` | `due_on` | そのまま（nullなら省略） |
 
 ### 3. サマリー出力
 
 同期結果をコンソールに表示してください：
 
 ```
-Asana同期完了: 全X件 (未完了: Y件, 自分: Z件, 期限超過: W件)
+Asana同期完了: 全X件 (未完了: Y件, 期限超過: W件)
 ```
 
 ### 4. 期限超過タスクがあれば警告
@@ -66,5 +63,4 @@ Asana同期完了: 全X件 (未完了: Y件, 自分: Z件, 期限超過: W件)
 ## 注意
 
 - completedタスクは含めるが、最新20件のみ
-- `notes_preview` はnotesの先頭100文字（なければ空文字）
-- assigneeがnullの場合は "未割当" とする
+- assigneeがnullの場合も含める（wez-sidebar側では使わない）

@@ -6,6 +6,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::worker::decomposer::{self, Subtask};
+use crate::worker::task_file;
 
 use super::http::AppState;
 
@@ -246,6 +247,19 @@ fn dfs_cycle(
     rec_stack.remove(&node);
     path.pop();
     false
+}
+
+/// GET /api/tasks/cache — wez-sidebar 互換の軽量タスク一覧
+pub async fn tasks_cache(
+    State(state): State<Arc<AppState>>,
+) -> Json<task_file::WezTasksFile> {
+    match state.db.get_active_tasks() {
+        Ok(tasks) => Json(task_file::to_wez_tasks_file(&tasks)),
+        Err(e) => {
+            tracing::error!("Failed to get tasks for cache: {}", e);
+            Json(task_file::WezTasksFile { tasks: vec![] })
+        }
+    }
 }
 
 /// GET /api/tasks/summary

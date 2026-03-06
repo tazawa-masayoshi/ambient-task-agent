@@ -52,6 +52,7 @@ pub async fn run_server(state: AppState, port: u16) -> Result<()> {
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/tasks", get(api::list_tasks))
         .route("/api/tasks/next", get(api::next_task))
+        .route("/api/tasks/cache", get(api::tasks_cache))
         .route("/api/tasks/summary", get(api::tasks_summary))
         .route("/api/tasks/validate", get(api::validate_tasks))
         .route("/api/tasks/{id}/progress", get(api::task_progress))
