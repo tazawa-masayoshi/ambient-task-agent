@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,15 +11,33 @@ use crate::repo_config::ExecMode;
 
 const MAX_LOG_FILES: usize = 100;
 
+// ============================================================================
+// AgentBackend trait — LLM 実行バックエンドの抽象
+// ============================================================================
+
+/// LLM バックエンドに渡すリクエスト
+pub struct AgentRequest {
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub max_turns: u32,
+    pub allowed_tools: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub timeout_secs: Option<u64>,
+    pub max_output_bytes: Option<usize>,
+}
+
+/// LLM バックエンドから返るレスポンス
 #[derive(Debug, Clone)]
-pub struct ClaudeResult {
+pub struct AgentOutput {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
     pub duration: std::time::Duration,
+    pub truncated: bool,
 }
 
-impl ClaudeResult {
+impl AgentOutput {
     /// エラー出力を返す（stderr が空なら stdout をフォールバック）
     pub fn error_output(&self) -> &str {
         if self.stderr.is_empty() {
@@ -37,6 +56,106 @@ impl ClaudeResult {
         }
     }
 }
+
+/// LLM 実行バックエンドの抽象インターフェース
+#[async_trait]
+pub trait AgentBackend: Send + Sync {
+    async fn execute(&self, request: AgentRequest) -> Result<AgentOutput>;
+}
+
+// ============================================================================
+// ClaudeCliBackend — claude -p コマンド実行
+// ============================================================================
+
+pub struct ClaudeCliBackend;
+
+#[async_trait]
+impl AgentBackend for ClaudeCliBackend {
+    async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
+        let turns_str = request.max_turns.to_string();
+        let mut args = vec!["-p", &request.prompt];
+
+        if let Some(ref sp) = request.system_prompt {
+            args.extend(["--system-prompt", sp]);
+        }
+        args.extend(["--max-turns", &turns_str]);
+
+        if let Some(ref tools) = request.allowed_tools {
+            args.extend(["--allowedTools", tools]);
+        }
+
+        let mut cmd = Command::new("claude");
+        cmd.args(&args);
+        if let Some(ref dir) = request.cwd {
+            cmd.current_dir(dir);
+        }
+
+        // env_clear + 環境変数注入
+        if !request.env.is_empty() {
+            cmd.env_clear();
+            for (key, val) in &request.env {
+                cmd.env(key, val);
+            }
+        }
+
+        // タイムアウト付き実行
+        let start = std::time::Instant::now();
+        let output = if let Some(timeout_secs) = request.timeout_secs {
+            let timeout_dur = std::time::Duration::from_secs(timeout_secs);
+            cmd.kill_on_drop(true);
+            let output_fut = cmd.output();
+            match tokio::time::timeout(timeout_dur, output_fut).await {
+                Ok(result) => result.context("Failed to execute claude -p")?,
+                Err(_) => {
+                    let duration = start.elapsed();
+                    return Ok(AgentOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: format!("Process timed out after {}s", timeout_secs),
+                        duration,
+                        truncated: false,
+                    });
+                }
+            }
+        } else {
+            cmd.output()
+                .await
+                .context("Failed to execute claude -p")?
+        };
+        let duration = start.elapsed();
+
+        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let success = output.status.success();
+
+        // 出力サイズ切り詰め
+        let truncated = if let Some(max_bytes) = request.max_output_bytes {
+            if stdout.len() > max_bytes {
+                let total = stdout.len();
+                let safe_end = truncate_str(&stdout, max_bytes).len();
+                stdout.truncate(safe_end);
+                stdout.push_str(&format!("\n[truncated, {} total bytes]", total));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        Ok(AgentOutput {
+            success,
+            stdout,
+            stderr,
+            duration,
+            truncated,
+        })
+    }
+}
+
+// ============================================================================
+// ClaudeRunner — ビルダー + 実行制御オーケストレーター
+// ============================================================================
 
 #[derive(Debug, Serialize)]
 struct ExecutionLog {
@@ -69,11 +188,10 @@ pub struct ClaudeRunner {
     max_output_bytes: Option<usize>,
     exec_mode: ExecMode,
     semaphore: Option<Arc<Semaphore>>,
-    /// 事前解決済みの環境変数 (key, value) ペア
     resolved_env: Option<Vec<(String, String)>>,
-    /// true の場合、semaphore が取得できなければ即エラー（interactive 用）
     non_blocking: bool,
     hooks: Option<Arc<crate::execution::HookRegistry>>,
+    backend: Option<Arc<dyn AgentBackend>>,
 }
 
 impl ClaudeRunner {
@@ -93,6 +211,7 @@ impl ClaudeRunner {
             resolved_env: None,
             non_blocking: false,
             hooks: None,
+            backend: None,
         }
     }
 
@@ -166,7 +285,7 @@ impl ClaudeRunner {
         self
     }
 
-    /// RunnerContext から防御設定+フックを一括注入（既に設定済みの値は上書きしない）
+    /// RunnerContext から防御設定+フック+バックエンドを一括注入
     pub fn with_context(mut self, ctx: &RunnerContext) -> Self {
         let (exec_mode, timeout) = ctx.defaults.resolve_for_module(&self.module);
         if self.timeout_secs.is_none() {
@@ -185,10 +304,11 @@ impl ClaudeRunner {
             self.semaphore = Some(ctx.semaphore.clone());
         }
         self.hooks = Some(ctx.hooks.clone());
+        self.backend = Some(ctx.backend.clone());
         self
     }
 
-    pub async fn run(self) -> Result<ClaudeResult> {
+    pub async fn run(self) -> Result<AgentOutput> {
         // 0. Hook: before_run
         if let Some(ref hooks) = self.hooks {
             let prompt_summary = truncate_str(&self.prompt, 200);
@@ -214,17 +334,18 @@ impl ClaudeRunner {
             }
             ExecMode::DryRun => {
                 tracing::info!("ClaudeRunner [{}]: dry_run mode, skipping execution", self.module);
-                return Ok(ClaudeResult {
+                return Ok(AgentOutput {
                     success: true,
                     stdout: "[dry_run]".to_string(),
                     stderr: String::new(),
                     duration: std::time::Duration::ZERO,
+                    truncated: false,
                 });
             }
             ExecMode::Normal => {}
         }
 
-        // 2. Semaphore acquire（non_blocking: interactive 用に即失敗）
+        // 2. Semaphore acquire
         let _permit = match &self.semaphore {
             Some(sem) if self.non_blocking => Some(
                 sem.try_acquire()
@@ -241,19 +362,7 @@ impl ClaudeRunner {
             None => None,
         };
 
-        // 3. コマンド構築
-        let turns_str = self.max_turns.to_string();
-        let mut args = vec!["-p", &self.prompt];
-
-        if let Some(ref sp) = self.system_prompt {
-            args.extend(["--system-prompt", sp]);
-        }
-        args.extend(["--max-turns", &turns_str]);
-
-        if let Some(ref tools) = self.allowed_tools {
-            args.extend(["--allowedTools", tools]);
-        }
-
+        // 3. AgentRequest 構築 → バックエンド実行
         tracing::info!(
             "ClaudeRunner [{}]: max_turns={}, system_prompt={}, cwd={:?}, timeout={:?}s",
             self.module,
@@ -263,89 +372,32 @@ impl ClaudeRunner {
             self.timeout_secs,
         );
 
-        let mut cmd = Command::new("claude");
-        cmd.args(&args);
-        if let Some(ref dir) = self.cwd {
-            cmd.current_dir(dir);
-        }
-
-        // 4. env_clear + 事前解決済み環境変数の注入
-        if let Some(ref env_pairs) = self.resolved_env {
-            cmd.env_clear();
-            for (key, val) in env_pairs {
-                cmd.env(key, val);
-            }
-        }
-
-        // 5. タイムアウト付き実行
-        let start = std::time::Instant::now();
-        let output = if let Some(timeout_secs) = self.timeout_secs {
-            let timeout_dur = std::time::Duration::from_secs(timeout_secs);
-            // kill_on_drop(true): cmd.output() が返す future は内部で Child を所有する。
-            // タイムアウトで future が drop されると Child も drop され、SIGKILL が送信される。
-            // ref: https://docs.rs/tokio/latest/tokio/process/struct.Command.html#method.kill_on_drop
-            cmd.kill_on_drop(true);
-            let output_fut = cmd.output();
-            match tokio::time::timeout(timeout_dur, output_fut).await {
-                Ok(result) => result.context("Failed to execute claude -p")?,
-                Err(_) => {
-                    tracing::warn!(
-                        "ClaudeRunner [{}]: timed out after {}s",
-                        self.module,
-                        timeout_secs
-                    );
-                    let duration = start.elapsed();
-                    return Ok(ClaudeResult {
-                        success: false,
-                        stdout: String::new(),
-                        stderr: format!("Process timed out after {}s", timeout_secs),
-                        duration,
-                    });
-                }
-            }
-        } else {
-            cmd.output()
-                .await
-                .context("Failed to execute claude -p")?
-        };
-        let duration = start.elapsed();
-
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let success = output.status.success();
-
-        // 6. 出力サイズ切り詰め
-        let truncated = if let Some(max_bytes) = self.max_output_bytes {
-            if stdout.len() > max_bytes {
-                let total = stdout.len();
-                let safe_end = truncate_str(&stdout, max_bytes).len();
-                stdout.truncate(safe_end);
-                stdout.push_str(&format!("\n[truncated, {} total bytes]", total));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let request = AgentRequest {
+            prompt: self.prompt.clone(),
+            system_prompt: self.system_prompt.clone(),
+            max_turns: self.max_turns,
+            allowed_tools: self.allowed_tools.clone(),
+            cwd: self.cwd.clone(),
+            env: self.resolved_env.clone().unwrap_or_default(),
+            timeout_secs: self.timeout_secs,
+            max_output_bytes: self.max_output_bytes,
         };
 
-        let result = ClaudeResult {
-            success,
-            stdout,
-            stderr,
-            duration,
-        };
+        let backend = self.backend.as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(ClaudeCliBackend));
 
-        if !success {
+        let result = backend.execute(request).await?;
+
+        if !result.success {
             tracing::warn!(
-                "ClaudeRunner [{}]: failed (exit {}): {}",
+                "ClaudeRunner [{}]: failed: {}",
                 self.module,
-                output.status,
                 result.stderr
             );
         }
 
-        // 8. Hook: after_run（実行記録をレジストリに push）
+        // 4. Hook: after_run
         if let Some(ref hooks) = self.hooks {
             let record = ExecutionRecord {
                 module: self.module.clone(),
@@ -361,7 +413,7 @@ impl ClaudeRunner {
             hooks.run_after(&record);
         }
 
-        // 非同期ログ書き込み
+        // 5. 非同期ログ書き込み
         if let Some(log_dir) = self.log_dir {
             let log = ExecutionLog {
                 timestamp: chrono::Utc::now()
@@ -387,7 +439,7 @@ impl ClaudeRunner {
                 },
                 timeout_secs: self.timeout_secs,
                 max_output_bytes: self.max_output_bytes,
-                truncated,
+                truncated: result.truncated,
             };
             let module = self.module.clone();
             tokio::spawn(async move {
@@ -433,7 +485,6 @@ async fn write_log(log_dir: &Path, log: &ExecutionLog) -> Result<()> {
     let json = serde_json::to_string_pretty(log)?;
     tokio::fs::write(&path, json).await?;
 
-    // ローテーション
     rotate_logs(log_dir, MAX_LOG_FILES).await;
 
     Ok(())
@@ -465,4 +516,3 @@ async fn rotate_logs(log_dir: &Path, max_files: usize) {
         }
     }
 }
-

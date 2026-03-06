@@ -203,5 +203,7 @@ pub struct RunnerContext {
     pub hooks: Arc<HookRegistry>,
     /// 起動時に一度解決した環境変数（毎回 std::env::var を呼ばない）
     pub resolved_env: Vec<(String, String)>,
+    /// LLM 実行バックエンド
+    pub backend: Arc<dyn crate::claude::AgentBackend>,
 }
 

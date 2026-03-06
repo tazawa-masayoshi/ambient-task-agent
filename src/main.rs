@@ -482,6 +482,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         registry: registry.clone(),
         hooks: hooks.clone(),
         resolved_env,
+        backend: std::sync::Arc::new(claude::ClaudeCliBackend),
     };
 
     let app_state = server::http::AppState {
