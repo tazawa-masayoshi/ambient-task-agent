@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -15,6 +15,24 @@ const MAX_LOG_FILES: usize = 100;
 // AgentBackend trait — LLM 実行バックエンドの抽象
 // ============================================================================
 
+/// 追加ツールのメタデータ (Bedrock tool 定義用)
+pub struct ToolMeta {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Bedrock の tool ループで built-in 以外のツールをディスパッチする trait
+#[async_trait]
+pub trait ExtraToolDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Option<(String, bool)>; // (output, success)
+}
+
 /// LLM バックエンドに渡すリクエスト
 pub struct AgentRequest {
     pub prompt: String,
@@ -25,6 +43,10 @@ pub struct AgentRequest {
     pub env: Vec<(String, String)>,
     pub timeout_secs: Option<u64>,
     pub max_output_bytes: Option<usize>,
+    /// Bedrock 用: 追加ツール定義 (domain-specific tools)
+    pub extra_tool_defs: Vec<ToolMeta>,
+    /// Bedrock 用: 追加ツールのハンドラ。ClaudeCliBackend では無視される
+    pub tool_dispatcher: Option<Arc<dyn ExtraToolDispatcher>>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -35,6 +57,57 @@ pub struct AgentOutput {
     pub stderr: String,
     pub duration: std::time::Duration,
     pub truncated: bool,
+    /// トークン使用量（JSON出力モードで取得可能）
+    pub usage: Option<TokenUsage>,
+    /// セッション費用（USD）
+    pub cost_usd: Option<f64>,
+}
+
+/// Claude CLI の JSON 出力から取得できるトークン使用量
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+}
+
+/// `claude -p --output-format json` のレスポンス構造体
+#[derive(Debug, Deserialize)]
+struct ClaudeJsonResponse {
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    usage: Option<ClaudeJsonUsage>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    num_turns: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeJsonUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 impl AgentOutput {
@@ -69,11 +142,110 @@ pub trait AgentBackend: Send + Sync {
 
 pub struct ClaudeCliBackend;
 
+impl ClaudeCliBackend {
+    /// Claude Code CLI がインストールされているか検出する
+    #[allow(dead_code)]
+    pub fn detect() -> Option<String> {
+        let output = std::process::Command::new("claude")
+            .arg("--version")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    /// JSON レスポンスをパースして AgentOutput を構築する
+    fn parse_json_response(
+        raw: &str,
+        duration: std::time::Duration,
+        max_output_bytes: Option<usize>,
+    ) -> AgentOutput {
+        match serde_json::from_str::<ClaudeJsonResponse>(raw) {
+            Ok(parsed) => {
+                let is_error = parsed.is_error;
+                let mut stdout = parsed.result.unwrap_or_default();
+
+                let usage = parsed.usage.map(|u| TokenUsage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
+                });
+                let cost_usd = parsed.total_cost_usd;
+
+                if let Some(sid) = &parsed.session_id {
+                    tracing::debug!("Claude CLI session_id={}, turns={:?}", sid, parsed.num_turns);
+                }
+                if let Some(ref u) = usage {
+                    tracing::info!(
+                        "Claude CLI usage: in={} out={} cache_create={} cache_read={} total={}",
+                        u.input_tokens, u.output_tokens,
+                        u.cache_creation_input_tokens, u.cache_read_input_tokens,
+                        u.total(),
+                    );
+                }
+                if let Some(cost) = cost_usd {
+                    tracing::info!("Claude CLI cost: ${:.6}", cost);
+                }
+
+                let truncated = if let Some(max_bytes) = max_output_bytes {
+                    if stdout.len() > max_bytes {
+                        let total = stdout.len();
+                        let safe_end = truncate_str(&stdout, max_bytes).len();
+                        stdout.truncate(safe_end);
+                        stdout.push_str(&format!("\n[truncated, {} total bytes]", total));
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                AgentOutput {
+                    success: !is_error,
+                    stdout,
+                    stderr: String::new(),
+                    duration,
+                    truncated,
+                    usage,
+                    cost_usd,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse Claude CLI JSON, falling back to raw: {}", e);
+                AgentOutput {
+                    success: true,
+                    stdout: raw.trim().to_string(),
+                    stderr: String::new(),
+                    duration,
+                    truncated: false,
+                    usage: None,
+                    cost_usd: None,
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl AgentBackend for ClaudeCliBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
         let turns_str = request.max_turns.to_string();
-        let mut args = vec!["-p", &request.prompt];
+
+        // OpenFang/PicoClaw 参考: -p + JSON出力 + 権限スキップ + UI無効化
+        let mut args = vec![
+            "-p",
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+            "--no-chrome",
+        ];
 
         if let Some(ref sp) = request.system_prompt {
             args.extend(["--system-prompt", sp]);
@@ -85,7 +257,8 @@ impl AgentBackend for ClaudeCliBackend {
         }
 
         let mut cmd = Command::new("claude");
-        cmd.args(&args);
+        // stdinからプロンプトを投入（長大プロンプトでの引数長制限を回避）
+        cmd.args(&args).arg("-");
         if let Some(ref dir) = request.cwd {
             cmd.current_dir(dir);
         }
@@ -98,58 +271,72 @@ impl AgentBackend for ClaudeCliBackend {
             }
         }
 
-        // タイムアウト付き実行
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        // タイムアウト付き実行（タイムアウトなし時は Duration::MAX で統一）
         let start = std::time::Instant::now();
-        let output = if let Some(timeout_secs) = request.timeout_secs {
-            let timeout_dur = std::time::Duration::from_secs(timeout_secs);
-            cmd.kill_on_drop(true);
-            let output_fut = cmd.output();
-            match tokio::time::timeout(timeout_dur, output_fut).await {
-                Ok(result) => result.context("Failed to execute claude -p")?,
-                Err(_) => {
-                    let duration = start.elapsed();
-                    return Ok(AgentOutput {
-                        success: false,
-                        stdout: String::new(),
-                        stderr: format!("Process timed out after {}s", timeout_secs),
-                        duration,
-                        truncated: false,
-                    });
-                }
+        let timeout_dur = request.timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::MAX);
+
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().context("Failed to spawn claude -p")?;
+
+        // stdinにプロンプトを書き込んでクローズ
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(request.prompt.as_bytes()).await;
+        }
+
+        let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+            Ok(result) => result.context("Failed to execute claude -p")?,
+            Err(_) => {
+                let duration = start.elapsed();
+                return Ok(AgentOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Process timed out after {}s",
+                        request.timeout_secs.unwrap_or(0)
+                    ),
+                    duration,
+                    truncated: false,
+                    usage: None,
+                    cost_usd: None,
+                });
             }
-        } else {
-            cmd.output()
-                .await
-                .context("Failed to execute claude -p")?
         };
         let duration = start.elapsed();
 
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let success = output.status.success();
 
-        // 出力サイズ切り詰め
-        let truncated = if let Some(max_bytes) = request.max_output_bytes {
-            if stdout.len() > max_bytes {
-                let total = stdout.len();
-                let safe_end = truncate_str(&stdout, max_bytes).len();
-                stdout.truncate(safe_end);
-                stdout.push_str(&format!("\n[truncated, {} total bytes]", total));
-                true
-            } else {
-                false
+        if !output.status.success() && !raw_stdout.is_empty() {
+            // JSON出力モードではエラーも is_error: true の JSON で返る場合がある
+            let mut result = Self::parse_json_response(&raw_stdout, duration, request.max_output_bytes);
+            if result.stderr.is_empty() && !stderr.is_empty() {
+                result.stderr = stderr;
             }
-        } else {
-            false
-        };
+            result.success = false;
+            return Ok(result);
+        }
 
-        Ok(AgentOutput {
-            success,
-            stdout,
-            stderr,
-            duration,
-            truncated,
-        })
+        if !output.status.success() {
+            return Ok(AgentOutput {
+                success: false,
+                stdout: raw_stdout,
+                stderr,
+                duration,
+                truncated: false,
+                usage: None,
+                cost_usd: None,
+            });
+        }
+
+        // JSON出力をパースして構造化データを取得
+        Ok(Self::parse_json_response(&raw_stdout, duration, request.max_output_bytes))
     }
 }
 
@@ -174,6 +361,8 @@ struct ExecutionLog {
     timeout_secs: Option<u64>,
     max_output_bytes: Option<usize>,
     truncated: bool,
+    usage: Option<TokenUsage>,
+    cost_usd: Option<f64>,
 }
 
 pub struct ClaudeRunner {
@@ -192,6 +381,8 @@ pub struct ClaudeRunner {
     non_blocking: bool,
     hooks: Option<Arc<crate::execution::HookRegistry>>,
     backend: Option<Arc<dyn AgentBackend>>,
+    extra_tool_defs: Vec<ToolMeta>,
+    tool_dispatcher: Option<Arc<dyn ExtraToolDispatcher>>,
 }
 
 impl ClaudeRunner {
@@ -212,6 +403,8 @@ impl ClaudeRunner {
             non_blocking: false,
             hooks: None,
             backend: None,
+            extra_tool_defs: Vec::new(),
+            tool_dispatcher: None,
         }
     }
 
@@ -285,6 +478,17 @@ impl ClaudeRunner {
         self
     }
 
+    /// domain-specific tool を追加 (Bedrock 用)
+    pub fn extra_tools(
+        mut self,
+        defs: Vec<ToolMeta>,
+        dispatcher: Arc<dyn ExtraToolDispatcher>,
+    ) -> Self {
+        self.extra_tool_defs = defs;
+        self.tool_dispatcher = Some(dispatcher);
+        self
+    }
+
     /// RunnerContext から防御設定+フック+バックエンドを一括注入
     pub fn with_context(mut self, ctx: &RunnerContext) -> Self {
         let (exec_mode, timeout) = ctx.defaults.resolve_for_module(&self.module);
@@ -304,11 +508,19 @@ impl ClaudeRunner {
             self.semaphore = Some(ctx.semaphore.clone());
         }
         self.hooks = Some(ctx.hooks.clone());
-        self.backend = Some(ctx.backend.clone());
+        // モジュール別バックエンド選択: ops → ops_backend (Bedrock)
+        self.backend = Some(match self.module.as_str() {
+            "ops" => ctx
+                .ops_backend
+                .as_ref()
+                .unwrap_or(&ctx.backend)
+                .clone(),
+            _ => ctx.backend.clone(),
+        });
         self
     }
 
-    pub async fn run(self) -> Result<AgentOutput> {
+    pub async fn run(mut self) -> Result<AgentOutput> {
         // 0. Hook: before_run
         if let Some(ref hooks) = self.hooks {
             let prompt_summary = truncate_str(&self.prompt, 200);
@@ -340,6 +552,8 @@ impl ClaudeRunner {
                     stderr: String::new(),
                     duration: std::time::Duration::ZERO,
                     truncated: false,
+                    usage: None,
+                    cost_usd: None,
                 });
             }
             ExecMode::Normal => {}
@@ -381,6 +595,8 @@ impl ClaudeRunner {
             env: self.resolved_env.clone().unwrap_or_default(),
             timeout_secs: self.timeout_secs,
             max_output_bytes: self.max_output_bytes,
+            extra_tool_defs: self.extra_tool_defs.drain(..).collect(),
+            tool_dispatcher: self.tool_dispatcher.take(),
         };
 
         let backend = self.backend.as_ref()
@@ -440,6 +656,8 @@ impl ClaudeRunner {
                 timeout_secs: self.timeout_secs,
                 max_output_bytes: self.max_output_bytes,
                 truncated: result.truncated,
+                usage: result.usage.clone(),
+                cost_usd: result.cost_usd,
             };
             let module = self.module.clone();
             tokio::spawn(async move {

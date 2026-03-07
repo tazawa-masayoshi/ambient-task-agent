@@ -1,4 +1,5 @@
 mod asana;
+mod bedrock;
 mod claude;
 mod config;
 mod db;
@@ -476,6 +477,31 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
         .collect();
 
+    // Bedrock バックエンド初期化（設定がある場合のみ）
+    let ops_backend: Option<std::sync::Arc<dyn claude::AgentBackend>> =
+        if let Some(ref model_id) = repos_config.defaults.bedrock_model_id {
+            match bedrock::BedrockBackend::new(
+                model_id,
+                repos_config.defaults.bedrock_region.as_deref(),
+            )
+            .await
+            {
+                Ok(b) => {
+                    tracing::info!("Bedrock backend initialized (model: {})", model_id);
+                    Some(std::sync::Arc::new(b))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Bedrock init failed, ops will use claude -p: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let runner_ctx = execution::RunnerContext {
         defaults: repos_config.defaults.clone(),
         semaphore: semaphore.clone(),
@@ -483,6 +509,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         hooks: hooks.clone(),
         resolved_env,
         backend: std::sync::Arc::new(claude::ClaudeCliBackend),
+        ops_backend,
     };
 
     let app_state = server::http::AppState {

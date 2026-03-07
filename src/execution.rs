@@ -203,7 +203,9 @@ pub struct RunnerContext {
     pub hooks: Arc<HookRegistry>,
     /// 起動時に一度解決した環境変数（毎回 std::env::var を呼ばない）
     pub resolved_env: Vec<(String, String)>,
-    /// LLM 実行バックエンド
+    /// LLM 実行バックエンド (デフォルト: claude -p)
     pub backend: Arc<dyn crate::claude::AgentBackend>,
+    /// ops 専用バックエンド (Bedrock)。None なら backend にフォールバック
+    pub ops_backend: Option<Arc<dyn crate::claude::AgentBackend>>,
 }
 
