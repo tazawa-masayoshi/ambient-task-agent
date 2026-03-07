@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::claude::ClaudeRunner;
+use crate::db::OpsMessage;
 use crate::execution::RunnerContext;
 
 const OPS_ALLOWED_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep";
@@ -53,6 +54,7 @@ pub async fn execute_ops(
     max_turns: u32,
     log_dir: Option<&Path>,
     runner_ctx: &RunnerContext,
+    history: &[OpsMessage],
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
     if skill_content.is_empty() {
@@ -66,8 +68,22 @@ pub async fn execute_ops(
         base_soul, skill_content, OPS_RULES
     );
 
-    // プロンプト構築（ファイルはダウンロード済みパスを含める）
-    let mut prompt_parts = vec![format!("## Slackメッセージ\n{}", req.message_text)];
+    // プロンプト構築
+    let mut prompt_parts = Vec::new();
+
+    // 会話履歴があれば先頭に含める
+    if !history.is_empty() {
+        let history_text: Vec<String> = history
+            .iter()
+            .map(|m| format!("[{}] {}", m.role, m.content))
+            .collect();
+        prompt_parts.push(format!(
+            "## 前回の会話履歴\n{}",
+            history_text.join("\n\n")
+        ));
+    }
+
+    prompt_parts.push(format!("## Slackメッセージ\n{}", req.message_text));
     if !req.files.is_empty() {
         let file_list: Vec<String> = req
             .files
