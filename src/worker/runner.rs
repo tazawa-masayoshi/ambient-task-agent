@@ -805,9 +805,8 @@ impl Worker {
     }
 }
 
-/// Block Kit の承認ボタン付きブロックを構築
-fn build_proposal_blocks(task_id: i64, analysis_text: &str) -> serde_json::Value {
-    let task_id_str = task_id.to_string();
+/// Block Kit の要件定義表示ブロック（承認はスレッド返信で行う）
+fn build_proposal_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Value {
     serde_json::json!([
         {
             "type": "section",
@@ -817,27 +816,11 @@ fn build_proposal_blocks(task_id: i64, analysis_text: &str) -> serde_json::Value
             }
         },
         {
-            "type": "actions",
+            "type": "context",
             "elements": [
                 {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "✅ OK" },
-                    "action_id": "approve_task",
-                    "value": task_id_str,
-                    "style": "primary"
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "❌ NG" },
-                    "action_id": "reject_task",
-                    "value": task_id_str,
-                    "style": "danger"
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "🔄 再生成" },
-                    "action_id": "regenerate_task",
-                    "value": task_id_str
+                    "type": "mrkdwn",
+                    "text": "スレッドに返信して操作: `ok` 承認 / `go` 即実行 / `ng` 却下 / `再生成` やり直し"
                 }
             ]
         }

@@ -3,38 +3,24 @@
 > compaction で失われる文脈を保存。compaction summary と合わせて復元に使用。
 > Learnings に長期的価値があれば MEMORY.md に反映すること。
 
-### Snapshot (03/07 11:05, auto)
+### Snapshot (03/09 10:51, auto)
 
-**Intent:** Implement the following plan:
+**Intent:** https://github.com/sipeed/picoclaw
 
-**Outcomes:** 15 files changed
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/commands/asana-sync.md`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/Cargo.toml`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/repos.toml`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/soul.md`
+**Outcomes:** 5 files changed
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/bedrock.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/claude.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/db.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/execution.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/hook.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/main.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/repo_config.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/api.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/http.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_events.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/session.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/analyzer.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/ops.rs`
 
 **Context:**
 
- `39be7256` | /api/tasks/cache + asana-sync フォーマット統一 |
-| `3c1ba095` | **trait AgentBackend** — LLM 実行の抽象化 |
-| `2afe369f` | **ops_contexts SQLite 永続化** — 会話履歴の永続化 |
+".claude/scripts/add-subcategory.sh"
+```
 
-ZeroClaw 参考チェックリスト更新:
+方向性は正しい。今日の変更をまとめると：
 
-| パターン | 状態 |
-|---|---|
-| trait Provider (LLM抽象) | ✅ `trait AgentBackend` |
-| Memory 永続化 | ✅ `ops_contexts` SQLite |
-| Channel 抽象 | ❌ 不要 (Slack only) |
-| Tool 抽象 | ❌ 不要 (claude -p 管理) |
+1. **ClaudeCliBackend 強化** — `--output-format json` / `--dangerously-skip-permissions` / `--no-chrome` / stdin入力 / JSON usage パース（PicoClaw + OpenFang 参考）
+2. **ops の Tool 化** — `ExtraToolDispatcher` trait + `OpsToolDef` in TOML + `PARAM_xxx` 環境変数（ZeroClaw + OpenFang 参考）
+3. **後方互換** — `ops_tools` 優先、`ops_skills` フォールバック
