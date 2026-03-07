@@ -274,6 +274,7 @@ async fn execute_ops_tool(
 }
 
 /// tool ベースで ops を実行 (ops_tools が設定されている場合)
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_ops_with_tools(
     req: &OpsRequest,
     repo_path: &Path,

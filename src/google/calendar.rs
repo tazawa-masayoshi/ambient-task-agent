@@ -77,6 +77,13 @@ impl GoogleCalendarClient {
         let key: ServiceAccountKey = serde_json::from_str(&key_json)
             .context("Failed to parse service account key JSON")?;
 
+        // token_uri を oauth2.googleapis.com に制限（SSRF 防止）
+        anyhow::ensure!(
+            key.token_uri.starts_with("https://oauth2.googleapis.com/"),
+            "token_uri must be https://oauth2.googleapis.com/*, got: {}",
+            key.token_uri
+        );
+
         Ok(Self {
             client: reqwest::Client::new(),
             service_account_key: key,
@@ -138,6 +145,95 @@ impl GoogleCalendarClient {
         Ok(events)
     }
 
+    /// カレンダーにイベントを作成
+    pub async fn create_event(
+        &mut self,
+        summary: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        description: Option<&str>,
+    ) -> Result<String> {
+        let token = self.get_access_token().await?;
+
+        let url = format!(
+            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            urlencoded(&self.calendar_id)
+        );
+
+        let mut body = serde_json::json!({
+            "summary": summary,
+            "start": { "dateTime": start.to_rfc3339() },
+            "end": { "dateTime": end.to_rfc3339() },
+            "transparency": "transparent",
+        });
+        if let Some(desc) = description {
+            body["description"] = serde_json::Value::String(desc.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to create calendar event")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Google Calendar create event error ({}): {}", status, body);
+        }
+
+        let event: CalendarEvent = resp.json().await.context("Failed to parse created event")?;
+        Ok(event.id)
+    }
+
+    /// 指定プレフィックスで始まるイベントを今日分だけ削除
+    pub async fn delete_events_by_summary_prefix(&mut self, prefix: &str) -> Result<usize> {
+        let events = self.fetch_today_events().await?;
+        let mut deleted = 0;
+
+        for event in &events {
+            let summary = event.summary.as_deref().unwrap_or("");
+            if summary.starts_with(prefix) {
+                if let Err(e) = self.delete_event(&event.id).await {
+                    tracing::warn!("Failed to delete calendar event {}: {}", event.id, e);
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    async fn delete_event(&mut self, event_id: &str) -> Result<()> {
+        let token = self.get_access_token().await?;
+
+        let url = format!(
+            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}",
+            urlencoded(&self.calendar_id),
+            urlencoded(event_id),
+        );
+
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("Failed to delete calendar event")?;
+
+        if !resp.status().is_success() && resp.status().as_u16() != 410 {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Google Calendar delete event error ({}): {}", status, body);
+        }
+
+        Ok(())
+    }
+
     async fn get_access_token(&mut self) -> Result<String> {
         if let Some((ref token, ref expires_at)) = self.cached_token {
             if Utc::now() < *expires_at - Duration::minutes(5) {
@@ -176,7 +272,7 @@ impl GoogleCalendarClient {
         let now = Utc::now().timestamp();
         let claims = JwtClaims {
             iss: self.service_account_key.client_email.clone(),
-            scope: "https://www.googleapis.com/auth/calendar.readonly".to_string(),
+            scope: "https://www.googleapis.com/auth/calendar.events".to_string(),
             aud: self.service_account_key.token_uri.clone(),
             iat: now,
             exp: now + 3600,
@@ -193,6 +289,14 @@ impl GoogleCalendarClient {
 impl CalendarEvent {
     pub fn start_time(&self) -> Option<DateTime<Utc>> {
         self.start
+            .date_time
+            .as_ref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    pub fn end_time(&self) -> Option<DateTime<Utc>> {
+        self.end
             .date_time
             .as_ref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())

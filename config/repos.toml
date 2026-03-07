@@ -52,21 +52,13 @@ ops_skills = [".claude/skills/add-interview/SKILL.md"]
 key = "morning_briefing"
 cron = "0 0 9 * * Mon-Fri *"    # 平日 9:00
 job_type = "morning_briefing"
-prompt = """\
-Asanaタスクとカレンダーを分析し、今日やるべきことを提案してください。
-期限超過→ブロッカー除去→本日期限→MTG準備→高インパクト順。
-簡潔にSlack mrkdwnで日本語出力。"""
+prompt = ""  # デフォルトプロンプト使用（構造化済み）
 
 [[schedule]]
 key = "evening_summary"
 cron = "0 0 18 * * Mon-Fri *"   # 平日 18:00
 job_type = "evening_summary"
-prompt = """\
-本日の振り返りをまとめてください。
-- 今日完了したタスク
-- 進行中の作業
-- 明日に持ち越すべきタスクと推奨アクション
-簡潔にSlack mrkdwnで日本語出力。"""
+prompt = ""  # デフォルトプロンプト使用（構造化済み）
 
 [[schedule]]
 key = "meeting_reminder"

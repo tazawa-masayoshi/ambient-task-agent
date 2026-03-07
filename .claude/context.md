@@ -3,22 +3,26 @@
 > compaction で失われる文脈を保存。compaction summary と合わせて復元に使用。
 > Learnings に長期的価値があれば MEMORY.md に反映すること。
 
-### Snapshot (03/09 18:06, auto)
+### Snapshot (03/10 00:53, auto)
 
-**Intent:** ..
+**Intent:** Implement the following plan:
 
-**Outcomes:** 6 files changed
-- `/home/ec2-user/.config/ambient-task-agent/repos.toml`
-- `/home/ec2-user/masayoshi/ambient-task-agent/src/config.rs`
-- `/home/ec2-user/masayoshi/ambient-task-agent/src/repo_config.rs`
-- `/home/ec2-user/masayoshi/ambient-task-agent/src/server/slack_events.rs`
-- `/home/ec2-user/masayoshi/ambient-task-agent/src/worker/ops.rs`
-- `/home/ec2-user/masayoshi/ambient-task-agent/tools/hikken_add_subcategory.sh`
+**Outcomes:** 12 files changed
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/context.md`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/repos.toml`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/soul.md`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/db.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/google/calendar.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/repo_config.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_events.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/mod.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/runner.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/scheduler.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/workspace.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/tests/test_gcal_create.py`
 
 **Context:**
 
- で起動し、Socket Mode 接続完了しています。Slack で 🤖 スタンプを押してテストしてください。
-まだイベント来ていない。もう少し待ちます。
-イベントが来ていません。🤖 リアクションは `reaction_added` イベントとして受信されるはずですが、以前一度押して外していないと再度同じリアクションは送信されません。
-
-一度 🤖 を外してからもう一度押してみてください。
+ープが `calendar.readonlyevents`（旧 + 新が結合されたマージアーティファクト）になっています。まず修正してから並列レビューを実行します。
+実ファイルは `calendar.events` で正しい（diff の表示が jj の old→new concatenation による誤読）。次に3エージェント並列レビューを実行します。
+soul.md とrepos.toml の実ファイルを確認します。diff に古い内容が残っているように見えます。

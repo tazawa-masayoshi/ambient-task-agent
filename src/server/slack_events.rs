@@ -99,7 +99,7 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
                     Ok(msg) => {
                         let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                         tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                        dispatch_ops_request(state, &msg, channel, message_ts, text, &repo_entry).await?;
+                        dispatch_ops_request(state, &msg, channel, message_ts, text, repo_entry).await?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);
