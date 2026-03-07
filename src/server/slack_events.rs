@@ -433,8 +433,70 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             tracing::info!("Task {} archived via thread message", task.id);
         }
 
+        // 承認系コマンド（Block Kit ボタンと同等）
+        "ok" | "承認" | "approve" => {
+            if task.status != "proposed" {
+                slack
+                    .reply_thread(
+                        channel,
+                        thread_ts,
+                        &format!(":no_entry: 現在のステータスは `{}` のため承認できません（proposed のみ）", task.status),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            state.db.update_status(task.id, "approved")?;
+            slack
+                .reply_thread(channel, thread_ts, ":white_check_mark: 承認しました！タスク分解を開始します...")
+                .await?;
+            tracing::info!("Task {} approved via thread reply", task.id);
+            state.wake_worker();
+        }
+
+        "ng" | "却下" | "reject" => {
+            if task.status != "proposed" {
+                return Ok(());
+            }
+            state.db.update_status(task.id, "rejected")?;
+            slack
+                .reply_thread(channel, thread_ts, ":x: 却下しました")
+                .await?;
+            tracing::info!("Task {} rejected via thread reply", task.id);
+        }
+
+        "再生成" | "regenerate" | "retry" => {
+            if task.status != "proposed" {
+                return Ok(());
+            }
+            state.db.reset_for_regeneration(task.id)?;
+            slack
+                .reply_thread(channel, thread_ts, ":arrows_counterclockwise: 要件定義を再生成します...")
+                .await?;
+            tracing::info!("Task {} regeneration requested via thread reply", task.id);
+            state.wake_worker();
+        }
+
+        "go" | "実行" | "run" => {
+            if task.status != "proposed" {
+                slack
+                    .reply_thread(
+                        channel,
+                        thread_ts,
+                        &format!(":no_entry: 現在のステータスは `{}` のため実行できません（proposed のみ）", task.status),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            state.db.update_status(task.id, "auto_approved")?;
+            slack
+                .reply_thread(channel, thread_ts, ":robot_face: 自動実行モードで承認しました！実行を開始します...")
+                .await?;
+            tracing::info!("Task {} auto_approved via thread reply", task.id);
+            state.wake_worker();
+        }
+
         _ => {
-            // sleep/wake/archive 以外のスレッド返信は無視
+            // 認識できないスレッド返信は無視
         }
     }
 
