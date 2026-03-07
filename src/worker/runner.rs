@@ -10,7 +10,7 @@ use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 
-use super::{analyzer, context, decomposer, executor, priority, scheduler, task_file};
+use super::{analyzer, context, decomposer, executor, priority, scheduler, task_file, workspace};
 
 /// ハートビート間隔の下限
 const MIN_HEARTBEAT_SECS: u64 = 10;
@@ -29,6 +29,7 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Db,
         repos_config: ReposConfig,
@@ -310,23 +311,49 @@ impl Worker {
                     self.db.update_complexity(task.id, c)?;
                     tracing::info!("Task {} complexity: {}", task.id, c);
                 }
-                self.db.update_status(task.id, "proposed")?;
 
-                // Block Kit ボタン付きで Slack に投稿
-                let analysis_display = truncate_for_slack(&analysis, 2800);
-                let blocks = build_proposal_blocks(task.id, analysis_display);
-                let plan_ts = self
-                    .slack
-                    .post_blocks(channel, &thread_ts, &blocks, "要件定義が完成しました（ボタンで操作してください）")
-                    .await?;
+                // auto_execute 判定
+                let is_auto_execute = task
+                    .repo_key
+                    .as_deref()
+                    .and_then(|key| self.repos_config.find_repo_by_key(key))
+                    .map(|r| r.auto_execute)
+                    .unwrap_or(false);
 
-                self.db.update_plan_ts(task.id, &plan_ts)?;
+                if is_auto_execute {
+                    // ボタンなしで情報投稿 → auto_approved へ
+                    let analysis_display = truncate_for_slack(&analysis, 2800);
+                    let blocks = build_info_blocks(task.id, analysis_display);
+                    let plan_ts = self
+                        .slack
+                        .post_blocks(channel, &thread_ts, &blocks, "要件定義が完成しました（自動実行されます）")
+                        .await?;
+                    self.db.update_plan_ts(task.id, &plan_ts)?;
+                    self.db.update_status(task.id, "auto_approved")?;
 
-                tracing::info!(
-                    "Analysis posted for task {} (plan_ts: {})",
-                    task.asana_task_gid,
-                    plan_ts
-                );
+                    tracing::info!(
+                        "Analysis posted for task {} (auto_execute, plan_ts: {})",
+                        task.asana_task_gid,
+                        plan_ts
+                    );
+                } else {
+                    // 既存フロー: ボタン付き投稿 → proposed
+                    self.db.update_status(task.id, "proposed")?;
+
+                    let analysis_display = truncate_for_slack(&analysis, 2800);
+                    let blocks = build_proposal_blocks(task.id, analysis_display);
+                    let plan_ts = self
+                        .slack
+                        .post_blocks(channel, &thread_ts, &blocks, "要件定義が完成しました（ボタンで操作してください）")
+                        .await?;
+                    self.db.update_plan_ts(task.id, &plan_ts)?;
+
+                    tracing::info!(
+                        "Analysis posted for task {} (plan_ts: {})",
+                        task.asana_task_gid,
+                        plan_ts
+                    );
+                }
             }
             Err(e) => {
                 let err_msg = format!("Analysis failed: {}", e);
@@ -512,6 +539,16 @@ impl Worker {
 
     /// auto_approved → executing → done: 要件定義をプランとして自動実行
     async fn execute_auto_approved_task(&self, task: CodingTask) -> Result<()> {
+        let repo_entry = task
+            .repo_key
+            .as_deref()
+            .and_then(|key| self.repos_config.find_repo_by_key(key));
+
+        // auto_execute リポジトリなら worktree 実行パスへ分岐
+        if repo_entry.map(|r| r.auto_execute).unwrap_or(false) {
+            return self.execute_in_worktree(task, repo_entry.unwrap()).await;
+        }
+
         let channel = task
             .slack_channel
             .as_deref()
@@ -525,12 +562,7 @@ impl Worker {
             .await
             .ok();
 
-        // Step 2: リポジトリパスとエントリを解決
-        let repo_entry = task
-            .repo_key
-            .as_deref()
-            .and_then(|key| self.repos_config.find_repo_by_key(key));
-
+        // Step 2: リポジトリパスを解決
         let repo_path = repo_entry.map(|r| self.repos_config.repo_local_path(r));
 
         // analysis_text をプランとして使う
@@ -591,7 +623,7 @@ impl Worker {
                 .ok();
         } else {
             self.db
-                .set_error(task.id, &truncate_for_slack(&result.output, 500))?;
+                .set_error(task.id, truncate_for_slack(&result.output, 500))?;
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
@@ -603,6 +635,171 @@ impl Worker {
                 .await
                 .ok();
         }
+
+        Ok(())
+    }
+
+    /// worktree 隔離実行: worktree 作成 → executor → PR 作成
+    async fn execute_in_worktree(
+        &self,
+        task: CodingTask,
+        repo_entry: &crate::repo_config::RepoEntry,
+    ) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+
+        // Step 1: worktree 作成
+        self.slack
+            .reply_thread(channel, thread_ts, ":file_folder: worktree を作成中...")
+            .await
+            .ok();
+
+        let ws = match workspace::create(
+            base_dir,
+            &repo_entry.key,
+            task.id,
+            &repo_entry.default_branch,
+        )
+        .await
+        {
+            Ok(ws) => ws,
+            Err(e) => {
+                let err_msg = format!("Worktree creation failed: {}", e);
+                self.db.set_error(task.id, &err_msg)?;
+                self.slack
+                    .reply_thread(channel, thread_ts, &format!(":x: {}", err_msg))
+                    .await
+                    .ok();
+                return Err(e);
+            }
+        };
+
+        // Step 2: DB に branch_name を記録
+        self.db
+            .update_branch_name(task.id, &ws.branch_name)?;
+
+        // Step 3: status → executing
+        self.db.update_status(task.id, "executing")?;
+        self.slack
+            .reply_thread(
+                channel,
+                thread_ts,
+                &format!(":rocket: worktree で自動実行中... (branch: `{}`)", ws.branch_name),
+            )
+            .await
+            .ok();
+
+        // Step 4: executor 実行 (cwd = worktree_path)
+        let plan_text = task.analysis_text.as_deref().unwrap_or("");
+        let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
+        let execute_turns = match task.complexity.as_deref() {
+            Some("complex") => self
+                .repos_config
+                .defaults
+                .claude_max_execute_turns
+                .saturating_mul(2),
+            _ => self.repos_config.defaults.claude_max_execute_turns,
+        };
+
+        let wc = context::WorkContext {
+            repo_path: ws.worktree_path.clone(),
+            max_turns: execute_turns,
+            soul: context::read_soul(base_dir),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        };
+
+        let log_dir = self.log_dir();
+        let result = executor::execute_task(
+            &task.asana_task_name,
+            plan_text,
+            Some(repo_entry),
+            Some(ws.worktree_path.as_path()),
+            &wc,
+            Some(&log_dir),
+            &self.runner_ctx,
+        )
+        .await;
+
+        // Step 5: 結果に応じて PR 作成 or cleanup
+        match result {
+            Ok(exec_result) if exec_result.success => {
+                // PR 作成を試みる
+                match workspace::finalize(
+                    &ws,
+                    &task.asana_task_name,
+                    &repo_entry.default_branch,
+                    &repo_entry.github,
+                )
+                .await
+                {
+                    Ok(pr_url) => {
+                        self.db.update_pr_url(task.id, &pr_url)?;
+                        self.db.update_status(task.id, "done")?;
+
+                        let repo_path = self.repos_config.repo_local_path(repo_entry);
+                        context::append_completed_task(base_dir, &task, Some(&repo_path));
+
+                        let output_summary = truncate_for_slack(&exec_result.output, 2800);
+                        let msg = format!(
+                            ":white_check_mark: 自動実行完了 — PR を作成しました\n{}\n```\n{}\n```",
+                            pr_url, output_summary
+                        );
+                        self.slack
+                            .reply_thread(channel, thread_ts, &msg)
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        // PR 作成失敗（変更なし含む）
+                        self.db.update_status(task.id, "done")?;
+
+                        let repo_path = self.repos_config.repo_local_path(repo_entry);
+                        context::append_completed_task(base_dir, &task, Some(&repo_path));
+
+                        let output_summary = truncate_for_slack(&exec_result.output, 2800);
+                        let msg = format!(
+                            ":white_check_mark: 自動実行完了（PR作成スキップ: {}）\n```\n{}\n```",
+                            e, output_summary
+                        );
+                        self.slack
+                            .reply_thread(channel, thread_ts, &msg)
+                            .await
+                            .ok();
+                    }
+                }
+            }
+            Ok(exec_result) => {
+                // executor 失敗
+                self.db
+                    .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
+
+                let output_summary = truncate_for_slack(&exec_result.output, 3700);
+                let msg = format!(":x: 自動実行失敗\n```\n{}\n```", output_summary);
+                self.slack
+                    .reply_thread(channel, thread_ts, &msg)
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                self.db
+                    .set_error(task.id, &format!("Execution error: {}", e))?;
+
+                let msg = format!(":x: 実行エラー\n```\n{}\n```", e);
+                self.slack
+                    .reply_thread(channel, thread_ts, &msg)
+                    .await
+                    .ok();
+            }
+        }
+
+        // Step 6: worktree cleanup（PR push 済みなので不要）
+        workspace::remove(&ws).await.ok();
 
         Ok(())
     }
@@ -641,6 +838,28 @@ fn build_proposal_blocks(task_id: i64, analysis_text: &str) -> serde_json::Value
                     "text": { "type": "plain_text", "text": "🔄 再生成" },
                     "action_id": "regenerate_task",
                     "value": task_id_str
+                }
+            ]
+        }
+    ])
+}
+
+/// Block Kit の情報表示ブロック（ボタンなし、auto_execute 用）
+fn build_info_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(":clipboard: *要件定義*\n\n{}", analysis_text)
+            }
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": ":gear: auto_execute が有効なため、worktree で自動実行されます"
                 }
             ]
         }
