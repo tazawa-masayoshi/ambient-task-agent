@@ -343,63 +343,131 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         .and_then(|t| t.as_str())
         .unwrap_or_default();
 
-    // トップレベルメッセージの処理
+    // ops チャンネル判定（トップレベル・スレッド返信の両方で使う）
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
-    if thread_ts.is_none() {
-        // ops チャンネル検知 → スキル自動実行
-        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-            let ops_skills = match &repo_entry.ops_skills {
+
+    // ops チャンネルのメッセージ処理（トップレベル or スレッド返信）
+    if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+        // ops_tools (tool ベース) を優先、なければ ops_skills (skill ベース)
+        let use_tools = repo_entry
+            .ops_tools
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+
+        let ops_skills = if use_tools {
+            // tool ベースの場合、ops_skills チェックをスキップ
+            Vec::new()
+        } else {
+            match &repo_entry.ops_skills {
                 Some(s) if !s.is_empty() => s.clone(),
-                _ => return Ok(()),
-            };
-
-            let slack = state.slack_client();
-            slack.reply_thread(channel, message_ts, ":gear: 処理中...").await.ok();
-
-            let files = extract_slack_files(event);
-            let repo_path = state.repos_config.repo_local_path(repo_entry);
-            let soul = crate::worker::context::read_soul(&state.repos_config.defaults.repos_base_dir);
-            let max_turns = state.repos_config.defaults.claude_max_execute_turns;
-
-            let req = crate::worker::ops::OpsRequest {
-                message_text: text.to_string(),
-                files,
-            };
-
-            let channel = channel.to_string();
-            let message_ts = message_ts.to_string();
-            let log_dir = log_dir_from_state(state);
-            let runner_ctx = state.runner_ctx.clone();
-
-            tokio::spawn(async move {
-                // ファイルダウンロード（spawn 内で実行し、イベントハンドラをブロックしない）
-                if !req.files.is_empty() {
-                    let images_dir = repo_path.join("images");
-                    for f in &req.files {
-                        let dest = images_dir.join(&f.name);
-                        if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
-                            tracing::warn!("Failed to download file {}: {}", f.name, e);
-                        }
+                _ => {
+                    if thread_ts.is_none() {
+                        return Ok(());
                     }
+                    Vec::new()
                 }
+            }
+        };
 
-                match crate::worker::ops::execute_ops(&req, &repo_path, &ops_skills, &soul, max_turns, Some(&log_dir), &runner_ctx).await {
-                    Ok(output) => {
-                        let truncated = crate::worker::runner::truncate_for_slack(&output, 3700);
-                        let suffix = if truncated.len() < output.len() { "\n... (truncated)" } else { "" };
-                        let msg = format!(":white_check_mark: 完了\n```\n{}{}\n```", truncated, suffix);
-                        slack.reply_thread(&channel, &message_ts, &msg).await.ok();
-                    }
-                    Err(e) => {
-                        let msg = format!(":x: 失敗: {}", e);
-                        slack.reply_thread(&channel, &message_ts, &msg).await.ok();
-                    }
-                }
-            });
-
+        // tool ベースでも skill ベースでもない場合、スレッド返信以外は無視
+        if !use_tools && ops_skills.is_empty() && thread_ts.is_none() {
             return Ok(());
         }
 
+        // スレッド返信の場合: 既存の ops コンテキストがあるかチェック
+        let effective_thread_ts = thread_ts.unwrap_or(message_ts);
+        let is_followup = thread_ts.is_some()
+            && state.db.get_ops_repo_key(channel, effective_thread_ts)?
+                .is_some();
+
+        // トップレベル or 既存 ops スレッドへの返信
+        if thread_ts.is_none() || is_followup {
+            if ops_skills.is_empty() && !is_followup {
+                // ops_skills 未設定でトップレベル → 無視
+            } else {
+                let slack = state.slack_client();
+                slack.reply_thread(channel, effective_thread_ts, ":gear: 処理中...").await.ok();
+
+                let files = extract_slack_files(event);
+                let repo_path = state.repos_config.repo_local_path(repo_entry);
+                let repo_key = repo_entry.key.clone();
+                let soul = crate::worker::context::read_soul(&state.repos_config.defaults.repos_base_dir);
+                let max_turns = state.repos_config.defaults.claude_max_execute_turns;
+
+                // 会話履歴を読み込み
+                let history = state.db.get_ops_context(channel, effective_thread_ts)?;
+
+                let req = crate::worker::ops::OpsRequest {
+                    message_text: text.to_string(),
+                    files,
+                };
+
+                let db = state.db.clone();
+                let channel = channel.to_string();
+                let thread_ts_owned = effective_thread_ts.to_string();
+                let log_dir = log_dir_from_state(state);
+                let runner_ctx = state.runner_ctx.clone();
+                let ops_tools = repo_entry.ops_tools.clone();
+
+                tokio::spawn(async move {
+                    // ファイルダウンロード
+                    if !req.files.is_empty() {
+                        let images_dir = repo_path.join("images");
+                        for f in &req.files {
+                            let dest = images_dir.join(&f.name);
+                            if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
+                                tracing::warn!("Failed to download file {}: {}", f.name, e);
+                            }
+                        }
+                    }
+
+                    // ユーザーメッセージを保存
+                    if let Err(e) = db.append_ops_context(&channel, &thread_ts_owned, &repo_key, "user", &req.message_text) {
+                        tracing::warn!("Failed to save ops context (user): {}", e);
+                    }
+
+                    // ops_tools (tool ベース) と ops_skills (skill ベース) を分岐
+                    let use_tools = ops_tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+
+                    let exec_result = if use_tools {
+                        let tools = ops_tools.as_ref().unwrap();
+                        crate::worker::ops::execute_ops_with_tools(
+                            &req, &repo_path, tools, &soul,
+                            Some(&log_dir), &runner_ctx, &history,
+                        ).await
+                    } else {
+                        crate::worker::ops::execute_ops(
+                            &req, &repo_path, &ops_skills, &soul,
+                            max_turns, Some(&log_dir), &runner_ctx, &history,
+                        ).await
+                    };
+
+                    match exec_result {
+                        Ok(output) => {
+                            // アシスタント応答を保存
+                            if let Err(e) = db.append_ops_context(&channel, &thread_ts_owned, &repo_key, "assistant", &output) {
+                                tracing::warn!("Failed to save ops context (assistant): {}", e);
+                            }
+
+                            let truncated = crate::worker::runner::truncate_for_slack(&output, 3700);
+                            let suffix = if truncated.len() < output.len() { "\n... (truncated)" } else { "" };
+                            let msg = format!(":white_check_mark: 完了\n```\n{}{}\n```", truncated, suffix);
+                            slack.reply_thread(&channel, &thread_ts_owned, &msg).await.ok();
+                        }
+                        Err(e) => {
+                            let msg = format!(":x: 失敗: {}", e);
+                            slack.reply_thread(&channel, &thread_ts_owned, &msg).await.ok();
+                        }
+                    }
+                });
+
+                return Ok(());
+            }
+        }
+    }
+
+    if thread_ts.is_none() {
         // Asana URL 自動リンク
         if let Some(task_gid) = extract_asana_task_gid(text) {
             handle_asana_url_link(state, channel, message_ts, &task_gid).await?;

@@ -105,14 +105,14 @@ fn merge_layers(repo_content: &str, global_content: &str, repo_header: &str, glo
 /// per-repo context → global context を結合して返す
 pub fn merged_context(repos_base_dir: &str, repo: Option<&Path>) -> String {
     let global = read_context(repos_base_dir);
-    let repo_ctx = repo.map(|r| read_repo_context(r)).unwrap_or_default();
+    let repo_ctx = repo.map(read_repo_context).unwrap_or_default();
     merge_layers(&repo_ctx, &global, "リポジトリ作業履歴", "横断作業履歴")
 }
 
 /// per-repo memory → global memory を結合して返す
 pub fn merged_memory(repos_base_dir: &str, repo: Option<&Path>) -> String {
     let global = read_memory(repos_base_dir);
-    let repo_mem = repo.map(|r| read_repo_memory(r)).unwrap_or_default();
+    let repo_mem = repo.map(read_repo_memory).unwrap_or_default();
     merge_layers(&repo_mem, &global, "リポジトリ学習メモ", "横断学習メモ")
 }
 

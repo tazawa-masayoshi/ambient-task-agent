@@ -184,6 +184,18 @@ impl Db {
                 created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
+
+            CREATE TABLE IF NOT EXISTS ops_contexts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel     TEXT NOT NULL,
+                thread_ts   TEXT NOT NULL,
+                repo_key    TEXT NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_ops_contexts_thread
+                ON ops_contexts(channel, thread_ts);
             ",
         )?;
 
@@ -846,4 +858,82 @@ impl Db {
         let task = stmt.query_row(params![id], row_to_task).ok();
         Ok(task)
     }
+
+    pub fn update_branch_name(&self, id: i64, branch_name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET branch_name = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![branch_name, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_pr_url(&self, id: i64, pr_url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET pr_url = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![pr_url, id],
+        )?;
+        Ok(())
+    }
+
+    // ── ops_contexts ──
+
+    /// ops 会話メッセージを保存
+    pub fn append_ops_context(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        repo_key: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ops_contexts (channel, thread_ts, repo_key, role, content) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![channel, thread_ts, repo_key, role, content],
+        )?;
+        Ok(())
+    }
+
+    /// ops スレッドの会話履歴を取得（時系列順）
+    pub fn get_ops_context(&self, channel: &str, thread_ts: &str) -> Result<Vec<OpsMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, created_at FROM ops_contexts WHERE channel = ?1 AND thread_ts = ?2 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![channel, thread_ts], |row| {
+                Ok(OpsMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// ops スレッドの repo_key を取得
+    pub fn get_ops_repo_key(&self, channel: &str, thread_ts: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT repo_key FROM ops_contexts WHERE channel = ?1 AND thread_ts = ?2 LIMIT 1",
+            params![channel, thread_ts],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(key) => Ok(Some(key)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct OpsMessage {
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
 }
