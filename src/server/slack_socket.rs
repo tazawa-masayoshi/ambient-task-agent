@@ -8,14 +8,37 @@ use super::slack_events;
 
 /// Socket Mode で Slack に接続してイベントを受信する
 pub async fn run_socket_mode(state: Arc<AppState>, app_token: String) {
+    const MAX_RETRIES: u32 = 30;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         match connect_and_listen(&state, &app_token).await {
             Ok(()) => {
+                // 正常切断（disconnect メッセージ等）→ カウンタリセット
+                consecutive_failures = 0;
                 tracing::info!("Socket Mode connection closed, reconnecting...");
             }
             Err(e) => {
-                tracing::error!("Socket Mode error: {}, reconnecting in 5s...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_RETRIES {
+                    tracing::error!(
+                        "Socket Mode: {} consecutive failures, giving up. Last error: {}",
+                        consecutive_failures, e
+                    );
+                    return;
+                }
+                // エクスポネンシャルバックオフ: 1, 2, 4, 8, ... 秒（上限60秒）
+                let backoff = std::cmp::min(
+                    1u64 << (consecutive_failures - 1),
+                    MAX_BACKOFF_SECS,
+                );
+                tracing::error!(
+                    "Socket Mode error ({}/{}): {}, retrying in {}s...",
+                    consecutive_failures, MAX_RETRIES, e, backoff
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             }
         }
     }
