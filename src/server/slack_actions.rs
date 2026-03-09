@@ -136,6 +136,44 @@ fn extract_payload_field(body: &[u8]) -> Option<String> {
     None
 }
 
+/// Socket Mode から呼ばれる interactive ペイロードの処理
+pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> anyhow::Result<()> {
+    let action_payload: SlackActionPayload = serde_json::from_value(payload.clone())?;
+
+    let action = match action_payload.actions.first() {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+
+    let task_id: i64 = action
+        .value
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid task_id"))?;
+
+    let channel = action_payload
+        .channel
+        .as_ref()
+        .map(|c| c.id.as_str())
+        .unwrap_or(&state.slack_channel);
+    let message_ts = action_payload.message.as_ref().map(|m| m.ts.as_str());
+    let thread_ts = action_payload
+        .message
+        .as_ref()
+        .and_then(|m| m.thread_ts.as_deref());
+
+    process_action(
+        state,
+        &action.action_id,
+        task_id,
+        channel,
+        message_ts,
+        thread_ts,
+    )
+    .await
+}
+
 async fn process_action(
     state: &AppState,
     action_id: &str,

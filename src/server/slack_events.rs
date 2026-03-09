@@ -90,6 +90,24 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
             state.wake_worker();
         }
 
+        // ⚡ ops 手動実行（ops チャンネルのメッセージに対して）
+        "zap" => {
+            if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+                let slack = state.slack_client();
+                // メッセージ本文を取得
+                match slack.fetch_message(channel, message_ts).await {
+                    Ok(msg) => {
+                        let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                        tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                        dispatch_ops_request(state, &msg, channel, message_ts, text, &repo_entry).await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);
+                    }
+                }
+            }
+        }
+
         // 👍 了解（承認操作は Block Kit ボタンに移行済み）
         "+1" => {
             let slack = state.slack_client();
@@ -351,11 +369,38 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     // ops チャンネル判定（トップレベル・スレッド返信の両方で使う）
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
 
-    // ops チャンネル: トップレベルは無視（@bot メンションで app_mention 経由に統一）
-    // スレッド返信のみ許可（既存 ops スレッドへの会話継続）
+    // ops チャンネル: トップレベルは claude -p で作業対象か判定、スレッド返信は既存 ops の会話継続
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
         if thread_ts.is_none() {
-            // トップレベルメッセージ → @bot メンションなしなので無視
+            // ops_monitor が有効なチャンネルのみ自動分類（それ以外は ⚡ 手動トリガーで対応）
+            if repo_entry.ops_monitor {
+                let repo_entry_clone = repo_entry.clone();
+                let state_clone = state.clone();
+                let event_clone = event.clone();
+                let channel_owned = channel.to_string();
+                let message_ts_owned = message_ts.to_string();
+                let text_owned = text.to_string();
+
+                tokio::spawn(async move {
+                    match classify_ops_message(&text_owned, &repo_entry_clone, &state_clone).await {
+                        Ok(true) => {
+                            tracing::info!("ops message classified as actionable in {}", channel_owned);
+                            if let Err(e) = dispatch_ops_request(
+                                &state_clone, &event_clone, &channel_owned,
+                                &message_ts_owned, &text_owned, &repo_entry_clone,
+                            ).await {
+                                tracing::error!("dispatch_ops_request failed: {}", e);
+                            }
+                        }
+                        Ok(false) => {
+                            tracing::debug!("ops message classified as non-actionable in {}", channel_owned);
+                        }
+                        Err(e) => {
+                            tracing::warn!("ops classification failed: {}", e);
+                        }
+                    }
+                });
+            }
             return Ok(());
         }
 
@@ -602,6 +647,74 @@ async fn handle_asana_url_link(
 }
 
 // ============================================================================
+// Ops classification — トップレベルメッセージが作業対象か判定
+// ============================================================================
+
+/// ops チャンネルのメッセージが作業依頼かどうかを claude -p で判定
+async fn classify_ops_message(
+    text: &str,
+    repo_entry: &crate::repo_config::RepoEntry,
+    state: &Arc<AppState>,
+) -> Result<bool> {
+    // 短すぎるメッセージは無視
+    if text.trim().len() < 5 {
+        return Ok(false);
+    }
+
+    // 対応可能な作業の説明を構築
+    let ops_desc = build_ops_description(repo_entry);
+    if ops_desc.is_empty() {
+        return Ok(false);
+    }
+
+    let prompt = format!(
+        "以下のSlackメッセージは、このチャンネルで対応すべき作業依頼ですか？\n\n\
+         ## 対応可能な作業\n{}\n\n\
+         ## メッセージ\n{}\n\n\
+         作業依頼であれば YES、そうでなければ NO とだけ答えてください。",
+        ops_desc, text
+    );
+
+    let log_dir = log_dir_from_state(state);
+    let result = ClaudeRunner::new("classify", &prompt)
+        .max_turns(1)
+        .allowed_tools("")
+        .log_dir(&log_dir)
+        .with_context(&state.runner_ctx)
+        .run()
+        .await?;
+
+    if !result.success {
+        tracing::warn!("classify claude -p failed: {}", result.stderr);
+        return Ok(false);
+    }
+
+    let answer = result.stdout.trim().to_uppercase();
+    Ok(answer.split_whitespace().any(|w| w == "YES"))
+}
+
+/// RepoEntry から対応可能な作業の説明テキストを生成
+fn build_ops_description(repo_entry: &crate::repo_config::RepoEntry) -> String {
+    // tool ベース: ツール名と説明を列挙
+    if let Some(ref tools) = repo_entry.ops_tools {
+        if !tools.is_empty() {
+            return tools
+                .iter()
+                .map(|t| format!("- {}: {}", t.name, t.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    // skill ベース: スキルファイルの存在だけ通知
+    if let Some(ref skills) = repo_entry.ops_skills {
+        if !skills.is_empty() {
+            return "- スキルファイルに定義された定型作業".to_string();
+        }
+    }
+    String::new()
+}
+
+// ============================================================================
 // Ops dispatch (app_mention + thread followup 共通)
 // ============================================================================
 
@@ -624,6 +737,7 @@ async fn dispatch_ops_request(
     let max_turns = state.repos_config.defaults.claude_max_execute_turns;
     let ops_tools = repo_entry.ops_tools.clone();
     let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
+    let ops_download_dir = repo_entry.ops_download_dir.clone();
 
     // 会話履歴を読み込み
     let history = state.db.get_ops_context(channel, thread_ts)?;
@@ -641,15 +755,18 @@ async fn dispatch_ops_request(
     let thread_ts_owned = thread_ts.to_string();
     let log_dir = log_dir_from_state(state);
     let runner_ctx = state.runner_ctx.clone();
+    let admin_user = state.repos_config.defaults.ops_admin_user.clone();
 
     tokio::spawn(async move {
-        // ファイルダウンロード
+        // ファイルダウンロード（ops_download_dir が設定されている場合のみ）
         if !req.files.is_empty() {
-            let images_dir = repo_path.join("images");
-            for f in &req.files {
-                let dest = images_dir.join(&f.name);
-                if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
-                    tracing::warn!("Failed to download file {}: {}", f.name, e);
+            if let Some(ref dl_dir) = ops_download_dir {
+                let download_dir = repo_path.join(dl_dir);
+                for f in &req.files {
+                    let dest = download_dir.join(&f.name);
+                    if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
+                        tracing::warn!("Failed to download file {}: {}", f.name, e);
+                    }
                 }
             }
         }
@@ -662,16 +779,17 @@ async fn dispatch_ops_request(
         // ops_tools (tool ベース) と ops_skills (skill ベース) を分岐
         let use_tools = ops_tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
 
+        let dl_dir_ref = ops_download_dir.as_deref();
         let exec_result = if use_tools {
             let tools = ops_tools.as_ref().unwrap();
             crate::worker::ops::execute_ops_with_tools(
                 &req, &repo_path, tools, &soul,
-                Some(&log_dir), &runner_ctx, &history,
+                Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
             ).await
         } else {
             crate::worker::ops::execute_ops(
                 &req, &repo_path, &ops_skills, &soul,
-                max_turns, Some(&log_dir), &runner_ctx, &history,
+                max_turns, Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
             ).await
         };
 
@@ -682,14 +800,24 @@ async fn dispatch_ops_request(
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
 
-                let truncated = crate::worker::runner::truncate_for_slack(&output, 3700);
-                let suffix = if truncated.len() < output.len() { "\n... (truncated)" } else { "" };
-                let msg = format!(":white_check_mark: 完了\n```\n{}{}\n```", truncated, suffix);
-                slack.reply_thread(&channel, &thread_ts_owned, &msg).await.ok();
+                // 依頼者向け: スレッドにフレンドリーな完了メッセージ
+                slack.reply_thread(&channel, &thread_ts_owned, ":white_check_mark: 対応完了しました！").await.ok();
+
+                // 管理者向け: DM で詳細結果を通知
+                if let Some(ref admin) = admin_user {
+                    let detail = format!(":white_check_mark: *ops 完了* (#{}):\n```\n{}\n```", channel, output);
+                    slack.post_message(admin, &detail).await.ok();
+                }
             }
             Err(e) => {
-                let msg = format!(":x: 失敗: {}", e);
-                slack.reply_thread(&channel, &thread_ts_owned, &msg).await.ok();
+                // 依頼者向け: スレッドにエラー通知
+                slack.reply_thread(&channel, &thread_ts_owned, ":x: 処理に失敗しました。管理者に連絡します。").await.ok();
+
+                // 管理者向け: DM でエラー詳細を通知
+                if let Some(ref admin) = admin_user {
+                    let detail = format!(":x: *ops 失敗* (#{}):\n```\n{}\n```", channel, e);
+                    slack.post_message(admin, &detail).await.ok();
+                }
             }
         }
     });

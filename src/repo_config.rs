@@ -93,6 +93,8 @@ pub struct Defaults {
     pub claude_allowed_env: Vec<String>,
     #[serde(default)]
     pub module_policy: HashMap<String, ModulePolicy>,
+    /// ops 完了時に詳細結果を通知する管理者の Slack ユーザーID
+    pub ops_admin_user: Option<String>,
     /// Bedrock モデル ID (設定時に ops を Bedrock バックエンドで実行)
     pub bedrock_model_id: Option<String>,
     /// Bedrock リージョン (省略時は AWS_DEFAULT_REGION)
@@ -163,6 +165,13 @@ pub struct RepoEntry {
     /// 新方式: tool ベース (優先)
     #[serde(default)]
     pub ops_tools: Option<Vec<OpsToolDef>>,
+    /// Slack 添付ファイルの保存先ディレクトリ（repo_path からの相対パス）
+    /// 未設定の場合はファイルをダウンロードしない
+    pub ops_download_dir: Option<String>,
+    /// true: チャンネルのトップレベルメッセージを自動監視して作業対象か判定
+    /// false/未設定: ⚡リアクションによる手動トリガーのみ
+    #[serde(default)]
+    pub ops_monitor: bool,
     /// true: 分析後に自動実行 + PR 作成（承認スキップ）
     #[serde(default)]
     pub auto_execute: bool,

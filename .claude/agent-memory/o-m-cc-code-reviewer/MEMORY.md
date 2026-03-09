@@ -14,6 +14,20 @@
 - `build_system_prompt()` の共通化は analyzer/decomposer/executor/scheduler で適切に実施済み
 - `HookDecision` の `before_run` チェーンは設計として OK (短絡評価)
 
+### 効率・ホットパス上の既知パターン
+- `load_credentials_env()` が `load_slack_config/asana/server` ごとに独立呼び出しされ、起動時に3ファイルを複数回読む → `OnceLock` またはまとめて1回呼び出しにすべき
+- `cmd_task` のように複数フラグがある関数で DB を毎フラグ open するパターンが発生しやすい → 先頭で1回だけ open して使い回す
+- ops_monitor チャンネルで全トップレベルメッセージを LLM 分類するパターン → 高頻度チャンネルではコスト増大リスク
+- `load_credentials_env` の `set_var` ループは「プロセス env が最優先」になっており、`.env` 優先というコメントと矛盾しやすい
+- 二重 spawn（外側 spawn → 内側 spawn）は機能問題なし → 過剰検知寄り、デバッグ複雑性の指摘にとどめる
+
+### 繰り返し見つかるコード再利用問題
+- `AsanaConfig { pat: state.asana_pat.clone(), ... }` の inline 構築が `slack_events.rs` / `webhook.rs` / `hooks.rs` で繰り返し発生 → `AppState::asana_config()` メソッド化が有効
+- `OpsContext` 構造体が `http.rs` に定義されているが実際には未使用（会話履歴は DB 経由）→ デッドコードの可能性大
+- `classify_ops_message` の `answer.contains("YES")` は部分一致問題（memory 既記の `.split_whitespace().any(|w| w == keyword)` が安全）
+- `log_dir_from_state` はモジュールプライベートで `slack_events.rs` 内に閉じており、他ファイルに同じロジックが生まれる余地がある → `AppState` のメソッドに移動が望ましい
+- `reqwest::Client::new()` が `slack_socket.rs` と `SlackClient` / `AsanaClient` / `GoogleCalendarClient` に分散 → Socket Mode は `SlackClient` を共有できる可能性あり
+
 ### Blast Radius が大きかった変更の傾向
 - `RunnerContext` の導入: 11ファイルにシグネチャ変更が波及 (これは意図的なリファクタリング)
 - `truncate_for_slack` が `runner.rs` から `slack_events.rs` に参照されており、モジュール境界が曖昧になっている

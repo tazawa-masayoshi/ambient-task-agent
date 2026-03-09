@@ -42,7 +42,7 @@ pub struct SlackFile {
 }
 
 /// ops プロンプトを構築（履歴 + メッセージ + 添付ファイル）
-fn build_ops_prompt(req: &OpsRequest, history: &[OpsMessage]) -> String {
+fn build_ops_prompt(req: &OpsRequest, history: &[OpsMessage], download_dir: Option<&str>) -> String {
     let mut parts = Vec::new();
     if !history.is_empty() {
         let history_text: Vec<String> = history
@@ -53,15 +53,28 @@ fn build_ops_prompt(req: &OpsRequest, history: &[OpsMessage]) -> String {
     }
     parts.push(format!("## Slackメッセージ\n{}", req.message_text));
     if !req.files.is_empty() {
-        let file_list: Vec<String> = req
-            .files
-            .iter()
-            .map(|f| format!("- images/{}", f.name))
-            .collect();
-        parts.push(format!(
-            "## 添付ファイル（images/ にダウンロード済み）\n{}",
-            file_list.join("\n")
-        ));
+        if let Some(dir) = download_dir {
+            let file_list: Vec<String> = req
+                .files
+                .iter()
+                .map(|f| format!("- {}/{}", dir, f.name))
+                .collect();
+            parts.push(format!(
+                "## 添付ファイル（{}/ にダウンロード済み）\n{}",
+                dir,
+                file_list.join("\n")
+            ));
+        } else {
+            let file_list: Vec<String> = req
+                .files
+                .iter()
+                .map(|f| format!("- {}", f.name))
+                .collect();
+            parts.push(format!(
+                "## 添付ファイル（Slackに添付、ローカル未保存）\n{}",
+                file_list.join("\n")
+            ));
+        }
     }
     parts.join("\n\n")
 }
@@ -95,6 +108,7 @@ pub async fn execute_ops(
     log_dir: Option<&Path>,
     runner_ctx: &RunnerContext,
     history: &[OpsMessage],
+    download_dir: Option<&str>,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
     if skill_content.is_empty() {
@@ -108,7 +122,7 @@ pub async fn execute_ops(
         base_soul, skill_content, OPS_RULES
     );
 
-    let prompt = build_ops_prompt(req, history);
+    let prompt = build_ops_prompt(req, history, download_dir);
 
     let result = ClaudeRunner::new("ops", &prompt)
         .system_prompt(&system_prompt)
@@ -189,20 +203,15 @@ async fn execute_ops_tool(
     params: &serde_json::Value,
     repo_path: &Path,
 ) -> Result<String> {
-    let command_path = repo_path.join(&tool.command);
+    let command_path = if Path::new(&tool.command).is_absolute() {
+        PathBuf::from(&tool.command)
+    } else {
+        repo_path.join(&tool.command)
+    };
 
-    // パストラバーサル防止（canonicalize 失敗＝ファイル不在はそのままエラー）
-    let canonical = command_path
-        .canonicalize()
-        .with_context(|| format!("Tool command not found: {}", tool.command))?;
-    let repo_canonical = repo_path
-        .canonicalize()
-        .context("Failed to canonicalize repo_path")?;
-    if !canonical.starts_with(&repo_canonical) {
-        anyhow::bail!(
-            "Tool command path traversal detected: {}",
-            tool.command
-        );
+    // コマンドファイルの存在確認
+    if !command_path.exists() {
+        anyhow::bail!("Tool command not found: {}", command_path.display());
     }
 
     let mut cmd = tokio::process::Command::new("bash");
@@ -273,6 +282,7 @@ pub async fn execute_ops_with_tools(
     log_dir: Option<&Path>,
     runner_ctx: &RunnerContext,
     history: &[OpsMessage],
+    download_dir: Option<&str>,
 ) -> Result<String> {
     if tools.is_empty() {
         anyhow::bail!("No ops_tools defined");
@@ -282,7 +292,7 @@ pub async fn execute_ops_with_tools(
     let base_soul = if soul.is_empty() { TOOL_OPS_SOUL } else { soul };
     let system_prompt = base_soul.to_string();
 
-    let prompt = build_ops_prompt(req, history);
+    let prompt = build_ops_prompt(req, history, download_dir);
 
     // OpsToolDef → ToolMeta に変換
     let tool_metas: Vec<ToolMeta> = tools.iter().map(ops_tool_to_meta).collect();

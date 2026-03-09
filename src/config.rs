@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static CREDENTIALS_ENV: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SlackConfig {
@@ -18,18 +21,33 @@ pub struct AsanaConfig {
     pub user_name: String,
 }
 
-/// Load environment variables from .env files.
-/// Priority: ./.env > ~/.credentials/common.env
+/// Load environment variables from .env files + process env.
+/// Priority: ./.env > ~/.credentials/ambient-task-agent.env > ~/.credentials/common.env > process env
+/// Also sets loaded values into process env so std::env::var() can find them.
 pub fn load_credentials_env() -> HashMap<String, String> {
-    let mut map = HashMap::new();
+    CREDENTIALS_ENV
+        .get_or_init(|| {
+            let mut map: HashMap<String, String> = std::env::vars().collect();
 
-    let global_path = home_dir().join(".credentials/common.env");
-    load_env_file(&global_path, &mut map);
+            let global_path = home_dir().join(".credentials/common.env");
+            load_env_file(&global_path, &mut map);
 
-    let local_path = PathBuf::from(".env");
-    load_env_file(&local_path, &mut map);
+            let agent_path = home_dir().join(".credentials/ambient-task-agent.env");
+            load_env_file(&agent_path, &mut map);
 
-    map
+            let local_path = PathBuf::from(".env");
+            load_env_file(&local_path, &mut map);
+
+            // .env ファイルから読んだ値を process env にも反映
+            for (key, value) in &map {
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                }
+            }
+
+            map
+        })
+        .clone()
 }
 
 fn load_env_file(path: &PathBuf, map: &mut HashMap<String, String>) {

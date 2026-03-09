@@ -566,6 +566,17 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         worker.run().await;
     });
 
+    // Socket Mode（SLACK_APP_TOKEN があれば起動）
+    let app_token = std::env::var("SLACK_APP_TOKEN").ok();
+    if let Some(ref token) = app_token {
+        let state = std::sync::Arc::new(app_state.clone());
+        let token = token.clone();
+        tokio::spawn(async move {
+            server::slack_socket::run_socket_mode(state, token).await;
+        });
+        tracing::info!("Socket Mode enabled");
+    }
+
     // HTTP サーバー起動
     server::http::run_server(app_state, port).await
 }

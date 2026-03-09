@@ -151,6 +151,36 @@ impl SlackClient {
         Ok(())
     }
 
+    /// conversations.history でメッセージ1件を取得（リアクション→ops 用）
+    pub async fn fetch_message(&self, channel: &str, ts: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get("https://slack.com/api/conversations.history")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .query(&[
+                ("channel", channel),
+                ("latest", ts),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ])
+            .send()
+            .await
+            .context("Slack conversations.history request failed")?;
+
+        let data: serde_json::Value = resp.json().await.context("Failed to parse response")?;
+
+        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+            anyhow::bail!("conversations.history error: {}", err);
+        }
+
+        data.get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .context("No message found")
+    }
+
     async fn send_message(
         &self,
         channel: &str,

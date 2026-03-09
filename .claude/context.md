@@ -3,24 +3,22 @@
 > compaction で失われる文脈を保存。compaction summary と合わせて復元に使用。
 > Learnings に長期的価値があれば MEMORY.md に反映すること。
 
-### Snapshot (03/09 10:51, auto)
+### Snapshot (03/09 18:06, auto)
 
-**Intent:** https://github.com/sipeed/picoclaw
+**Intent:** ..
 
-**Outcomes:** 5 files changed
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/bedrock.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/claude.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/repo_config.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_events.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/ops.rs`
+**Outcomes:** 6 files changed
+- `/home/ec2-user/.config/ambient-task-agent/repos.toml`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/config.rs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/repo_config.rs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/server/slack_events.rs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/worker/ops.rs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/tools/hikken_add_subcategory.sh`
 
 **Context:**
 
-".claude/scripts/add-subcategory.sh"
-```
+ で起動し、Socket Mode 接続完了しています。Slack で 🤖 スタンプを押してテストしてください。
+まだイベント来ていない。もう少し待ちます。
+イベントが来ていません。🤖 リアクションは `reaction_added` イベントとして受信されるはずですが、以前一度押して外していないと再度同じリアクションは送信されません。
 
-方向性は正しい。今日の変更をまとめると：
-
-1. **ClaudeCliBackend 強化** — `--output-format json` / `--dangerously-skip-permissions` / `--no-chrome` / stdin入力 / JSON usage パース（PicoClaw + OpenFang 参考）
-2. **ops の Tool 化** — `ExtraToolDispatcher` trait + `OpsToolDef` in TOML + `PARAM_xxx` 環境変数（ZeroClaw + OpenFang 参考）
-3. **後方互換** — `ops_tools` 優先、`ops_skills` フォールバック
+一度 🤖 を外してからもう一度押してみてください。
