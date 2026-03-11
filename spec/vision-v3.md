@@ -16,16 +16,132 @@
 
 | プロジェクト | 概要 | 参考ポイント |
 |-------------|------|-------------|
-| [openclaw/openclaw](https://github.com/openclaw/openclaw) | パーソナル AI アシスタント — Gateway + マルチチャネル + デバイスノード（Node.js/TS） | Gateway WS コントロールプレーン（セッション・プレゼンス・cron・webhook 統合管理）、20+ チャネル（Slack Bolt/Discord/Telegram/WhatsApp/iMessage 等）、クロスエージェント通信（sessions_list/send/history）、per-session state（model/thinking level 切替）、Skills プラットフォーム（bundled/managed/workspace）、デバイスノード（macOS/iOS/Android）統合、cron + webhook + Gmail Pub/Sub、DM pairing セキュリティ |
-| [RightNow-AI/openfang](https://github.com/RightNow-AI/openfang) | Agent OS — 自律エージェントの完全なランタイム環境（Rust, 14 crate, 138K LOC） | 「Hands」= 自律実行パッケージ（スケジュール駆動、24/7稼働）、HAND.toml マニフェスト + SKILL.md、40チャネルアダプタ（Slack/Discord/Telegram等）、WASM サンドボックス + 16段セキュリティ、SQLite + ベクトル埋め込み、Merkle hash-chain 監査証跡、承認ゲート（購買等の危険操作に必須承認） |
-| [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) | 軽量自律 AI アシスタント基盤（Rust, <5MB RAM） | トレイト駆動アーキテクチャ（Provider/Channel/Memory/Tool/Runtime 全て差し替え可能）、設定変更だけで実装切替（zero code changes）、SQLite ハイブリッド検索 + PostgreSQL 対応、15+ チャネル対応、ガイダンスシステム（TOML マニフェスト + SKILL.md）、daemon モード常時稼働 |
-| [sipeed/picoclaw](https://github.com/sipeed/picoclaw) | 超軽量パーソナル AI アシスタント（Go, <10MB RAM, $10 HW で動作） | Gateway モード（永続 Webhook サーバー）+ Agent モード（CLI）+ Launcher モード（Web UI）、RISC-V/ARM/MIPS/x86 マルチアーキテクチャ、チャット統合（Telegram/Discord/WhatsApp/LINE等）、model_list 形式でゼロコードプロバイダ追加 |
+| [openclaw/openclaw](https://github.com/openclaw/openclaw) | パーソナル AI アシスタント — Gateway + マルチチャネル + デバイスノード（Node.js/TS, 56K stars） | Gateway WS コントロールプレーン（セッション・プレゼンス・cron・webhook 統合管理）、20+ チャネル（Slack Bolt/Discord/Telegram/WhatsApp/iMessage 等）、クロスエージェント通信（sessions_list/send/history）、per-session state（model/thinking level 切替）、Skills プラットフォーム（bundled/managed/workspace）、DM pairing セキュリティ |
+| [openclaw/acpx](https://github.com/openclaw/acpx) | ACP（Agent Client Protocol）CLI クライアント | リポジトリスコープの名前付き並列セッション（`-s backend`/`-s frontend`）、Prompt Queue（実行中に新プロンプトが来たら queue に積む）、Crash Recovery（自動セッション再開）、`~/.acpx/` にセッション状態永続化 |
+| [openclaw/caclawphony](https://github.com/openclaw/caclawphony) | PR 自動管理パイプライン（Linear + GitHub 統合） | 「状態遷移 = 承認認可」の設計（Linear state 遷移でエージェント行動を解放）、Triage→Review→Preparation の専門エージェント分離、GitHub の実際の状態と Tracker 状態の突合わせ、resource-aware serialization（1件ずつ処理） |
+| [openclaw/lobster](https://github.com/openclaw/lobster) | ワークフローシェル（typed pipeline エンジン） | YAML front matter + Markdown で typed pipeline 定義（WORKFLOW.md と同じ発想）、`approve: true` による人間確認ゲート、ステップ間依存定義 |
+| [RightNow-AI/openfang](https://github.com/RightNow-AI/openfang) | Agent OS — 自律エージェントの完全なランタイム環境（Rust, 14 crate, 13.6K stars） | Workflow Engine（Sequential/FanOut/Conditional/Loop の4実行モード）、承認ゲート（Tokio oneshot channel で agent が suspend → 人間が resolve）、deny-wins ツールポリシー（`@web_tools` グループ参照 + depth-aware 権限削減）、3種のバックグラウンド実行（continuous/periodic/proactive）、Pre-advance cron scheduling（二重発火防止）、Context Budget（モデル窓サイズ比率でのアダプティブ制限）、Busy-flag tick skipping、エラー注入プロンプト（"Report error honestly, do NOT fabricate"） |
+| [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) | 軽量自律 AI アシスタント基盤（Rust, <5MB RAM, 25.9K stars） | Lane Queue（セッション単位の直列実行レーン）、AGENTS.md worktree ルール（scope命名・single-concern・cleanup policy）、段階的自律レベル（full/assisted/supervised）、7-gate defense-in-depth セキュリティスタック、段階的 Emergency Stop（KillAll/NetworkKill/ToolFreeze）、9-state ライフサイクル FSM（typed state + guarded transitions）、Research Phase（行動前の多ツール調査フェーズ）、crash-isolated subsystem supervision、Doctor ヘルスチェック |
+| [sipeed/picoclaw](https://github.com/sipeed/picoclaw) | 超軽量パーソナル AI アシスタント（Go, <10MB RAM, 23K stars） | 3チャンネルメッセージバス（inbound/outbound/outbound_media 分離）、再利用可能 ToolLoop（main agent と subagent で同一ロジック）、3層ファイルサンドボックス（hostFs→sandboxFs→whitelistFs）、Shell deny リスト（40+ 正規表現）、非同期 Spawn + callback パターン、ルールベースモデルルーティング（ML不要の複雑度分類器）、mtime ベースコンテキストキャッシュ無効化 |
 
 ### プロンプト設計
 
 | プロジェクト | 概要 | 参考ポイント |
 |-------------|------|-------------|
 | [phuryn/pm-skills](https://github.com/phuryn/pm-skills) | PM 向けプロンプトスキル集 | ロール設定 → Think Step by Step → 構造化テンプレートのパターン、Tiger 分類フレームワーク |
+
+## 参考プロジェクトから取り入れるパターン
+
+### 優先度: 高（Phase 1-2 で採用）
+
+#### 1. Worktree 安全ルール（ZeroClaw, OpenClaw）
+
+CLAUDE.md / AGENTS.md にエージェント向けの worktree 行動規範を明文化する。
+
+```
+- 専用 worktree 内でのみ作業する（共有 workspace を触らない）
+- 1 worktree = 1 ブランチ = 1 タスク（混在禁止）
+- 命名規約: agent/task-{id}
+- git stash / branch 切り替え / worktree 作成は禁止（管理はランタイムが行う）
+- マージ/クローズ後は cleanup（git worktree prune + git fetch --prune）
+- Queue safety: 現在のタスクのみアサイン、将来のタスクを先取りしない
+```
+
+#### 2. 承認ゲートの改善（OpenFang, ZeroClaw）
+
+現在の Slack ボタン + `:+1:` を、OpenFang の oneshot channel パターンで強化する。
+
+```
+現在:  Slack ボタン → DB ポーリング → 状態遷移
+改善:  Slack ボタン → tokio::oneshot → タスク即再開（ポーリング不要）
+```
+
+段階的自律レベル（ZeroClaw 由来）を per-repo 設定に追加:
+- `full`: 分析後に自動実行（承認スキップ）— 信頼済みリポ
+- `assisted`: 高リスク操作のみ承認要求 — 通常リポ
+- `supervised`: 全ステップで承認必須 — 本番環境リポ
+
+#### 3. Pre-advance Cron Scheduling（OpenFang）
+
+スケジュールジョブの `next_run` を実行前に更新する（実行後ではなく）。
+遅い実行が次のティックと重なっても二重発火しない。
+
+#### 4. Busy-flag Tick Skipping（OpenFang）
+
+ポーリングループで前回の処理がまだ実行中なら、次のティックをスキップする。
+バックログの蓄積を防止。現行の `tokio::interval` + セマフォに追加する軽量改善。
+
+### 優先度: 中（Phase 3-4 で採用）
+
+#### 5. ルールベースモデルルーティング（PicoClaw）
+
+Slack メッセージの複雑度でモデルを切り替え、コストを最適化する。
+
+```
+score = 0
+if tokens > 200: +0.35
+if code block:   +0.40    ← 最強シグナル
+if tool_calls > 3: +0.25
+
+threshold = 0.35 → haiku（軽量応答） / sonnet（コーディング）
+```
+
+ML 不要、サブマイクロ秒、外部呼び出しなし。
+
+#### 6. 段階的 Emergency Stop（ZeroClaw）
+
+Slack ops チャンネルから段階的な停止コマンドを発行:
+- `kill`: 全タスク停止
+- `freeze`: ツール実行のみ凍結（エージェントは生存）
+- `pause {task_id}`: 特定タスクのみ一時停止
+
+#### 7. Research Phase（ZeroClaw）
+
+Agent ループに「調査フェーズ」を明示的に組み込む。
+実装前に多ツールでコードベースを調査 → 計画策定 → 実行。
+現行の Analyzer は同等だが、Executor 内でも mini-research を行う設計にする。
+
+#### 8. Doctor / Health Check（ZeroClaw）
+
+`/doctor` コマンドで全サブシステムの疎通確認:
+- Asana API: 接続 + トークン有効性
+- Slack API: Bot token + チャンネルアクセス
+- GitHub: SSH 接続 + リポジトリアクセス
+- Google Calendar: Service Account 認証
+- DB: WAL モード + テーブル存在確認
+
+#### 9. GitHub/Tracker 状態突合わせ（caclawphony）
+
+CI の実際の状態（`gh run list`）と `task_attempts.status` を定期的に突合わせる。
+DB の状態が「ci_pending」なのに GitHub では既に完了/失敗しているケースを検出・修正。
+
+#### 10. Triage 多信号重複検出（caclawphony）
+
+新タスク作成時に既存タスクとの重複を検出する:
+- タイトル/説明の類似度（キーワードマッチ）
+- 影響ファイルの重複（同じファイルを変更するタスク）
+- 関連 Issue の共通性
+
+### 優先度: 低（将来検討）
+
+#### 11. ACP セッション管理（acpx）
+
+Claude Code プロセスを長期セッションとして管理する将来構想:
+- リポジトリスコープのセッション永続化
+- Prompt Queue（実行中に次のプロンプトを積む）
+- Crash Recovery（自動セッション再開）
+
+#### 12. Context Budget アダプティブ制限（OpenFang）
+
+モデルの context window サイズに対する比率で制限:
+- 個別結果: 窓の 30% を超えたら truncate
+- 全体: 75% を超えたら古い結果を 2000 chars にコンパクション
+- UTF-8 セーフ（境界を歩いて有効位置まで戻る）
+
+#### 13. 3チャンネルメッセージバス（PicoClaw）
+
+inbound / outbound / outbound_media を分離して head-of-line blocking を防止。
+現行の Slack 送受信が複雑化した場合に検討。
 
 ## アーキテクチャ思想
 
