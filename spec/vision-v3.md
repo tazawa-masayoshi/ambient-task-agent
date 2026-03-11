@@ -30,6 +30,12 @@
 |-------------|------|-------------|
 | [phuryn/pm-skills](https://github.com/phuryn/pm-skills) | PM 向けプロンプトスキル集 | ロール設定 → Think Step by Step → 構造化テンプレートのパターン、Tiger 分類フレームワーク |
 
+### Harness Engineering / ベストプラクティス記事
+
+| 記事 | 概要 | 参考ポイント |
+|------|------|-------------|
+| [逆瀬川ちゃん — Harness Engineering ベストプラクティス](https://gyakuse.com/harness-engineering) | Claude Code / Codex ユーザー向け Harness Engineering 総合ガイド（2026-03-09） | 7本柱: (1) リポジトリ衛生（ADR + テスト = 腐敗耐性）、(2) 決定論的ツール（PostToolUse Hook でリンター自動実行、Plankton パターン、リンター設定保護、エラーメッセージを修正指示にする）、(3) AGENTS.md/CLAUDE.md はポインタとして50行以下、(4) 計画と実行の分離、(5) E2E テスト戦略（アクセシビリティツリー = ユニバーサル IF、agent-browser/Playwright CLI）、(6) セッション間状態管理（Git ログ = ブリッジ、JSON 進捗記録）、(7) Codex vs Claude Code 比較（Hooks が最大差別化要因）。MVH（最小実行可能ハーネス）ロードマップ付き |
+
 ## 参考プロジェクトから取り入れるパターン
 
 ### 優先度: 高（Phase 1-2 で採用）
