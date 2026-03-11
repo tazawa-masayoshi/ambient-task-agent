@@ -877,6 +877,33 @@ impl Db {
         Ok(())
     }
 
+    /// ci_pending 状態のタスクを1件取得
+    pub fn get_ci_pending_task(&self) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'ci_pending' ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
+        Ok(task)
+    }
+
+    /// retry_count をインクリメントして新しい値を返す
+    pub fn increment_retry_count(&self, id: i64) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET retry_count = retry_count + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        let count: i32 = conn.query_row(
+            "SELECT retry_count FROM coding_tasks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     // ── ops_contexts ──
 
     /// ops 会話メッセージを保存

@@ -175,6 +175,13 @@ pub struct RepoEntry {
     /// true: 分析後に自動実行 + PR 作成（承認スキップ）
     #[serde(default)]
     pub auto_execute: bool,
+    /// CI 失敗時の最大リトライ回数（デフォルト: 3）
+    #[serde(default = "default_ci_max_retry")]
+    pub ci_max_retry: u32,
+}
+
+fn default_ci_max_retry() -> u32 {
+    3
 }
 
 fn default_branch() -> String {
