@@ -22,4 +22,13 @@
   Key patterns: Lane Queue per session, worktree isolation rules (one wt per PR/scope), 7-gate security stack,
   9-state lifecycle FSM, graduated emergency stop (KillAll/NetworkKill/DomainBlock/ToolFreeze),
   daemon supervision with exponential backoff, autonomy levels (full/assisted/supervised).
+  Concurrency: max_concurrent=24 default, queue_poll_ms=250, queue_wait_ms=30000, load_window_secs=240,
+  strategy="least_loaded". Heartbeat=30min interval (HEARTBEAT.md). No DB for task state (in-memory Tokio).
   Patterns documented in `zeroclaw-patterns.md`.
+- **OpenClaw** (https://github.com/openclaw/openclaw): TypeScript autonomous agent (247k stars, Mar 2026).
+  Key patterns: 4-lane FIFO queue (main/cron/subagent/nested), per-session serialization (cap=1),
+  global throttle via agents.defaults.maxConcurrent, sessions_spawn for child agents (heavyweight),
+  Lobster for deterministic multi-step pipelines (no DB, environment-based state).
+  Heartbeat: HeartbeatRunner every 30min (configurable), reads HEARTBEAT.md, skips if main lane busy.
+  Task state: NO plan→DB→execute pattern; pure in-memory queue + session history.
+  Concurrency docs: https://docs.openclaw.ai/concepts/queue, https://docs.openclaw.ai/gateway/heartbeat

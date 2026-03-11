@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,12 +22,10 @@ pub struct Worker {
     asana_pat: String,
     asana_project_id: String,
     asana_user_name: String,
-    google_calendar: Option<GoogleCalendarClient>,
+    google_calendar: tokio::sync::Mutex<Option<GoogleCalendarClient>>,
     default_slack_channel: String,
     notify: Arc<Notify>,
     runner_ctx: crate::execution::RunnerContext,
-    /// Busy-flag: 前回のタスク処理がまだ実行中かどうか（バックログ防止）
-    busy: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -52,11 +49,10 @@ impl Worker {
             asana_pat,
             asana_project_id,
             asana_user_name,
-            google_calendar,
+            google_calendar: tokio::sync::Mutex::new(google_calendar),
             default_slack_channel,
             notify,
             runner_ctx,
-            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -80,9 +76,10 @@ impl Worker {
 
     /// メインワーカーループ
     ///
-    /// - ハートビート（60秒）: スケジューラージョブチェック
+    /// - ハートビート（15秒）: DB からタスクを取得して tokio::spawn で並列実行
     /// - イベント駆動: Notify で即時起床してタスク処理
-    pub async fn run(mut self) {
+    /// - 各タスクは spawn されるため、heartbeat ループはブロックしない
+    pub async fn run(self) {
         let heartbeat_secs = std::cmp::max(
             self.repos_config.defaults.worker_heartbeat_secs,
             MIN_HEARTBEAT_SECS,
@@ -95,26 +92,17 @@ impl Worker {
             tracing::error!("Failed to seed schedules: {}", e);
         }
 
+        let worker = Arc::new(self);
         let mut consecutive_errors: u32 = 0;
 
         loop {
-            // Busy-flag tick skipping: 前回の処理がまだ実行中ならスキップ
-            if self.busy.swap(true, Ordering::SeqCst) {
-                tracing::debug!("Worker busy, skipping tick");
-                tokio::time::sleep(heartbeat).await;
-                continue;
-            }
-
             let mut had_error = false;
 
-            // タスク処理
-            had_error |= self.process_tasks().await;
+            // タスク処理（個別に spawn、ループはブロックしない）
+            had_error |= worker.process_tasks();
 
-            // スケジューラージョブチェック
-            had_error |= self.run_scheduler().await;
-
-            // Busy-flag 解除
-            self.busy.store(false, Ordering::SeqCst);
+            // スケジューラージョブチェック（軽量なので直接 await）
+            had_error |= worker.run_scheduler().await;
 
             // エラー時バックオフ、通常時はハートビートまたは Notify 待ち
             if had_error {
@@ -132,7 +120,7 @@ impl Worker {
                 consecutive_errors = 0;
                 // Notify またはハートビートタイムアウトで起床
                 tokio::select! {
-                    _ = self.notify.notified() => {
+                    _ = worker.notify.notified() => {
                         tracing::debug!("Worker woken by event");
                     }
                     _ = tokio::time::sleep(heartbeat) => {
@@ -143,16 +131,22 @@ impl Worker {
         }
     }
 
-    /// タスクキューを処理。エラーがあれば true を返す
-    async fn process_tasks(&self) -> bool {
+    /// タスクキューを処理。各タスクを tokio::spawn で並列実行する。
+    /// DB フェッチエラーがあれば true を返す。
+    fn process_tasks(self: &Arc<Self>) -> bool {
         let mut had_error = false;
 
-        // 1. new → planning → proposed/auto_approved
+        // 1. new → planning（spawn 前にステータスを claim して二重 pickup 防止）
         match self.db.get_new_task() {
             Ok(Some(task)) => {
                 tracing::info!("Planning task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.plan_task(task).await {
-                    tracing::error!("Task planning failed: {}", e);
+                if self.db.update_status(task.id, "planning").is_ok() {
+                    let w = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = w.plan_task(task).await {
+                            tracing::error!("Task planning failed: {}", e);
+                        }
+                    });
                 }
             }
             Ok(None) => {}
@@ -166,8 +160,13 @@ impl Worker {
         match self.db.get_approved_task() {
             Ok(Some(task)) => {
                 tracing::info!("Executing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.execute_approved_task(task).await {
-                    tracing::error!("Approved task execution failed: {}", e);
+                if self.db.update_status(task.id, "executing").is_ok() {
+                    let w = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = w.execute_approved_task(task).await {
+                            tracing::error!("Approved task execution failed: {}", e);
+                        }
+                    });
                 }
             }
             Ok(None) => {}
@@ -192,8 +191,13 @@ impl Worker {
         match self.db.get_auto_approved_task() {
             Ok(Some(task)) => {
                 tracing::info!("Auto-executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.execute_approved_task(task).await {
-                    tracing::error!("Auto-execution failed: {}", e);
+                if self.db.update_status(task.id, "executing").is_ok() {
+                    let w = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = w.execute_approved_task(task).await {
+                            tracing::error!("Auto-execution failed: {}", e);
+                        }
+                    });
                 }
             }
             Ok(None) => {}
@@ -207,9 +211,12 @@ impl Worker {
         match self.db.get_ci_pending_task() {
             Ok(Some(task)) => {
                 tracing::debug!("Checking CI for task: {} ({})", task.asana_task_name, task.id);
-                if let Err(e) = self.check_ci_and_handle(task).await {
-                    tracing::error!("CI check failed: {}", e);
-                }
+                let w = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(e) = w.check_ci_and_handle(task).await {
+                        tracing::error!("CI check failed: {}", e);
+                    }
+                });
             }
             Ok(None) => {}
             Err(e) => {
@@ -229,15 +236,16 @@ impl Worker {
     }
 
     /// スケジューラージョブを実行。エラーがあれば true を返す
-    async fn run_scheduler(&mut self) -> bool {
+    async fn run_scheduler(&self) -> bool {
         let base_dir = &self.repos_config.defaults.repos_base_dir;
+        let gcal = self.google_calendar.lock().await.take();
         let mut ctx = scheduler::SchedulerContext {
             db: self.db.clone(),
             slack: self.slack.clone(),
             asana_pat: self.asana_pat.clone(),
             asana_project_id: self.asana_project_id.clone(),
             asana_user_name: self.asana_user_name.clone(),
-            google_calendar: self.google_calendar.take(),
+            google_calendar: gcal,
             repos_base_dir: base_dir.clone(),
             stagnation_threshold_hours: self.repos_config.defaults.stagnation_threshold_hours,
             soul: context::read_soul(base_dir),
@@ -253,7 +261,7 @@ impl Worker {
             false
         };
 
-        self.google_calendar = ctx.google_calendar;
+        *self.google_calendar.lock().await = ctx.google_calendar;
         had_error
     }
 
@@ -290,10 +298,7 @@ impl Worker {
             }
         };
 
-        // Step 2: status → planning
-        self.db.update_status(task.id, "planning")?;
-
-        // Step 3: リポジトリパスを解決
+        // Step 2: リポジトリパスを解決（status は spawn 前に "planning" に更新済み）
         let repo_path = match self.resolve_repo_path(&task) {
             Ok(p) => p,
             Err(e) => {
@@ -423,14 +428,13 @@ impl Worker {
             return self.execute_in_worktree(task, entry).await;
         }
 
-        // フォールバック: worktree なし直接実行
+        // フォールバック: worktree なし直接実行（status は spawn 前に "executing" に更新済み）
         let channel = task
             .slack_channel
             .as_deref()
             .unwrap_or(&self.default_slack_channel);
         let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
 
-        self.db.update_status(task.id, "executing")?;
         let exec_blocks = build_executing_blocks(task.id, ":rocket: 実行中...");
         self.slack
             .post_blocks(channel, thread_ts, &exec_blocks, "実行中...")
@@ -546,8 +550,7 @@ impl Worker {
         self.db
             .update_branch_name(task.id, &ws.branch_name)?;
 
-        // Step 3: status → executing（ストップボタン付き通知）
-        self.db.update_status(task.id, "executing")?;
+        // Step 3: ストップボタン付き通知（status は spawn 前に "executing" に更新済み）
         let exec_msg = format!(":rocket: worktree で実行中... (branch: `{}`)", ws.branch_name);
         let exec_blocks = build_executing_blocks(task.id, &exec_msg);
         self.slack

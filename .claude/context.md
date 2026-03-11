@@ -3,11 +3,13 @@
 > compaction で失われる文脈を保存。compaction summary と合わせて復元に使用。
 > Learnings に長期的価値があれば MEMORY.md に反映すること。
 
-### Snapshot (03/11 17:05, auto)
+### Snapshot (03/11 20:54, auto)
 
 **Intent:** Implement the following plan:
 
 **Outcomes:** 15 files changed
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/agent-memory/o-m-cc-code-reviewer/MEMORY.md`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/chronicle.md`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/context.md`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/Cargo.toml`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/repos.toml`
@@ -20,21 +22,21 @@
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/google/calendar.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/main.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/repo_config.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_actions.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_events.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/analyzer.rs`
+- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/api.rs`
 
 **Context:**
 
-す。変更差分を取得してから並列レビューを実施します。
-## 集約結果
+ execute は走らない
+- CI チェックも走らない
+- 新しい `new` タスクの plan も走らない
 
-**Critical: 0件 → 品質ゲート通過**
+**全部止まる。**
 
-**Warning 修正対象 (3件):**
-1. `reset_for_regeneration` が `claude_session_id` をクリアしない (db.rs)
-2. `extract_complexity` の部分一致バグ (`"complex"` が `"complexity"` にもマッチ)
-3. Slack ファイル名のパストラバーサル (slack_events.rs)
+並列化すればこうなる:
 
-修正します。
-Slack ファイル名のパストラバーサル修正。
+```
+今: heartbeat → process_tasks(5分ブロック) → 次のheartbeat
+後: heartbeat → spawn(plan) → 即return → 15秒後に次のheartbeat → spawn(execute) → ...
+```
+
+spawn した各タスクは Semaphore で `claude_max_concurrent` まで同時実行。heartbeat ループ自体は軽量なまま回り続ける。

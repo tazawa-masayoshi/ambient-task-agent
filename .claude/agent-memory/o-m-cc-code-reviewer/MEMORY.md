@@ -27,12 +27,9 @@
 - `classify_ops_message` の `answer.contains("YES")` は部分一致問題（memory 既記の `.split_whitespace().any(|w| w == keyword)` が安全）
 - `log_dir_from_state` はモジュールプライベートで `slack_events.rs` 内に閉じており、`Worker::log_dir()` と同ロジックが生まれている → `AppState` / `ReposConfig` のメソッドに移動が望ましい（3回目確認）
 - `reqwest::Client::new()` が `slack_socket.rs` と `SlackClient` / `AsanaClient` / `GoogleCalendarClient` に分散 → Socket Mode は `SlackClient` を共有できる可能性あり
-- `WorkContext` 構築（`prepare_repo_context` + フィールド設定）が `runner.rs` 内5箇所に重複 → `context.rs` に `prepare_work_context()` を追加すべき
-- `resolve_execute_turns`（WORKFLOW.md → デフォルト → complex時2倍）が `runner.rs` 3箇所に重複
+- `WorkContext` 構築と `resolve_execute_turns` の重複 → `build_worktree_context(ws, max_turns, has_session)` と `resolve_execute_turns(worktree_path, complexity)` ヘルパーに統合済み（Plan/Act mode 導入時に解消）
 - Block Kit ビルダー関数（`build_proposal_blocks` / `build_info_blocks`）が `_task_id` を受け取るが未使用 → /simplify で修正済み（パラメータ削除）。残骸パラメータはこのパターンで再発しやすいことに注意
-- `WorkContext` 構築（`prepare_repo_context` + フィールド設定）の重複は `runner.rs` 内で worktree/oneshot/subtask/CI_retry の4ルートで引き続き存在 → `/simplify` 後も未解消、次回レビュー時に再確認
-- `resolve_execute_turns`（WORKFLOW.md → デフォルト → complex時2倍）の重複は `runner.rs` の `execute_auto_approved_task` / `execute_worktree_oneshot` / `execute_single_subtask` の3箇所に引き続き存在
-- `reset_for_regeneration` でセッションIDがリセットされないパターン → 正常フローでは plan_task が update_session_id で上書きするため無害。異常フロー（plan 失敗後に手動でステータス変更）でのみ問題になる
+- `reset_for_regeneration` の `claude_session_id = NULL` 追加済み（再生成時に古いセッションが残留するバグ修正）
 
 ### Blast Radius が大きかった変更の傾向
 - `RunnerContext` の導入: 11ファイルにシグネチャ変更が波及 (これは意図的なリファクタリング)
@@ -47,7 +44,8 @@
 ### Plan/Act モード追加後の固有パターン
 - `build_worktree_context(has_session=true)` で context/memory を空にするのは意図的 → Plan セッションに既存コンテキストあり、soul のみ system_prompt 経由で渡す設計
 - `execute_task_with_session` は `resume_session_id.is_some()` で短縮プロンプトに切り替え → Plan → Act の継続性設計として OK
-- `extract_complexity` の `section.contains(keyword)` はセクション内限定のため "complex" が "complexity" にマッチするリスクあり → PLANNER_RULES で1語指定しているため現実リスクは低い
+- `extract_complexity` の部分一致バグ修正済み: `section.contains(keyword)` → `section.split_whitespace().any(|w| w == *keyword)`
+- decomposer.rs 削除後、`Subtask` / `get_actionable_subtasks` は `db.rs` に移動（旧 DB データ後方互換として保持）
 
 ## Calibration
 - `#[allow(dead_code)]` 付きフィールドは移行期の意図的残留と誤用の区別が必要 → Context を読んで判断
