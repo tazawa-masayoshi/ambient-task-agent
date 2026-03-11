@@ -32,3 +32,9 @@
   Heartbeat: HeartbeatRunner every 30min (configurable), reads HEARTBEAT.md, skips if main lane busy.
   Task state: NO plan→DB→execute pattern; pure in-memory queue + session history.
   Concurrency docs: https://docs.openclaw.ai/concepts/queue, https://docs.openclaw.ai/gateway/heartbeat
+- **autoresearch** (https://github.com/karpathy/autoresearch): Python 630-line autonomous ML experiment loop (Mar 2026).
+  Key patterns: git-ratchet (keep commit if metric improves, `git reset HEAD~1` if not), immutable/mutable
+  file separation (constants+prepare.py fixed, train.py mutable), program.md as agent instruction spec,
+  "NEVER STOP" directive for unattended loop, TSV logging of all experiments (kept + discarded),
+  status=crash for OOM/fundamental errors. No parallelism (single-GPU sequential). ~12 exp/hour.
+  Related: Ralph Wiggum loop (single agent in bash loop), Gas Town (30 parallel agents with role hierarchy).

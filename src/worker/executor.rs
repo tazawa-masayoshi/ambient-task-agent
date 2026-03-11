@@ -25,6 +25,7 @@ const CODING_RULES: &str = "\
 - 既存のコードパターンや命名規則を尊重すること
 - プランに記載された変更のみを行うこと（スコープ外の変更は禁止）
 - テストがある場合は実行して通ることを確認すること
+- **確認を求めて止まるな。** 最後まで自律的に実行すること
 - 完了時に変更の要約を出力すること";
 
 const GENERAL_RULES: &str = "\
@@ -93,7 +94,7 @@ pub async fn execute_task_with_session(
 
     // --resume 時は計画が既にセッションにあるため短縮プロンプト
     let prompt = if resume_session_id.is_some() {
-        "上記の計画を実行してください。ファイルの変更を行い、テストを確認してください。".to_string()
+        "上記の計画を実行してください。ファイルの変更を行い、テストを確認してください。確認を求めて止まらず、最後まで自律的に実行してください。".to_string()
     } else {
         let mut parts = vec![format!("## タスク\n{}\n\n## 承認済みプラン\n{}", task_name, plan_text)];
         if !wc.context.is_empty() {

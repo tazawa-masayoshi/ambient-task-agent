@@ -144,12 +144,8 @@ impl Worker {
             Ok(Some(task)) => {
                 tracing::info!("Planning task: {} ({})", task.asana_task_name, task.asana_task_gid);
                 if self.db.update_status(task.id, "planning").is_ok() {
-                    let w = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = w.plan_task(task).await {
-                            tracing::error!("Task planning failed: {}", e);
-                        }
-                    });
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move { w.plan_task(task).await });
                 }
             }
             Ok(None) => {}
@@ -164,12 +160,8 @@ impl Worker {
             Ok(Some(task)) => {
                 tracing::info!("Executing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
                 if self.db.update_status(task.id, "executing").is_ok() {
-                    let w = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = w.execute_approved_task(task).await {
-                            tracing::error!("Approved task execution failed: {}", e);
-                        }
-                    });
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move { w.execute_approved_task(task).await });
                 }
             }
             Ok(None) => {}
@@ -195,12 +187,8 @@ impl Worker {
             Ok(Some(task)) => {
                 tracing::info!("Auto-executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
                 if self.db.update_status(task.id, "executing").is_ok() {
-                    let w = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = w.execute_approved_task(task).await {
-                            tracing::error!("Auto-execution failed: {}", e);
-                        }
-                    });
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move { w.execute_approved_task(task).await });
                 }
             }
             Ok(None) => {}
@@ -214,12 +202,8 @@ impl Worker {
         match self.db.get_ci_pending_task() {
             Ok(Some(task)) => {
                 tracing::debug!("Checking CI for task: {} ({})", task.asana_task_name, task.id);
-                let w = Arc::clone(self);
-                tokio::spawn(async move {
-                    if let Err(e) = w.check_ci_and_handle(task).await {
-                        tracing::error!("CI check failed: {}", e);
-                    }
-                });
+                let task_id = task.id;
+                self.spawn_task(task_id, |w| async move { w.check_ci_and_handle(task).await });
             }
             Ok(None) => {}
             Err(e) => {
@@ -668,9 +652,12 @@ impl Worker {
         )
         .await?;
 
+        // MEMORY 永続化
+        self.persist_learnings(&result.output, &task, None);
+
         if result.success {
             self.db.update_status(task.id, "done")?;
-            context::append_completed_task(base_dir, &task, None);
+            context::append_completed_task(base_dir, &task, None, Some(&result.output));
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
@@ -803,10 +790,14 @@ impl Worker {
 
         match result {
             Ok(exec_result) if exec_result.success => {
+                // MEMORY 永続化（worktree 削除前に main repo に保存）
+                self.persist_learnings(&exec_result.output, task, Some(repo_entry));
                 // finalize_worktree が remove まで担当
                 self.finalize_worktree(task, repo_entry, ws).await?;
             }
             Ok(exec_result) => {
+                // 失敗時も学びがあれば保存
+                self.persist_learnings(&exec_result.output, task, Some(repo_entry));
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
@@ -829,6 +820,49 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// executor 出力から MEMORY 行を抽出し、global + per-repo memory に永続化
+    fn persist_learnings(
+        &self,
+        output: &str,
+        task: &CodingTask,
+        repo_entry: Option<&crate::repo_config::RepoEntry>,
+    ) {
+        if let Some(memory) = context::extract_memory(output) {
+            let base_dir = &self.repos_config.defaults.repos_base_dir;
+            let entry = format!("[{}] {}", task.asana_task_name, memory);
+
+            if let Err(e) = context::append_memory(base_dir, &entry) {
+                tracing::warn!("Failed to persist global memory: {}", e);
+            }
+            if let Some(re) = repo_entry {
+                let repo_path = self.repos_config.repo_local_path(re);
+                if let Err(e) = context::append_repo_memory(&repo_path, &entry) {
+                    tracing::warn!("Failed to persist repo memory: {}", e);
+                }
+            }
+            tracing::info!("Persisted learning for task {}: {}", task.id, memory);
+        }
+    }
+
+    /// タスク処理を spawn し、panic/エラー時に DB を error 状態に復帰させる
+    fn spawn_task<F, Fut>(self: &Arc<Self>, task_id: i64, f: F)
+    where
+        F: FnOnce(Arc<Worker>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        let w = Arc::clone(self);
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            match f(w).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!("Task {} failed: {}", task_id, e);
+                    db.set_error(task_id, &format!("Task failed: {}", e)).ok();
+                }
+            }
+        });
     }
 
     /// WORKFLOW.md → defaults → complex*2 の順で max_turns を解決
@@ -908,7 +942,7 @@ impl Worker {
             Err(e) => {
                 self.db.update_status(task.id, "done")?;
                 let repo_path = self.repos_config.repo_local_path(repo_entry);
-                context::append_completed_task(base_dir, task, Some(&repo_path));
+                context::append_completed_task(base_dir, task, Some(&repo_path), None);
                 let msg = format!(
                     ":white_check_mark: 自動実行完了（PR作成スキップ: {}）",
                     e
@@ -974,7 +1008,7 @@ impl Worker {
                 self.db.update_status(task.id, "done")?;
 
                 let repo_path = self.repos_config.repo_local_path(repo_entry);
-                context::append_completed_task(base_dir, &task, Some(&repo_path));
+                context::append_completed_task(base_dir, &task, Some(&repo_path), None);
 
                 self.slack
                     .reply_thread(
@@ -990,7 +1024,7 @@ impl Worker {
                 self.db.update_status(task.id, "done")?;
 
                 let repo_path = self.repos_config.repo_local_path(repo_entry);
-                context::append_completed_task(base_dir, &task, Some(&repo_path));
+                context::append_completed_task(base_dir, &task, Some(&repo_path), None);
 
                 let pr_url = task.pr_url.as_deref().unwrap_or("(no URL)");
                 let msg = format!(
@@ -1294,7 +1328,20 @@ fn ensure_repo_agent_rules(repo_path: &Path) {
 - CLAUDE.md に記載されたプロジェクト規約に従うこと
 - 既存のコードパターン・命名規則・ディレクトリ構造を尊重すること
 - スコープ外の変更は禁止（依頼された範囲のみ変更すること）
-- 変更後はテストを実行して通ることを確認すること
+
+## 実行スタイル（重要）
+- **確認を求めて止まるな。** 計画に従って最後まで自律的に実行すること
+- エラーが出たらコードを修正して再試行。3回修正しても解決しなければ SUMMARY に記録して完了
+- 不明点は合理的に推測して進め、推測した内容を SUMMARY に記録すること
+
+## 品質チェック（完了前に必須）
+- テストがあれば実行して全パス確認
+- リンターがあれば実行してエラーゼロ確認
+- 型チェックがあれば実行してエラーゼロ確認
+
+## 知識活用
+- `.agent/memory.md` があれば作業開始時に読み、過去の学びを活用すること
+- 作業中に発見したパターン・注意点があれば `.agent/memory.md` に追記すること
 
 ## Worktree 安全ルール
 - 専用 worktree 内でのみ作業する（共有 workspace を触らない）

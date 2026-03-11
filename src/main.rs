@@ -383,7 +383,7 @@ fn cmd_task(id: i64, start: bool, done: bool) -> Result<()> {
             let repo_path = t.repo_key.as_deref().and_then(|key| {
                 repos_config.find_repo_by_key(key).map(|r| repos_config.repo_local_path(r))
             });
-            worker::context::append_completed_task(base_dir, &t, repo_path.as_deref());
+            worker::context::append_completed_task(base_dir, &t, repo_path.as_deref(), None);
         }
         eprintln!("Task #{} を done に遷移しました（actual_minutes 自動計算済み）", id);
     }

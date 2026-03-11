@@ -49,8 +49,6 @@ pub struct Defaults {
     pub claude_allowed_env: Vec<String>,
     #[serde(default)]
     pub module_policy: HashMap<String, ModulePolicy>,
-    /// ops 完了時に詳細結果を通知する管理者の Slack ユーザーID
-    pub ops_admin_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

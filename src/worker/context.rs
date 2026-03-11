@@ -177,7 +177,6 @@ pub fn append_context(repos_base_dir: &str, entry: &str) -> Result<()> {
 }
 
 /// グローバル memory.md に1行追記（30件ローテーション）
-#[allow(dead_code)]
 pub fn append_memory(repos_base_dir: &str, entry: &str) -> Result<()> {
     append_rotated(&global_memory_path(repos_base_dir), entry, MAX_MEMORY_ENTRIES)
 }
@@ -188,7 +187,6 @@ pub fn append_repo_context(repo: &Path, entry: &str) -> Result<()> {
 }
 
 /// per-repo memory.md に1行追記（30件ローテーション）
-#[allow(dead_code)]
 pub fn append_repo_memory(repo: &Path, entry: &str) -> Result<()> {
     append_rotated(&repo_memory_path(repo), entry, MAX_MEMORY_ENTRIES)
 }
@@ -198,16 +196,21 @@ pub fn append_repo_memory(repo: &Path, entry: &str) -> Result<()> {
 // ============================================================================
 
 /// context.md にタスク完了記録を追記（global + per-repo）
+///
+/// `output` が渡された場合、SUMMARY 行を抽出してエントリに含める。
 pub fn append_completed_task(
     repos_base_dir: &str,
     task: &crate::db::CodingTask,
     repo_path: Option<&Path>,
+    output: Option<&str>,
 ) {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let entry = format!(
-        "[DONE] #{} {} ({})",
-        task.id, task.asana_task_name, date
-    );
+    let summary = output.and_then(extract_summary);
+    let entry = if let Some(ref s) = summary {
+        format!("[DONE] #{} {} ({}) — {}", task.id, task.asana_task_name, date, s)
+    } else {
+        format!("[DONE] #{} {} ({})", task.id, task.asana_task_name, date)
+    };
     if let Err(e) = append_context(repos_base_dir, &entry) {
         tracing::error!("Failed to append completed task to global context: {}", e);
     }
@@ -277,7 +280,6 @@ pub fn migrate_context_files(repos_base_dir: &str) -> Result<()> {
 // 出力パース
 // ============================================================================
 
-#[allow(dead_code)]
 /// executor 出力から SUMMARY: 行を抽出（最後に見つかったものを採用）
 pub fn extract_summary(output: &str) -> Option<String> {
     output
@@ -287,7 +289,6 @@ pub fn extract_summary(output: &str) -> Option<String> {
         .map(|line| line.trim_start_matches("SUMMARY:").trim().to_string())
 }
 
-#[allow(dead_code)]
 /// executor 出力から MEMORY: 行を抽出（最後に見つかったものを採用）
 pub fn extract_memory(output: &str) -> Option<String> {
     output
