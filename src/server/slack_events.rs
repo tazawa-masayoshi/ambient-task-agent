@@ -90,16 +90,15 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
             state.wake_worker();
         }
 
-        // ⚡ ops 手動実行（ops チャンネルのメッセージに対して）
+        // ⚡ ops 手動実行（ops チャンネルのメッセージに対して）→ キューに追加
         "zap" => {
             if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
                 let slack = state.slack_client();
-                // メッセージ本文を取得
                 match slack.fetch_message(channel, message_ts).await {
                     Ok(msg) => {
                         let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                         tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                        dispatch_ops_request(state, &msg, channel, message_ts, text, repo_entry).await?;
+                        enqueue_ops_request(state, &msg, channel, message_ts, text, repo_entry, "ready")?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);
@@ -150,9 +149,9 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
     let command = extract_command(text);
     tracing::info!("App mention command: '{}' in {}", command, channel);
 
-    // ops チャンネルでのメンション → ops 実行にルーティング
+    // ops チャンネルでのメンション → キューに追加（ready: 分類不要）
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-        return dispatch_ops_request(state, event, channel, thread_ts, text, repo_entry).await;
+        return enqueue_ops_request(state, event, channel, thread_ts, text, repo_entry, "ready");
     }
 
     let slack = state.slack_client();
@@ -234,14 +233,44 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
             }
         }
 
-        // その他: claude -p に投げる
+        // その他: claude -p に投げる（スレッド内なら履歴をコンテキストに含める）
         other if !other.is_empty() => {
             slack
                 .reply_thread(channel, thread_ts, ":brain: 考え中...")
                 .await?;
 
+            // スレッド内メンションの場合、会話履歴を取得してプロンプトに含める
+            let prompt = if event.get("thread_ts").is_some() {
+                match slack.fetch_thread_replies(channel, thread_ts).await {
+                    Ok(replies) => {
+                        let history: Vec<String> = replies.iter()
+                            .filter_map(|msg| {
+                                let user = msg.get("user").and_then(|u| u.as_str()).unwrap_or("unknown");
+                                let text = msg.get("text").and_then(|t| t.as_str())?;
+                                Some(format!("<@{}>: {}", user, text))
+                            })
+                            .collect();
+                        if history.is_empty() {
+                            other.to_string()
+                        } else {
+                            format!(
+                                "## スレッドの会話履歴\n{}\n\n## 依頼\n{}",
+                                history.join("\n"),
+                                other
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch thread replies: {}", e);
+                        other.to_string()
+                    }
+                }
+            } else {
+                other.to_string()
+            };
+
             let log_dir = log_dir_from_state(state);
-            match ClaudeRunner::new("mention", other)
+            match ClaudeRunner::new("mention", &prompt)
                 .max_turns(3)
                 .log_dir(&log_dir)
                 .with_context(&state.runner_ctx)
@@ -353,6 +382,11 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         return Ok(());
     }
 
+    // Bot 自身のメッセージは無視
+    if event.get("bot_id").is_some() {
+        return Ok(());
+    }
+
     let channel = event
         .get("channel")
         .and_then(|c| c.as_str())
@@ -369,48 +403,14 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     // ops チャンネル判定（トップレベル・スレッド返信の両方で使う）
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
 
-    // ops チャンネル: トップレベルは claude -p で作業対象か判定、スレッド返信は既存 ops の会話継続
-    if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-        if thread_ts.is_none() {
-            // ops_monitor が有効なチャンネルのみ自動分類（それ以外は ⚡ 手動トリガーで対応）
+    // ops チャンネル: トップレベルのみキュー対象、スレッド返信は通常のコーディングモードへ
+    if thread_ts.is_none() {
+        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
             if repo_entry.ops_monitor {
-                let repo_entry_clone = repo_entry.clone();
-                let state_clone = state.clone();
-                let event_clone = event.clone();
-                let channel_owned = channel.to_string();
-                let message_ts_owned = message_ts.to_string();
-                let text_owned = text.to_string();
-
-                tokio::spawn(async move {
-                    match classify_ops_message(&text_owned, &repo_entry_clone, &state_clone).await {
-                        Ok(true) => {
-                            tracing::info!("ops message classified as actionable in {}", channel_owned);
-                            if let Err(e) = dispatch_ops_request(
-                                &state_clone, &event_clone, &channel_owned,
-                                &message_ts_owned, &text_owned, &repo_entry_clone,
-                            ).await {
-                                tracing::error!("dispatch_ops_request failed: {}", e);
-                            }
-                        }
-                        Ok(false) => {
-                            tracing::debug!("ops message classified as non-actionable in {}", channel_owned);
-                        }
-                        Err(e) => {
-                            tracing::warn!("ops classification failed: {}", e);
-                        }
-                    }
-                });
+                enqueue_ops_request(state, event, channel, message_ts, text, repo_entry, "pending")?;
             }
             return Ok(());
         }
-
-        let effective_thread_ts = thread_ts.unwrap_or(message_ts);
-        let is_followup = state.db.get_ops_repo_key(channel, effective_thread_ts)?.is_some();
-
-        if is_followup {
-            return dispatch_ops_request(state, event, channel, effective_thread_ts, text, repo_entry).await;
-        }
-        // 既存 ops スレッドでなければ通常のスレッド処理へ
     }
 
     if thread_ts.is_none() {
@@ -708,177 +708,34 @@ async fn handle_asana_url_link(
 }
 
 // ============================================================================
-// Ops classification — トップレベルメッセージが作業対象か判定
+// Ops enqueue
 // ============================================================================
 
-/// ops チャンネルのメッセージが作業依頼かどうかを claude -p で判定
-async fn classify_ops_message(
-    text: &str,
-    repo_entry: &crate::repo_config::RepoEntry,
-    state: &Arc<AppState>,
-) -> Result<bool> {
-    // 短すぎるメッセージは無視
-    if text.trim().len() < 5 {
-        return Ok(false);
-    }
-
-    // 対応可能な作業の説明を構築
-    let ops_desc = build_ops_description(repo_entry);
-    if ops_desc.is_empty() {
-        return Ok(false);
-    }
-
-    let prompt = format!(
-        "以下のSlackメッセージは、このチャンネルで対応すべき作業依頼ですか？\n\n\
-         ## 対応可能な作業\n{}\n\n\
-         ## メッセージ\n{}\n\n\
-         作業依頼であれば YES、そうでなければ NO とだけ答えてください。",
-        ops_desc, text
-    );
-
-    let log_dir = log_dir_from_state(state);
-    let result = ClaudeRunner::new("classify", &prompt)
-        .max_turns(1)
-        .allowed_tools("")
-        .log_dir(&log_dir)
-        .with_context(&state.runner_ctx)
-        .run()
-        .await?;
-
-    if !result.success {
-        tracing::warn!("classify claude -p failed: {}", result.stderr);
-        return Ok(false);
-    }
-
-    let answer = result.stdout.trim().to_uppercase();
-    Ok(answer.split_whitespace().any(|w| w == "YES"))
-}
-
-/// RepoEntry から対応可能な作業の説明テキストを生成
-fn build_ops_description(repo_entry: &crate::repo_config::RepoEntry) -> String {
-    if let Some(ref skills) = repo_entry.ops_skills {
-        if !skills.is_empty() {
-            return "- スキルファイルに定義された定型作業".to_string();
-        }
-    }
-    String::new()
-}
-
-// ============================================================================
-// Ops dispatch (app_mention + thread followup 共通)
-// ============================================================================
-
-/// ops チャンネルのリクエストを処理（@bot メンションまたはスレッド返信）
-async fn dispatch_ops_request(
+/// ops リクエストをキューに追加してワーカーを起床
+///
+/// - status = "pending": 分類が必要（ops_monitor 自動検出）
+/// - status = "ready": 分類不要で即実行（⚡手動トリガー、@メンション、スレッド返信）
+fn enqueue_ops_request(
     state: &Arc<AppState>,
     event: &serde_json::Value,
     channel: &str,
-    thread_ts: &str,
+    message_ts: &str,
     text: &str,
     repo_entry: &crate::repo_config::RepoEntry,
+    status: &str,
 ) -> Result<()> {
-    let slack = state.slack_client();
-    slack.reply_thread(channel, thread_ts, ":gear: 処理中...").await.ok();
-
-    let files = extract_slack_files(event);
-    let repo_path = state.repos_config.repo_local_path(repo_entry);
-    let repo_key = repo_entry.key.clone();
-    let soul = crate::worker::context::read_soul(&state.repos_config.defaults.repos_base_dir);
-    let max_turns = state.repos_config.defaults.claude_max_execute_turns;
-    let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
-    let ops_download_dir = repo_entry.ops_download_dir.clone();
-
-    // 会話履歴を読み込み
-    let history = state.db.get_ops_context(channel, thread_ts)?;
-
-    // メンション部分を除去してメッセージ本文を取得
-    let message_text = extract_command(text).to_string();
-
-    let req = crate::worker::ops::OpsRequest {
-        message_text,
-        files,
-    };
-
-    let db = state.db.clone();
-    let channel = channel.to_string();
-    let thread_ts_owned = thread_ts.to_string();
-    let log_dir = log_dir_from_state(state);
-    let runner_ctx = state.runner_ctx.clone();
-
-    tokio::spawn(async move {
-        // ファイルダウンロード（ops_download_dir が設定されている場合のみ）
-        if !req.files.is_empty() {
-            if let Some(ref dl_dir) = ops_download_dir {
-                let download_dir = repo_path.join(dl_dir);
-                for f in &req.files {
-                    let safe_name = std::path::Path::new(&f.name)
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("download"));
-                    let dest = download_dir.join(safe_name);
-                    if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
-                        tracing::warn!("Failed to download file {}: {}", f.name, e);
-                    }
-                }
-            }
-        }
-
-        // ユーザーメッセージを保存
-        if let Err(e) = db.append_ops_context(&channel, &thread_ts_owned, &repo_key, "user", &req.message_text) {
-            tracing::warn!("Failed to save ops context (user): {}", e);
-        }
-
-        let dl_dir_ref = ops_download_dir.as_deref();
-        let exec_result = crate::worker::ops::execute_ops(
-            &req, &repo_path, &ops_skills, &soul,
-            max_turns, Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
-        ).await;
-
-        match exec_result {
-            Ok(output) => {
-                // アシスタント応答を保存
-                if let Err(e) = db.append_ops_context(&channel, &thread_ts_owned, &repo_key, "assistant", &output) {
-                    tracing::warn!("Failed to save ops context (assistant): {}", e);
-                }
-
-                // スレッドに詳細結果を返信
-                let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
-                slack.reply_thread(&channel, &thread_ts_owned, &detail).await.ok();
-            }
-            Err(e) => {
-                // スレッドにエラー詳細を返信
-                let detail = format!(":x: *ops 失敗*\n```\n{}\n```", e);
-                slack.reply_thread(&channel, &thread_ts_owned, &detail).await.ok();
-            }
-        }
-    });
-
+    let event_json = serde_json::to_string(event).unwrap_or_default();
+    let id = state.db.enqueue_ops(
+        channel, message_ts, &repo_entry.key, text, &event_json, status,
+    )?;
+    tracing::info!("Enqueued ops item {} (status={}, channel={})", id, status, channel);
+    state.wake_worker();
     Ok(())
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Slack イベントの files 配列から SlackFile を抽出
-fn extract_slack_files(event: &serde_json::Value) -> Vec<crate::worker::ops::SlackFile> {
-    event
-        .get("files")
-        .and_then(|f| f.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|f| {
-                    let name = f.get("name")?.as_str()?.to_string();
-                    let url = f.get("url_private_download")?.as_str()?.to_string();
-                    Some(crate::worker::ops::SlackFile {
-                        name,
-                        url_private_download: url,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// ログ出力先ディレクトリを AppState から計算
 fn log_dir_from_state(state: &Arc<AppState>) -> PathBuf {
@@ -889,7 +746,7 @@ fn log_dir_from_state(state: &Arc<AppState>) -> PathBuf {
 
 /// メンションテキストからコマンド部分を抽出
 /// "<@U12345> sync" → "sync"
-fn extract_command(text: &str) -> &str {
+pub fn extract_command(text: &str) -> &str {
     // <@UXXXXXXX> を除去
     if let Some(pos) = text.find('>') {
         text[pos + 1..].trim()

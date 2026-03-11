@@ -233,6 +233,22 @@ impl Db {
                 updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
+            CREATE TABLE IF NOT EXISTS ops_queue (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel       TEXT NOT NULL,
+                message_ts    TEXT NOT NULL,
+                repo_key      TEXT NOT NULL,
+                message_text  TEXT NOT NULL,
+                event_json    TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL DEFAULT 'pending',
+                retry_count   INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_ops_queue_status
+                ON ops_queue(status, created_at);
+
             CREATE TABLE IF NOT EXISTS ops_contexts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel     TEXT NOT NULL,
@@ -926,6 +942,134 @@ impl Db {
             Err(e) => Err(e.into()),
         }
     }
+
+    // ========================================================================
+    // ops_queue
+    // ========================================================================
+
+    /// ops キューにアイテムを追加（同一 channel+message_ts の重複は無視）
+    pub fn enqueue_ops(
+        &self,
+        channel: &str,
+        message_ts: &str,
+        repo_key: &str,
+        message_text: &str,
+        event_json: &str,
+        status: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        // 同じメッセージが既にキューにある場合はスキップ（done/failed 含む）
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ops_queue WHERE channel = ?1 AND message_ts = ?2)",
+            params![channel, message_ts],
+            |row| row.get(0),
+        )?;
+        if exists {
+            tracing::debug!("ops_queue: duplicate skipped (channel={}, ts={})", channel, message_ts);
+            return Ok(0);
+        }
+        conn.execute(
+            "INSERT INTO ops_queue (channel, message_ts, repo_key, message_text, event_json, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![channel, message_ts, repo_key, message_text, event_json, status],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 10分以上 processing のまま放置されたアイテムを ready に戻す
+    pub fn recover_stale_ops(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE ops_queue SET status = 'ready', \
+             error_message = 'recovered from stale processing', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE status = 'processing' \
+             AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// 処理対象のキューアイテムを1件取得（pending/ready、同一 repo_key の processing がなければ）
+    pub fn dequeue_ops_item(&self) -> Result<Option<OpsQueueItem>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, channel, message_ts, repo_key, message_text, event_json, status, retry_count \
+             FROM ops_queue WHERE status IN ('pending', 'ready') \
+             AND repo_key NOT IN (SELECT DISTINCT repo_key FROM ops_queue WHERE status = 'processing') \
+             ORDER BY created_at ASC LIMIT 1",
+            [],
+            |row| {
+                Ok(OpsQueueItem {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    message_ts: row.get(2)?,
+                    repo_key: row.get(3)?,
+                    message_text: row.get(4)?,
+                    event_json: row.get(5)?,
+                    status: row.get(6)?,
+                    retry_count: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(item) => Ok(Some(item)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// キューアイテムのステータスを processing に更新
+    pub fn mark_ops_processing(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'processing', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// キューアイテムを完了にする
+    pub fn mark_ops_done(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'done', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// キューアイテムをスキップ（対応不要と分類）
+    pub fn mark_ops_skipped(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'skipped', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// キューアイテムをリトライ待ちに戻す
+    pub fn mark_ops_retry(&self, id: i64, error: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'ready', retry_count = retry_count + 1, \
+             error_message = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
+
+    /// キューアイテムを失敗にする
+    pub fn mark_ops_failed(&self, id: i64, error: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'failed', error_message = ?2, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -934,4 +1078,16 @@ pub struct OpsMessage {
     pub role: String,
     pub content: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpsQueueItem {
+    pub id: i64,
+    pub channel: String,
+    pub message_ts: String,
+    pub repo_key: String,
+    pub message_text: String,
+    pub event_json: String,
+    pub status: String,
+    pub retry_count: i64,
 }

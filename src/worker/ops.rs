@@ -95,6 +95,27 @@ fn read_ops_skills(repo_path: &Path, skill_paths: &[String]) -> String {
         .join("\n\n---\n\n")
 }
 
+/// Slack イベント JSON から SlackFile を抽出
+pub fn extract_slack_files_from_json(event: &serde_json::Value) -> Vec<SlackFile> {
+    event
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| {
+                    let name = f.get("name")?.as_str()?.to_string();
+                    let url = f.get("url_private_download")?.as_str()?.to_string();
+                    Some(SlackFile {
+                        name,
+                        url_private_download: url,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// ops タスクを claude -p で実行
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_ops(

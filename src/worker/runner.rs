@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::Notify;
 
-use crate::db::{CodingTask, Db};
+use crate::db::{CodingTask, Db, OpsQueueItem};
 use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
@@ -100,6 +100,9 @@ impl Worker {
 
             // タスク処理（個別に spawn、ループはブロックしない）
             had_error |= worker.process_tasks();
+
+            // ops キュー処理（個別に spawn）
+            had_error |= worker.process_ops_queue();
 
             // スケジューラージョブチェック（軽量なので直接 await）
             had_error |= worker.run_scheduler().await;
@@ -233,6 +236,195 @@ impl Worker {
         }
 
         had_error
+    }
+
+    /// ops キューを処理。spawn して即戻る。DB エラー時に true を返す。
+    fn process_ops_queue(self: &Arc<Self>) -> bool {
+        const MAX_OPS_RETRIES: i64 = 5;
+
+        // 長時間 processing のままのアイテムをリカバリ
+        match self.db.recover_stale_ops() {
+            Ok(n) if n > 0 => tracing::warn!("Recovered {} stale ops_queue items", n),
+            Err(e) => tracing::warn!("Failed to recover stale ops: {}", e),
+            _ => {}
+        }
+
+        match self.db.dequeue_ops_item() {
+            Ok(Some(item)) => {
+                tracing::info!(
+                    "Processing ops queue item {} (status={}, channel={}, retry={})",
+                    item.id, item.status, item.channel, item.retry_count
+                );
+                if self.db.mark_ops_processing(item.id).is_ok() {
+                    let w = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = w.run_ops_item(item, MAX_OPS_RETRIES).await {
+                            tracing::error!("ops queue item failed: {}", e);
+                        }
+                    });
+                }
+                false
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!("Failed to dequeue ops item: {}", e);
+                true
+            }
+        }
+    }
+
+    /// ops キューアイテムを実行
+    ///
+    /// - pending: classify → actionable なら実行、そうでなければ skipped
+    /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
+    async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
+        let repo_entry = match self.repos_config.find_repo_by_key(&item.repo_key) {
+            Some(r) => r.clone(),
+            None => {
+                let err = format!("Unknown repo key: {}", item.repo_key);
+                self.db.mark_ops_failed(item.id, &err)?;
+                return Ok(());
+            }
+        };
+
+        // pending → 分類が必要
+        if item.status == "pending" {
+            match self.classify_ops(&item, &repo_entry).await {
+                Ok(true) => {
+                    tracing::info!("ops item {} classified as actionable", item.id);
+                }
+                Ok(false) => {
+                    tracing::debug!("ops item {} classified as non-actionable", item.id);
+                    self.db.mark_ops_skipped(item.id)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("ops classification failed for item {}: {}", item.id, e);
+                    if item.retry_count + 1 >= max_retries {
+                        self.db.mark_ops_failed(item.id, &e.to_string())?;
+                    } else {
+                        self.db.mark_ops_retry(item.id, &e.to_string())?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // 実行
+        let event: serde_json::Value =
+            serde_json::from_str(&item.event_json).unwrap_or_default();
+
+        let slack = self.slack.clone();
+        slack.reply_thread(&item.channel, &item.message_ts, ":gear: 処理中...").await.ok();
+
+        // ファイルダウンロード
+        let files = super::ops::extract_slack_files_from_json(&event);
+        let repo_path = self.repos_config.repo_local_path(&repo_entry);
+        if !files.is_empty() {
+            if let Some(ref dl_dir) = repo_entry.ops_download_dir {
+                let download_dir = repo_path.join(dl_dir);
+                for f in &files {
+                    let safe_name = std::path::Path::new(&f.name)
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("download"));
+                    let dest = download_dir.join(safe_name);
+                    if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
+                        tracing::warn!("Failed to download file {}: {}", f.name, e);
+                    }
+                }
+            }
+        }
+
+        let repo_key = &item.repo_key;
+        let message_text = crate::server::slack_events::extract_command(&item.message_text).to_string();
+
+        // 会話履歴を保存 & 取得
+        if let Err(e) = self.db.append_ops_context(&item.channel, &item.message_ts, repo_key, "user", &message_text) {
+            tracing::warn!("Failed to save ops context (user): {}", e);
+        }
+        let history = self.db.get_ops_context(&item.channel, &item.message_ts)?;
+
+        let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
+        let ops_download_dir = repo_entry.ops_download_dir.clone();
+        let soul = context::read_soul(&self.repos_config.defaults.repos_base_dir);
+        let max_turns = self.repos_config.defaults.claude_max_execute_turns;
+        let log_dir = self.log_dir();
+
+        let req = super::ops::OpsRequest {
+            message_text,
+            files,
+        };
+
+        let dl_dir_ref = ops_download_dir.as_deref();
+        let exec_result = super::ops::execute_ops(
+            &req, &repo_path, &ops_skills, &soul,
+            max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
+        ).await;
+
+        match exec_result {
+            Ok(output) => {
+                if let Err(e) = self.db.append_ops_context(&item.channel, &item.message_ts, repo_key, "assistant", &output) {
+                    tracing::warn!("Failed to save ops context (assistant): {}", e);
+                }
+                let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
+                slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                self.db.mark_ops_done(item.id)?;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if item.retry_count + 1 >= max_retries {
+                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```", err_str);
+                    slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                    self.db.mark_ops_failed(item.id, &err_str)?;
+                } else {
+                    tracing::warn!("ops execution failed for item {} (retry {}): {}", item.id, item.retry_count, err_str);
+                    self.db.mark_ops_retry(item.id, &err_str)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// ops メッセージを分類（claude -p で作業対象かどうか判定）
+    async fn classify_ops(&self, item: &OpsQueueItem, repo_entry: &crate::repo_config::RepoEntry) -> Result<bool> {
+        if item.message_text.trim().len() < 5 {
+            return Ok(false);
+        }
+
+        let ops_desc = if let Some(ref skills) = repo_entry.ops_skills {
+            if !skills.is_empty() {
+                "- スキルファイルに定義された定型作業".to_string()
+            } else {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        };
+
+        let prompt = format!(
+            "以下のSlackメッセージは、このチャンネルで対応すべき作業依頼ですか？\n\n\
+             ## 対応可能な作業\n{}\n\n\
+             ## メッセージ\n{}\n\n\
+             作業依頼であれば YES、そうでなければ NO とだけ答えてください。",
+            ops_desc, item.message_text
+        );
+
+        let log_dir = self.log_dir();
+        let result = crate::claude::ClaudeRunner::new("classify", &prompt)
+            .max_turns(1)
+            .allowed_tools("")
+            .log_dir(&log_dir)
+            .with_context(&self.runner_ctx)
+            .run()
+            .await?;
+
+        if !result.success {
+            anyhow::bail!("classify claude -p failed: {}", result.stderr);
+        }
+
+        let answer = result.stdout.trim().to_uppercase();
+        Ok(answer.split_whitespace().any(|w| w == "YES"))
     }
 
     /// スケジューラージョブを実行。エラーがあれば true を返す

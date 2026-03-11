@@ -181,6 +181,34 @@ impl SlackClient {
             .context("No message found")
     }
 
+    /// conversations.replies でスレッドの全メッセージを取得
+    pub async fn fetch_thread_replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<serde_json::Value>> {
+        let resp = self
+            .client
+            .get("https://slack.com/api/conversations.replies")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .query(&[
+                ("channel", channel),
+                ("ts", thread_ts),
+                ("limit", "50"),
+            ])
+            .send()
+            .await
+            .context("Slack conversations.replies request failed")?;
+
+        let data: serde_json::Value = resp.json().await.context("Failed to parse response")?;
+
+        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+            anyhow::bail!("conversations.replies error: {}", err);
+        }
+
+        Ok(data.get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn send_message(
         &self,
         channel: &str,
