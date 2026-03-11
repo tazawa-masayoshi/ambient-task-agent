@@ -101,6 +101,7 @@ impl AgentBackend for BedrockBackend {
                         truncated: false,
                         usage: None,
                         cost_usd: None,
+                        session_id: None,
                     });
                 }
             }
@@ -141,6 +142,7 @@ impl AgentBackend for BedrockBackend {
                         truncated: false,
                         usage: None,
                         cost_usd: None,
+                        session_id: None,
                     });
                 }
             };
@@ -286,6 +288,7 @@ impl AgentBackend for BedrockBackend {
             truncated,
             usage: None,
             cost_usd: None,
+            session_id: None,
         })
     }
 }

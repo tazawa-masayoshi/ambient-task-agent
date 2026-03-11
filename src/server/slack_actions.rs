@@ -300,6 +300,55 @@ async fn process_action(
             state.wake_worker();
         }
 
+        "stop_task" => {
+            match task.status.as_str() {
+                "executing" | "ci_pending" | "analyzing" | "decomposing" | "awaiting_input" => {
+                    let prev_status = task.status.clone();
+                    state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
+
+                    // ボタンを無効化
+                    if let Some(msg_ts) = message_ts {
+                        let updated_blocks = serde_json::json!([
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": ":octagonal_sign: *中止されました*"
+                                }
+                            }
+                        ]);
+                        slack
+                            .update_blocks(channel, msg_ts, &updated_blocks, "中止されました")
+                            .await
+                            .ok();
+                    }
+
+                    slack
+                        .reply_thread(
+                            channel,
+                            reply_ts,
+                            &format!(
+                                ":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
+                                 実行中のプロセスは次のターン終了時に停止します",
+                                prev_status
+                            ),
+                        )
+                        .await?;
+                    tracing::info!("Task {} stopped via Block Kit button (was {})", task.id, prev_status);
+                }
+                _ => {
+                    slack
+                        .reply_thread(
+                            channel,
+                            reply_ts,
+                            &format!(":no_entry: 現在のステータスは `{}` のため中止できません", task.status),
+                        )
+                        .await
+                        .ok();
+                }
+            }
+        }
+
         _ => {
             tracing::debug!("Unknown action_id: {}", action_id);
         }

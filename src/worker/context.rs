@@ -102,6 +102,23 @@ fn merge_layers(repo_content: &str, global_content: &str, repo_header: &str, glo
     parts.join("\n\n")
 }
 
+/// per-repo WORKFLOW.md の body を soul にマージして返す
+pub fn merged_soul(repos_base_dir: &str, repo: Option<&Path>) -> String {
+    let global_soul = read_soul(repos_base_dir);
+    let workflow_body = repo
+        .and_then(super::workflow::load)
+        .map(|wf| wf.body)
+        .unwrap_or_default();
+
+    if workflow_body.is_empty() {
+        global_soul
+    } else if global_soul.is_empty() {
+        workflow_body
+    } else {
+        format!("{}\n\n## リポジトリ固有ルール（WORKFLOW.md）\n{}", global_soul, workflow_body)
+    }
+}
+
 /// per-repo context → global context を結合して返す
 pub fn merged_context(repos_base_dir: &str, repo: Option<&Path>) -> String {
     let global = read_context(repos_base_dir);

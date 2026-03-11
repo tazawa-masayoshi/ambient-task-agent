@@ -90,6 +90,9 @@ fn compute_next_run(cron_expr: &str) -> Option<String> {
 }
 
 /// 期限の来たスケジュールジョブがあれば実行
+///
+/// Pre-advance scheduling: next_run を実行「前」に更新する（OpenFang パターン）。
+/// これにより、遅い実行が次のティックと重なっても二重発火しない。
 pub async fn check_and_run(ctx: &mut SchedulerContext) -> Result<()> {
     let now = Utc::now();
 
@@ -100,12 +103,13 @@ pub async fn check_and_run(ctx: &mut SchedulerContext) -> Result<()> {
             job.job_type
         );
 
+        // Pre-advance: 実行前に next_run を更新（二重発火防止）
+        let next = compute_next_run(&job.schedule_cron).unwrap_or_default();
+        ctx.db.mark_job_run(job.id, &next)?;
+
         if let Err(e) = execute_job(&job, ctx).await {
             tracing::error!("Scheduled job {} failed: {}", job.job_key, e);
         }
-
-        let next = compute_next_run(&job.schedule_cron).unwrap_or_default();
-        ctx.db.mark_job_run(job.id, &next)?;
 
         tracing::info!("Job {} done. Next run: {}", job.job_key, next);
     }

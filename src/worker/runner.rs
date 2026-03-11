@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 
-use super::{analyzer, context, decomposer, executor, priority, scheduler, task_file, workspace};
+use super::{analyzer, context, decomposer, executor, priority, scheduler, task_file, workflow, workspace};
 
 /// ハートビート間隔の下限
 const MIN_HEARTBEAT_SECS: u64 = 10;
@@ -26,6 +27,8 @@ pub struct Worker {
     default_slack_channel: String,
     notify: Arc<Notify>,
     runner_ctx: crate::execution::RunnerContext,
+    /// Busy-flag: 前回のタスク処理がまだ実行中かどうか（バックログ防止）
+    busy: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -53,6 +56,7 @@ impl Worker {
             default_slack_channel,
             notify,
             runner_ctx,
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -94,6 +98,13 @@ impl Worker {
         let mut consecutive_errors: u32 = 0;
 
         loop {
+            // Busy-flag tick skipping: 前回の処理がまだ実行中ならスキップ
+            if self.busy.swap(true, Ordering::SeqCst) {
+                tracing::debug!("Worker busy, skipping tick");
+                tokio::time::sleep(heartbeat).await;
+                continue;
+            }
+
             let mut had_error = false;
 
             // タスク処理
@@ -101,6 +112,9 @@ impl Worker {
 
             // スケジューラージョブチェック
             had_error |= self.run_scheduler().await;
+
+            // Busy-flag 解除
+            self.busy.store(false, Ordering::SeqCst);
 
             // エラー時バックオフ、通常時はハートビートまたは Notify 待ち
             if had_error {
@@ -189,7 +203,26 @@ impl Worker {
             }
         }
 
-        // 4. ci_pending タスク → CI 結果確認 → done or リトライ
+        // 4. executing + subtask ループ再開（awaiting_input → executing に遷移済み）
+        match self.db.get_resumable_task() {
+            Ok(Some(task)) => {
+                tracing::info!(
+                    "Resuming subtask loop for task: {} (subtask {})",
+                    task.asana_task_name,
+                    task.current_subtask_index.unwrap_or(0)
+                );
+                if let Err(e) = self.resume_subtask_execution(task).await {
+                    tracing::error!("Subtask resume failed: {}", e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Failed to fetch resumable task: {}", e);
+                had_error = true;
+            }
+        }
+
+        // 5. ci_pending タスク → CI 結果確認 → done or リトライ
         match self.db.get_ci_pending_task() {
             Ok(Some(task)) => {
                 tracing::debug!("Checking CI for task: {} ({})", task.asana_task_name, task.id);
@@ -304,7 +337,7 @@ impl Worker {
         let wc = context::WorkContext {
             repo_path: repo_path.clone(),
             max_turns: self.repos_config.defaults.claude_max_plan_turns,
-            soul: context::read_soul(base_dir),
+            soul: context::merged_soul(base_dir, Some(&repo_path)),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
@@ -457,7 +490,7 @@ impl Worker {
         let wc = context::WorkContext {
             repo_path: repo_path.clone(),
             max_turns: plan_turns,
-            soul: context::read_soul(base_dir),
+            soul: context::merged_soul(base_dir, Some(&repo_path)),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
@@ -570,10 +603,11 @@ impl Worker {
             .unwrap_or(&self.default_slack_channel);
         let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
 
-        // Step 1: executing に更新 + Slack 通知
+        // Step 1: executing に更新 + ストップボタン付き通知
         self.db.update_status(task.id, "executing")?;
+        let exec_blocks = build_executing_blocks(task.id, ":rocket: 自動実行中...");
         self.slack
-            .reply_thread(channel, thread_ts, ":rocket: 自動実行中...")
+            .post_blocks(channel, thread_ts, &exec_blocks, "自動実行中...")
             .await
             .ok();
 
@@ -591,16 +625,22 @@ impl Worker {
                 context::merged_memory(base_dir, None),
             )
         };
+        // WORKFLOW.md から設定を読み込み
+        let wf = repo_path.as_deref().and_then(workflow::load);
+
         // complex タスクは max_turns を増やす
+        let base_turns = wf.as_ref()
+            .and_then(|w| w.config.max_execute_turns)
+            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
         let execute_turns = match task.complexity.as_deref() {
-            Some("complex") => self.repos_config.defaults.claude_max_execute_turns.saturating_mul(2),
-            _ => self.repos_config.defaults.claude_max_execute_turns,
+            Some("complex") => base_turns.saturating_mul(2),
+            _ => base_turns,
         };
 
         let wc = context::WorkContext {
             repo_path: repo_path.clone().unwrap_or_else(|| std::path::PathBuf::from(base_dir)),
             max_turns: execute_turns,
-            soul: context::read_soul(base_dir),
+            soul: context::merged_soul(base_dir, repo_path.as_deref()),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
@@ -654,7 +694,7 @@ impl Worker {
         Ok(())
     }
 
-    /// worktree 隔離実行: worktree 作成 → executor → PR 作成
+    /// worktree 隔離実行: worktree 作成 → サブタスクループ or ワンショット → PR 作成
     async fn execute_in_worktree(
         &self,
         task: CodingTask,
@@ -697,33 +737,53 @@ impl Worker {
         self.db
             .update_branch_name(task.id, &ws.branch_name)?;
 
-        // Step 3: status → executing
+        // Step 3: status → executing（ストップボタン付き通知）
         self.db.update_status(task.id, "executing")?;
+        let exec_msg = format!(":rocket: worktree で自動実行中... (branch: `{}`)", ws.branch_name);
+        let exec_blocks = build_executing_blocks(task.id, &exec_msg);
         self.slack
-            .reply_thread(
-                channel,
-                thread_ts,
-                &format!(":rocket: worktree で自動実行中... (branch: `{}`)", ws.branch_name),
-            )
+            .post_blocks(channel, thread_ts, &exec_blocks, &exec_msg)
             .await
             .ok();
 
-        // Step 4: executor 実行 (cwd = worktree_path)
+        // サブタスクの有無で分岐
+        let subtasks = parse_subtasks(&task);
+
+        if subtasks.len() > 1 {
+            // サブタスクループ: 最初のサブタスクを実行
+            self.db.update_current_subtask_index(task.id, 1)?;
+            self.execute_single_subtask(&task, repo_entry, &ws, &subtasks, 1, None)
+                .await
+        } else {
+            // ワンショット実行（サブタスクなし or 1つだけ）
+            self.execute_worktree_oneshot(&task, repo_entry, &ws).await
+        }
+    }
+
+    /// worktree ワンショット実行（サブタスクループなし）
+    async fn execute_worktree_oneshot(
+        &self,
+        task: &CodingTask,
+        repo_entry: &crate::repo_config::RepoEntry,
+        ws: &workspace::Workspace,
+    ) -> Result<()> {
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
         let plan_text = task.analysis_text.as_deref().unwrap_or("");
         let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
+
+        let wf = workflow::load(&ws.worktree_path);
+        let base_turns = wf.as_ref()
+            .and_then(|w| w.config.max_execute_turns)
+            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
         let execute_turns = match task.complexity.as_deref() {
-            Some("complex") => self
-                .repos_config
-                .defaults
-                .claude_max_execute_turns
-                .saturating_mul(2),
-            _ => self.repos_config.defaults.claude_max_execute_turns,
+            Some("complex") => base_turns.saturating_mul(2),
+            _ => base_turns,
         };
 
         let wc = context::WorkContext {
             repo_path: ws.worktree_path.clone(),
             max_turns: execute_turns,
-            soul: context::read_soul(base_dir),
+            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
@@ -741,56 +801,204 @@ impl Worker {
         )
         .await;
 
-        // Step 5: 結果に応じて PR 作成 or cleanup
+        self.handle_worktree_result(task, repo_entry, ws, result)
+            .await?;
+        workspace::remove(ws).await.ok();
+        Ok(())
+    }
+
+    /// サブタスクループ: 1つのサブタスクを実行し、次があれば awaiting_input に遷移
+    async fn execute_single_subtask(
+        &self,
+        task: &CodingTask,
+        repo_entry: &crate::repo_config::RepoEntry,
+        ws: &workspace::Workspace,
+        subtasks: &[decomposer::Subtask],
+        current_index: u32,
+        resume_session_id: Option<&str>,
+    ) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+
+        let subtask = match subtasks.iter().find(|s| s.index == current_index) {
+            Some(s) => s,
+            None => {
+                // 指定インデックスのサブタスクが見つからない → 全完了扱い
+                return self.finalize_worktree(task, repo_entry, ws).await;
+            }
+        };
+
+        self.slack
+            .reply_thread(
+                channel,
+                thread_ts,
+                &format!(
+                    ":hammer: サブタスク {}/{} 実行中: *{}*",
+                    current_index, subtasks.len(), subtask.title
+                ),
+            )
+            .await
+            .ok();
+
+        // サブタスク用プロンプト
+        let prompt = format!(
+            "## サブタスク {}/{}: {}\n{}\n\n## 全体の要件定義\n{}",
+            current_index,
+            subtasks.len(),
+            subtask.title,
+            subtask.detail,
+            task.analysis_text.as_deref().unwrap_or("")
+        );
+
+        let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
+        let wf = workflow::load(&ws.worktree_path);
+        let base_turns = wf.as_ref()
+            .and_then(|w| w.config.max_execute_turns)
+            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
+
+        let wc = context::WorkContext {
+            repo_path: ws.worktree_path.clone(),
+            max_turns: base_turns,
+            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        };
+
+        let log_dir = self.log_dir();
+        let result = executor::execute_task_with_session(
+            &format!("[{}/{}] {}", current_index, subtasks.len(), subtask.title),
+            &prompt,
+            Some(repo_entry),
+            Some(ws.worktree_path.as_path()),
+            &wc,
+            Some(&log_dir),
+            &self.runner_ctx,
+            resume_session_id,
+        )
+        .await;
+
         match result {
             Ok(exec_result) if exec_result.success => {
-                // PR 作成を試みる
-                match workspace::finalize(
-                    &ws,
-                    &task.asana_task_name,
-                    &repo_entry.default_branch,
-                    &repo_entry.github,
-                )
-                .await
-                {
-                    Ok(pr_url) => {
-                        self.db.update_pr_url(task.id, &pr_url)?;
-                        self.db.update_status(task.id, "ci_pending")?;
+                // セッション ID を保存
+                if let Some(ref sid) = exec_result.session_id {
+                    self.db.update_session_id(task.id, sid)?;
+                }
 
-                        let output_summary = truncate_for_slack(&exec_result.output, 2800);
-                        let msg = format!(
-                            ":gear: PR を作成しました — CI 結果を監視中...\n{}\n```\n{}\n```",
-                            pr_url, output_summary
-                        );
-                        self.slack
-                            .reply_thread(channel, thread_ts, &msg)
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
-                        // PR 作成失敗（変更なし含む）
-                        self.db.update_status(task.id, "done")?;
+                let next_index = current_index + 1;
+                let remaining: Vec<_> = subtasks
+                    .iter()
+                    .filter(|s| s.index >= next_index)
+                    .collect();
 
-                        let repo_path = self.repos_config.repo_local_path(repo_entry);
-                        context::append_completed_task(base_dir, &task, Some(&repo_path));
+                if remaining.is_empty() {
+                    // 全サブタスク完了 → PR 作成
+                    self.finalize_worktree(task, repo_entry, ws).await?;
+                } else {
+                    // 次のサブタスクがある → awaiting_input に遷移
+                    self.db.update_current_subtask_index(task.id, next_index as i32)?;
+                    self.db.update_status(task.id, "awaiting_input")?;
 
-                        let output_summary = truncate_for_slack(&exec_result.output, 2800);
-                        let msg = format!(
-                            ":white_check_mark: 自動実行完了（PR作成スキップ: {}）\n```\n{}\n```",
-                            e, output_summary
-                        );
-                        self.slack
-                            .reply_thread(channel, thread_ts, &msg)
-                            .await
-                            .ok();
-                    }
+                    let output_summary = truncate_for_slack(&exec_result.output, 1500);
+                    let msg = format!(
+                        ":white_check_mark: サブタスク {}/{} 完了: *{}*\n```\n{}\n```\n\n\
+                         次は *{}* です。\n\
+                         `go` で続行 / 指示を返信 / `stop` で中断",
+                        current_index,
+                        subtasks.len(),
+                        subtask.title,
+                        output_summary,
+                        remaining[0].title
+                    );
+                    self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
                 }
             }
             Ok(exec_result) => {
-                // executor 失敗
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
+                let output_summary = truncate_for_slack(&exec_result.output, 3700);
+                let msg = format!(
+                    ":x: サブタスク {}/{} 失敗\n```\n{}\n```",
+                    current_index,
+                    subtasks.len(),
+                    output_summary
+                );
+                self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
+                workspace::remove(ws).await.ok();
+            }
+            Err(e) => {
+                self.db
+                    .set_error(task.id, &format!("Execution error: {}", e))?;
+                let msg = format!(":x: 実行エラー\n```\n{}\n```", e);
+                self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
+                workspace::remove(ws).await.ok();
+            }
+        }
 
+        Ok(())
+    }
+
+    /// awaiting_input → executing: サブタスクループを再開
+    async fn resume_subtask_execution(&self, task: CodingTask) -> Result<()> {
+        let repo_entry = match task
+            .repo_key
+            .as_deref()
+            .and_then(|key| self.repos_config.find_repo_by_key(key))
+        {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+        let current_index = task.current_subtask_index.unwrap_or(1) as u32;
+        let subtasks = parse_subtasks(&task);
+        let session_id = task.claude_session_id.clone();
+
+        // 既存の worktree を再利用（create_for_retry と同じパターン）
+        let ws = workspace::create_for_retry(
+            base_dir,
+            &repo_entry.key,
+            task.id,
+            task.branch_name.as_deref().unwrap_or(""),
+        )
+        .await?;
+
+        self.execute_single_subtask(
+            &task,
+            repo_entry,
+            &ws,
+            &subtasks,
+            current_index,
+            session_id.as_deref(),
+        )
+        .await
+    }
+
+    /// worktree 実行結果の共通処理: PR 作成 or エラー
+    async fn handle_worktree_result(
+        &self,
+        task: &CodingTask,
+        repo_entry: &crate::repo_config::RepoEntry,
+        ws: &workspace::Workspace,
+        result: Result<executor::ExecutionResult>,
+    ) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+
+        match result {
+            Ok(exec_result) if exec_result.success => {
+                self.finalize_worktree(task, repo_entry, ws).await?;
+            }
+            Ok(exec_result) => {
+                self.db
+                    .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
                 let msg = format!(":x: 自動実行失敗\n```\n{}\n```", output_summary);
                 self.slack
@@ -801,7 +1009,6 @@ impl Worker {
             Err(e) => {
                 self.db
                     .set_error(task.id, &format!("Execution error: {}", e))?;
-
                 let msg = format!(":x: 実行エラー\n```\n{}\n```", e);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
@@ -809,10 +1016,56 @@ impl Worker {
                     .ok();
             }
         }
+        Ok(())
+    }
 
-        // Step 6: worktree cleanup（PR push 済みなので不要）
-        workspace::remove(&ws).await.ok();
+    /// worktree → PR 作成 → ci_pending or done
+    async fn finalize_worktree(
+        &self,
+        task: &CodingTask,
+        repo_entry: &crate::repo_config::RepoEntry,
+        ws: &workspace::Workspace,
+    ) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
 
+        match workspace::finalize(
+            ws,
+            &task.asana_task_name,
+            &repo_entry.default_branch,
+            &repo_entry.github,
+        )
+        .await
+        {
+            Ok(pr_url) => {
+                self.db.update_pr_url(task.id, &pr_url)?;
+                self.db.update_status(task.id, "ci_pending")?;
+                let msg = format!(":gear: PR を作成しました — CI 結果を監視中...\n{}", pr_url);
+                self.slack
+                    .reply_thread(channel, thread_ts, &msg)
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                self.db.update_status(task.id, "done")?;
+                let repo_path = self.repos_config.repo_local_path(repo_entry);
+                context::append_completed_task(base_dir, task, Some(&repo_path));
+                let msg = format!(
+                    ":white_check_mark: 自動実行完了（PR作成スキップ: {}）",
+                    e
+                );
+                self.slack
+                    .reply_thread(channel, thread_ts, &msg)
+                    .await
+                    .ok();
+            }
+        }
+
+        workspace::remove(ws).await.ok();
         Ok(())
     }
 
@@ -994,7 +1247,7 @@ impl Worker {
         let wc = context::WorkContext {
             repo_path: ws.worktree_path.clone(),
             max_turns: self.repos_config.defaults.claude_max_execute_turns,
-            soul: context::read_soul(base_dir),
+            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
@@ -1126,6 +1379,35 @@ fn build_info_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Value {
     ])
 }
 
+/// Block Kit の実行中ブロック（ストップボタン付き）
+fn build_executing_blocks(task_id: i64, message: &str) -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": message
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": ":octagonal_sign: 中止",
+                        "emoji": true
+                    },
+                    "style": "danger",
+                    "action_id": "stop_task",
+                    "value": format!("{}", task_id)
+                }
+            ]
+        }
+    ])
+}
+
 /// リポジトリの初期セットアップ + merged context/memory を返す
 fn prepare_repo_context(base_dir: &str, repo_path: &Path) -> (String, String) {
     // .agent/ ディレクトリ作成（create_dir_all は冪等）
@@ -1159,10 +1441,23 @@ fn ensure_repo_agent_rules(repo_path: &Path) {
     let default_rules = "\
 # エージェント向けルール
 
+## 基本原則
 - CLAUDE.md に記載されたプロジェクト規約に従うこと
 - 既存のコードパターン・命名規則・ディレクトリ構造を尊重すること
 - スコープ外の変更は禁止（依頼された範囲のみ変更すること）
 - 変更後はテストを実行して通ることを確認すること
+
+## Worktree 安全ルール
+- 専用 worktree 内でのみ作業する（共有 workspace を触らない）
+- git stash / git checkout / git switch は禁止（ブランチ管理はランタイムが行う）
+- git worktree の作成・削除は禁止（ランタイムが管理する）
+- 現在のタスクスコープ外のファイルを変更しない
+
+## Harness ルール
+- リンター設定・フォーマッター設定・テスト設定を変更してはいけない
+- テストやリンターのエラーは、コードを修正して解決すること
+- #[allow(...)] / @ts-ignore / noqa 等でエラーを黙らせてはいけない
+- CI が失敗した場合はコードを直すこと（CI 設定を変えない）
 ";
 
     if let Err(e) = std::fs::write(&agent_rules, default_rules) {
@@ -1174,4 +1469,12 @@ fn ensure_repo_agent_rules(repo_path: &Path) {
 
 pub(crate) fn truncate_for_slack(text: &str, max_len: usize) -> &str {
     crate::claude::truncate_str(text, max_len)
+}
+
+/// subtasks_json をパースして Subtask 配列を返す
+fn parse_subtasks(task: &CodingTask) -> Vec<decomposer::Subtask> {
+    task.subtasks_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
 }

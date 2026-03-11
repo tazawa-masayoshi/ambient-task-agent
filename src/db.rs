@@ -39,6 +39,10 @@ pub struct CodingTask {
     pub actual_minutes: Option<i32>,
     pub retrospective_note: Option<String>,
     pub complexity: Option<String>,
+    /// claude -p セッション継続用 ID
+    pub claude_session_id: Option<String>,
+    /// サブタスクループの現在インデックス（1-based）
+    pub current_subtask_index: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -70,7 +74,7 @@ pub struct ScheduledJob {
     pub next_run_at: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, claude_session_id, current_subtask_index, created_at, updated_at";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
     Ok(CodingTask {
@@ -100,8 +104,10 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
         actual_minutes: row.get(23)?,
         retrospective_note: row.get(24)?,
         complexity: row.get(25)?,
-        created_at: row.get(26)?,
-        updated_at: row.get(27)?,
+        claude_session_id: row.get(26)?,
+        current_subtask_index: row.get(27)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -215,6 +221,8 @@ impl Db {
             ("actual_minutes", "INTEGER"),  // v8
             ("retrospective_note", "TEXT"), // v8
             ("complexity", "TEXT"),         // v9
+            ("claude_session_id", "TEXT"),  // v10: セッション継続用
+            ("current_subtask_index", "INTEGER"), // v10: サブタスクループ進捗
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -902,6 +910,51 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// claude -p セッション ID を保存
+    pub fn update_session_id(&self, id: i64, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET claude_session_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![session_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// サブタスクループの現在インデックスを更新
+    pub fn update_current_subtask_index(&self, id: i64, index: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET current_subtask_index = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![index, id],
+        )?;
+        Ok(())
+    }
+
+    /// サブタスクループ再開可能なタスク: executing + current_subtask_index IS NOT NULL
+    pub fn get_resumable_task(&self) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'executing' AND current_subtask_index IS NOT NULL ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
+        Ok(task)
+    }
+
+    /// awaiting_input 状態のタスクを1件取得（ユーザー入力待ち）
+    #[allow(dead_code)]
+    pub fn get_awaiting_input_task(&self) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = 'awaiting_input' ORDER BY id ASC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row([], row_to_task).ok();
+        Ok(task)
     }
 
     // ── ops_contexts ──

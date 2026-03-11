@@ -99,7 +99,7 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
                     Ok(msg) => {
                         let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                         tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                        dispatch_ops_request(state, &msg, channel, message_ts, text, &repo_entry).await?;
+                        dispatch_ops_request(state, &msg, channel, message_ts, text, repo_entry).await?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);
@@ -521,23 +521,94 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             state.wake_worker();
         }
 
-        "go" | "実行" | "run" => {
-            if task.status != "proposed" {
-                slack
-                    .reply_thread(
-                        channel,
-                        thread_ts,
-                        &format!(":no_entry: 現在のステータスは `{}` のため実行できません（proposed のみ）", task.status),
-                    )
-                    .await?;
-                return Ok(());
+        "go" | "実行" | "run" | "続行" | "next" | "continue" => {
+            match task.status.as_str() {
+                "proposed" => {
+                    state.db.update_status(task.id, "auto_approved")?;
+                    slack
+                        .reply_thread(channel, thread_ts, ":robot_face: 自動実行モードで承認しました！実行を開始します...")
+                        .await?;
+                    tracing::info!("Task {} auto_approved via thread reply", task.id);
+                    state.wake_worker();
+                }
+                "awaiting_input" => {
+                    state.db.update_status(task.id, "executing")?;
+                    slack
+                        .reply_thread(channel, thread_ts, ":arrow_forward: 次のサブタスクを実行します...")
+                        .await?;
+                    tracing::info!("Task {} resumed from awaiting_input via thread reply", task.id);
+                    state.wake_worker();
+                }
+                _ => {
+                    slack
+                        .reply_thread(
+                            channel,
+                            thread_ts,
+                            &format!(":no_entry: 現在のステータスは `{}` のため実行できません", task.status),
+                        )
+                        .await?;
+                }
             }
-            state.db.update_status(task.id, "auto_approved")?;
-            slack
-                .reply_thread(channel, thread_ts, ":robot_face: 自動実行モードで承認しました！実行を開始します...")
-                .await?;
-            tracing::info!("Task {} auto_approved via thread reply", task.id);
-            state.wake_worker();
+        }
+
+        // 実行中タスクの停止
+        "stop" | "cancel" | "中止" | "停止" => {
+            match task.status.as_str() {
+                "executing" | "ci_pending" | "analyzing" | "decomposing" | "awaiting_input" => {
+                    let prev_status = task.status.clone();
+                    state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
+                    slack
+                        .reply_thread(
+                            channel,
+                            thread_ts,
+                            &format!(":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
+                                      実行中のプロセスは次のターン終了時に停止します", prev_status),
+                        )
+                        .await?;
+                    tracing::info!("Task {} cancelled via thread reply (was {})", task.id, prev_status);
+                }
+                _ => {
+                    slack
+                        .reply_thread(
+                            channel,
+                            thread_ts,
+                            &format!(":no_entry: 現在のステータスは `{}` のため中止できません", task.status),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        // ステータス確認
+        cmd if cmd == "status" || cmd == "状態" || cmd.starts_with("進捗") => {
+            let status_emoji = match task.status.as_str() {
+                "new" => ":inbox_tray:",
+                "analyzing" => ":brain:",
+                "proposed" => ":clipboard:",
+                "approved" | "auto_approved" => ":white_check_mark:",
+                "decomposing" => ":gear:",
+                "ready" => ":arrow_forward:",
+                "executing" => ":rocket:",
+                "ci_pending" => ":hourglass:",
+                "done" => ":tada:",
+                "error" => ":x:",
+                "sleeping" => ":zzz:",
+                _ => ":grey_question:",
+            };
+            let mut msg = format!(
+                "{} *{}*\nステータス: `{}`",
+                status_emoji, task.asana_task_name, task.status
+            );
+            if let Some(ref pr_url) = task.pr_url {
+                msg.push_str(&format!("\nPR: {}", pr_url));
+            }
+            if let Some(ref branch) = task.branch_name {
+                msg.push_str(&format!("\nブランチ: `{}`", branch));
+            }
+            if task.retry_count > 0 {
+                msg.push_str(&format!("\nリトライ: {}回", task.retry_count));
+            }
+            slack.reply_thread(channel, thread_ts, &msg).await?;
         }
 
         _ => {

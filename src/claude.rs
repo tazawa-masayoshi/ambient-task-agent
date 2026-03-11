@@ -43,6 +43,8 @@ pub struct AgentRequest {
     pub env: Vec<(String, String)>,
     pub timeout_secs: Option<u64>,
     pub max_output_bytes: Option<usize>,
+    /// セッション継続用: 前回の session_id を指定すると --resume で再開
+    pub resume_session_id: Option<String>,
     /// Bedrock 用: 追加ツール定義 (domain-specific tools)
     pub extra_tool_defs: Vec<ToolMeta>,
     /// Bedrock 用: 追加ツールのハンドラ。ClaudeCliBackend では無視される
@@ -61,6 +63,8 @@ pub struct AgentOutput {
     pub usage: Option<TokenUsage>,
     /// セッション費用（USD）
     pub cost_usd: Option<f64>,
+    /// セッションID（--resume で継続実行に使用）
+    pub session_id: Option<String>,
 }
 
 /// Claude CLI の JSON 出力から取得できるトークン使用量
@@ -216,6 +220,7 @@ impl ClaudeCliBackend {
                     truncated,
                     usage,
                     cost_usd,
+                    session_id: parsed.session_id,
                 }
             }
             Err(e) => {
@@ -228,6 +233,7 @@ impl ClaudeCliBackend {
                     truncated: false,
                     usage: None,
                     cost_usd: None,
+                    session_id: None,
                 }
             }
         }
@@ -246,6 +252,11 @@ impl AgentBackend for ClaudeCliBackend {
             "--dangerously-skip-permissions",
             "--no-chrome",
         ];
+
+        // セッション継続: --resume session_id
+        if let Some(ref sid) = request.resume_session_id {
+            args.extend(["--resume", sid]);
+        }
 
         if let Some(ref sp) = request.system_prompt {
             args.extend(["--system-prompt", sp]);
@@ -305,6 +316,7 @@ impl AgentBackend for ClaudeCliBackend {
                     truncated: false,
                     usage: None,
                     cost_usd: None,
+                    session_id: None,
                 });
             }
         };
@@ -332,6 +344,7 @@ impl AgentBackend for ClaudeCliBackend {
                 truncated: false,
                 usage: None,
                 cost_usd: None,
+                session_id: None,
             });
         }
 
@@ -383,6 +396,8 @@ pub struct ClaudeRunner {
     backend: Option<Arc<dyn AgentBackend>>,
     extra_tool_defs: Vec<ToolMeta>,
     tool_dispatcher: Option<Arc<dyn ExtraToolDispatcher>>,
+    /// セッション継続用: 前回の session_id
+    resume_session_id: Option<String>,
 }
 
 impl ClaudeRunner {
@@ -405,7 +420,14 @@ impl ClaudeRunner {
             backend: None,
             extra_tool_defs: Vec::new(),
             tool_dispatcher: None,
+            resume_session_id: None,
         }
+    }
+
+    /// セッション継続: 前回の session_id を指定して --resume で再開
+    pub fn resume(mut self, session_id: impl Into<String>) -> Self {
+        self.resume_session_id = Some(session_id.into());
+        self
     }
 
     pub fn system_prompt(mut self, sp: impl Into<String>) -> Self {
@@ -554,6 +576,7 @@ impl ClaudeRunner {
                     truncated: false,
                     usage: None,
                     cost_usd: None,
+                    session_id: None,
                 });
             }
             ExecMode::Normal => {}
@@ -595,6 +618,7 @@ impl ClaudeRunner {
             env: self.resolved_env.clone().unwrap_or_default(),
             timeout_secs: self.timeout_secs,
             max_output_bytes: self.max_output_bytes,
+            resume_session_id: self.resume_session_id.clone(),
             extra_tool_defs: self.extra_tool_defs.drain(..).collect(),
             tool_dispatcher: self.tool_dispatcher.take(),
         };

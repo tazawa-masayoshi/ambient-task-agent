@@ -216,6 +216,8 @@ mod tests {
             actual_minutes: None,
             retrospective_note: None,
             complexity: None,
+            claude_session_id: None,
+            current_subtask_index: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }

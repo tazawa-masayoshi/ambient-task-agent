@@ -41,6 +41,8 @@ const OUTPUT_INSTRUCTIONS: &str = "\
 pub struct ExecutionResult {
     pub success: bool,
     pub output: String,
+    /// claude -p セッションID（セッション継続に使用）
+    pub session_id: Option<String>,
 }
 
 fn build_system_prompt(soul: &str, skill: &str, is_coding: bool) -> String {
@@ -58,6 +60,21 @@ pub async fn execute_task(
     wc: &WorkContext,
     log_dir: Option<&Path>,
     runner_ctx: &RunnerContext,
+) -> Result<ExecutionResult> {
+    execute_task_with_session(task_name, plan_text, repo_entry, repo_path, wc, log_dir, runner_ctx, None).await
+}
+
+/// セッション継続対応の実行関数
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_task_with_session(
+    task_name: &str,
+    plan_text: &str,
+    repo_entry: Option<&RepoEntry>,
+    repo_path: Option<&Path>,
+    wc: &WorkContext,
+    log_dir: Option<&Path>,
+    runner_ctx: &RunnerContext,
+    resume_session_id: Option<&str>,
 ) -> Result<ExecutionResult> {
     let (system_prompt, allowed_tools, cwd) = if let Some(path) = repo_path {
         let tools = repo_entry
@@ -99,12 +116,18 @@ pub async fn execute_task(
         runner = runner.cwd(path);
     }
 
+    // セッション継続
+    if let Some(sid) = resume_session_id {
+        runner = runner.resume(sid);
+    }
+
     let result = runner.run().await?;
 
     if result.success {
         Ok(ExecutionResult {
             success: true,
             output: result.stdout,
+            session_id: result.session_id,
         })
     } else {
         Ok(ExecutionResult {
@@ -114,6 +137,7 @@ pub async fn execute_task(
             } else {
                 format!("{}\n\nSTDERR:\n{}", result.stdout, result.stderr)
             },
+            session_id: result.session_id,
         })
     }
 }

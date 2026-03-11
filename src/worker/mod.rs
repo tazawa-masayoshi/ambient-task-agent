@@ -7,4 +7,5 @@ pub mod priority;
 pub mod runner;
 pub mod scheduler;
 pub mod task_file;
+pub mod workflow;
 pub mod workspace;
