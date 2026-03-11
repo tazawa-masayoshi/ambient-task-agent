@@ -804,7 +804,6 @@ async fn dispatch_ops_request(
     let thread_ts_owned = thread_ts.to_string();
     let log_dir = log_dir_from_state(state);
     let runner_ctx = state.runner_ctx.clone();
-    let admin_user = state.repos_config.defaults.ops_admin_user.clone();
 
     tokio::spawn(async move {
         // ファイルダウンロード（ops_download_dir が設定されている場合のみ）
@@ -841,24 +840,14 @@ async fn dispatch_ops_request(
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
 
-                // 依頼者向け: スレッドにフレンドリーな完了メッセージ
-                slack.reply_thread(&channel, &thread_ts_owned, ":white_check_mark: 対応完了しました！").await.ok();
-
-                // 管理者向け: DM で詳細結果を通知
-                if let Some(ref admin) = admin_user {
-                    let detail = format!(":white_check_mark: *ops 完了* (#{}):\n```\n{}\n```", channel, output);
-                    slack.post_message(admin, &detail).await.ok();
-                }
+                // スレッドに詳細結果を返信
+                let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
+                slack.reply_thread(&channel, &thread_ts_owned, &detail).await.ok();
             }
             Err(e) => {
-                // 依頼者向け: スレッドにエラー通知
-                slack.reply_thread(&channel, &thread_ts_owned, ":x: 処理に失敗しました。管理者に連絡します。").await.ok();
-
-                // 管理者向け: DM でエラー詳細を通知
-                if let Some(ref admin) = admin_user {
-                    let detail = format!(":x: *ops 失敗* (#{}):\n```\n{}\n```", channel, e);
-                    slack.post_message(admin, &detail).await.ok();
-                }
+                // スレッドにエラー詳細を返信
+                let detail = format!(":x: *ops 失敗*\n```\n{}\n```", e);
+                slack.reply_thread(&channel, &thread_ts_owned, &detail).await.ok();
             }
         }
     });
