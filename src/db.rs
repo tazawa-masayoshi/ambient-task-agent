@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +46,47 @@ pub struct CodingTask {
     pub current_subtask_index: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// サブタスク定義（旧 decomposer で使用、DB の subtasks_json に保存済みデータの読み取り用に保持）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subtask {
+    pub index: u32,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub depends_on: Vec<u32>,
+    #[serde(default)]
+    pub estimated_minutes: Option<u32>,
+    #[serde(default = "default_subtask_status")]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub actual_minutes: Option<u32>,
+}
+
+fn default_subtask_status() -> String {
+    "pending".to_string()
+}
+
+/// 着手可能なサブタスク（pending + 依存解決済み）を返す
+pub fn get_actionable_subtasks(subtasks: &[Subtask]) -> Vec<&Subtask> {
+    let done_indices: HashSet<u32> = subtasks
+        .iter()
+        .filter(|s| s.status == "done")
+        .map(|s| s.index)
+        .collect();
+
+    subtasks
+        .iter()
+        .filter(|s| {
+            s.status == "pending"
+                && (s.depends_on.is_empty() || s.depends_on.iter().all(|dep| done_indices.contains(dep)))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,37 +320,26 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn get_new_task(&self) -> Result<Option<CodingTask>> {
+    fn get_task_by_status(&self, status: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'new' ORDER BY id ASC LIMIT 1",
+            "SELECT {} FROM coding_tasks WHERE status = ?1 ORDER BY id ASC LIMIT 1",
             TASK_COLUMNS
         );
         let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
+        Ok(stmt.query_row(params![status], row_to_task).ok())
+    }
+
+    pub fn get_new_task(&self) -> Result<Option<CodingTask>> {
+        self.get_task_by_status("new")
     }
 
     pub fn get_approved_task(&self) -> Result<Option<CodingTask>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'approved' ORDER BY id ASC LIMIT 1",
-            TASK_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
+        self.get_task_by_status("approved")
     }
 
     pub fn get_auto_approved_task(&self) -> Result<Option<CodingTask>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'auto_approved' ORDER BY id ASC LIMIT 1",
-            TASK_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
+        self.get_task_by_status("auto_approved")
     }
 
     pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
@@ -334,25 +365,6 @@ impl Db {
         conn.execute(
             "UPDATE coding_tasks SET analysis_text = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![analysis_text, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_subtasks(&self, id: i64, subtasks_json: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET subtasks_json = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![subtasks_json, id],
-        )?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn update_plan(&self, id: i64, plan_text: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET plan_text = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![plan_text, id],
         )?;
         Ok(())
     }
@@ -419,7 +431,7 @@ impl Db {
     pub fn reset_for_regeneration(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE coding_tasks SET status = 'new', analysis_text = NULL, plan_text = NULL, subtasks_json = NULL, slack_plan_ts = NULL, error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            "UPDATE coding_tasks SET status = 'new', analysis_text = NULL, plan_text = NULL, subtasks_json = NULL, slack_plan_ts = NULL, error_message = NULL, claude_session_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -737,50 +749,8 @@ impl Db {
     }
 
     // ========================================================================
-    // PM Layer: Priority / Progress / Subtask Management
+    // PM Layer: Priority
     // ========================================================================
-
-    /// サブタスクのステータスを更新し、progress_percent を再計算
-    pub fn update_subtask_status(&self, id: i64, subtask_index: u32, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let json_str: Option<String> = conn.query_row(
-            "SELECT subtasks_json FROM coding_tasks WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
-
-        let json_str = json_str.ok_or_else(|| anyhow::anyhow!("No subtasks_json for task {}", id))?;
-        let mut subtasks: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
-
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let mut found = false;
-        for s in subtasks.iter_mut() {
-            if s.get("index").and_then(|v| v.as_u64()) == Some(subtask_index as u64) {
-                s["status"] = serde_json::Value::String(status.to_string());
-                if status == "in_progress" && s.get("started_at").and_then(|v| v.as_str()).is_none() {
-                    s["started_at"] = serde_json::Value::String(now.clone());
-                }
-                if status == "done" {
-                    s["completed_at"] = serde_json::Value::String(now.clone());
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            anyhow::bail!("Subtask index {} not found in task {}", subtask_index, id);
-        }
-
-        let done_count = subtasks.iter().filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("done")).count();
-        let progress = if subtasks.is_empty() { 0 } else { ((done_count as f64 / subtasks.len() as f64) * 100.0).round() as i32 };
-
-        let new_json = serde_json::to_string(&subtasks)?;
-        conn.execute(
-            "UPDATE coding_tasks SET subtasks_json = ?1, progress_percent = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
-            params![new_json, progress, id],
-        )?;
-        Ok(())
-    }
 
     /// 優先度スコアを更新
     pub fn update_priority_score(&self, id: i64, score: f64) -> Result<()> {
@@ -788,16 +758,6 @@ impl Db {
         conn.execute(
             "UPDATE coding_tasks SET priority_score = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![score, id],
-        )?;
-        Ok(())
-    }
-
-    /// 進捗率を更新
-    pub fn update_progress(&self, id: i64, percent: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET progress_percent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![percent, id],
         )?;
         Ok(())
     }
@@ -887,14 +847,7 @@ impl Db {
 
     /// ci_pending 状態のタスクを1件取得
     pub fn get_ci_pending_task(&self) -> Result<Option<CodingTask>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'ci_pending' ORDER BY id ASC LIMIT 1",
-            TASK_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
+        self.get_task_by_status("ci_pending")
     }
 
     /// retry_count をインクリメントして新しい値を返す
@@ -920,41 +873,6 @@ impl Db {
             params![session_id, id],
         )?;
         Ok(())
-    }
-
-    /// サブタスクループの現在インデックスを更新
-    pub fn update_current_subtask_index(&self, id: i64, index: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET current_subtask_index = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![index, id],
-        )?;
-        Ok(())
-    }
-
-    /// サブタスクループ再開可能なタスク: executing + current_subtask_index IS NOT NULL
-    pub fn get_resumable_task(&self) -> Result<Option<CodingTask>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'executing' AND current_subtask_index IS NOT NULL ORDER BY id ASC LIMIT 1",
-            TASK_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
-    }
-
-    /// awaiting_input 状態のタスクを1件取得（ユーザー入力待ち）
-    #[allow(dead_code)]
-    pub fn get_awaiting_input_task(&self) -> Result<Option<CodingTask>> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status = 'awaiting_input' ORDER BY id ASC LIMIT 1",
-            TASK_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let task = stmt.query_row([], row_to_task).ok();
-        Ok(task)
     }
 
     // ── ops_contexts ──

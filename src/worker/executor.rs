@@ -42,6 +42,7 @@ pub struct ExecutionResult {
     pub success: bool,
     pub output: String,
     /// claude -p セッションID（セッション継続に使用）
+    #[allow(dead_code)]
     pub session_id: Option<String>,
 }
 
@@ -90,16 +91,19 @@ pub async fn execute_task_with_session(
         )
     };
 
-    let mut prompt_parts = vec![format!("## タスク\n{}\n\n## 承認済みプラン\n{}", task_name, plan_text)];
-
-    if !wc.context.is_empty() {
-        prompt_parts.push(format!("## 直近の作業履歴\n{}", wc.context));
-    }
-    if !wc.memory.is_empty() {
-        prompt_parts.push(format!("## 過去の学び・メモ\n{}", wc.memory));
-    }
-
-    let prompt = prompt_parts.join("\n\n");
+    // --resume 時は計画が既にセッションにあるため短縮プロンプト
+    let prompt = if resume_session_id.is_some() {
+        "上記の計画を実行してください。ファイルの変更を行い、テストを確認してください。".to_string()
+    } else {
+        let mut parts = vec![format!("## タスク\n{}\n\n## 承認済みプラン\n{}", task_name, plan_text)];
+        if !wc.context.is_empty() {
+            parts.push(format!("## 直近の作業履歴\n{}", wc.context));
+        }
+        if !wc.memory.is_empty() {
+            parts.push(format!("## 過去の学び・メモ\n{}", wc.memory));
+        }
+        parts.join("\n\n")
+    };
 
     let turns = repo_entry
         .and_then(|r| r.max_execute_turns)

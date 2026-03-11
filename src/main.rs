@@ -1,5 +1,4 @@
 mod asana;
-mod bedrock;
 mod claude;
 mod config;
 mod db;
@@ -88,12 +87,6 @@ enum Commands {
         /// done に遷移して完了記録（actual_minutes 自動計算）
         #[arg(long)]
         done: bool,
-        /// サブタスク N を in_progress に
-        #[arg(long)]
-        subtask_start: Option<u32>,
-        /// サブタスク N を done に
-        #[arg(long)]
-        subtask_done: Option<u32>,
     },
 }
 
@@ -111,7 +104,7 @@ async fn main() -> Result<()> {
         Commands::Start { query, gid } => cmd_start(query, gid)?,
         Commands::Current => cmd_current()?,
         Commands::Serve { port, config_dir } => cmd_serve(port, config_dir.as_deref()).await?,
-        Commands::Task { id, start, done, subtask_start, subtask_done } => cmd_task(id, start, done, subtask_start, subtask_done)?,
+        Commands::Task { id, start, done } => cmd_task(id, start, done)?,
     }
 
     Ok(())
@@ -371,7 +364,7 @@ fn cmd_current() -> Result<()> {
 // Task
 // ============================================================================
 
-fn cmd_task(id: i64, start: bool, done: bool, subtask_start: Option<u32>, subtask_done: Option<u32>) -> Result<()> {
+fn cmd_task(id: i64, start: bool, done: bool) -> Result<()> {
     let server_config = load_server_config(None)?;
     let repos_config = repo_config::ReposConfig::load(&server_config.repos_config_path)?;
     let base_dir = &repos_config.defaults.repos_base_dir;
@@ -393,18 +386,6 @@ fn cmd_task(id: i64, start: bool, done: bool, subtask_start: Option<u32>, subtas
             worker::context::append_completed_task(base_dir, &t, repo_path.as_deref());
         }
         eprintln!("Task #{} を done に遷移しました（actual_minutes 自動計算済み）", id);
-    }
-
-    if let Some(index) = subtask_start {
-        let db = db::Db::open(&server_config.db_path)?;
-        db.update_subtask_status(id, index, "in_progress")?;
-        eprintln!("Task #{} サブタスク #{} を in_progress に遷移しました", id, index);
-    }
-
-    if let Some(index) = subtask_done {
-        let db = db::Db::open(&server_config.db_path)?;
-        db.update_subtask_status(id, index, "done")?;
-        eprintln!("Task #{} サブタスク #{} を done に遷移しました", id, index);
     }
 
     match worker::task_file::read_task_file(base_dir, id) {
@@ -477,31 +458,6 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
         .collect();
 
-    // Bedrock バックエンド初期化（設定がある場合のみ）
-    let ops_backend: Option<std::sync::Arc<dyn claude::AgentBackend>> =
-        if let Some(ref model_id) = repos_config.defaults.bedrock_model_id {
-            match bedrock::BedrockBackend::new(
-                model_id,
-                repos_config.defaults.bedrock_region.as_deref(),
-            )
-            .await
-            {
-                Ok(b) => {
-                    tracing::info!("Bedrock backend initialized (model: {})", model_id);
-                    Some(std::sync::Arc::new(b))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Bedrock init failed, ops will use claude -p: {}",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
     let runner_ctx = execution::RunnerContext {
         defaults: repos_config.defaults.clone(),
         semaphore: semaphore.clone(),
@@ -509,7 +465,6 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         hooks: hooks.clone(),
         resolved_env,
         backend: std::sync::Arc::new(claude::ClaudeCliBackend),
-        ops_backend,
     };
 
     let app_state = server::http::AppState {

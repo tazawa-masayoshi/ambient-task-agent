@@ -492,7 +492,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             }
             state.db.update_status(task.id, "approved")?;
             slack
-                .reply_thread(channel, thread_ts, ":white_check_mark: 承認しました！タスク分解を開始します...")
+                .reply_thread(channel, thread_ts, ":white_check_mark: 承認しました！実行を開始します...")
                 .await?;
             tracing::info!("Task {} approved via thread reply", task.id);
             state.wake_worker();
@@ -521,22 +521,14 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             state.wake_worker();
         }
 
-        "go" | "実行" | "run" | "続行" | "next" | "continue" => {
+        "go" | "実行" | "run" => {
             match task.status.as_str() {
                 "proposed" => {
                     state.db.update_status(task.id, "auto_approved")?;
                     slack
-                        .reply_thread(channel, thread_ts, ":robot_face: 自動実行モードで承認しました！実行を開始します...")
+                        .reply_thread(channel, thread_ts, ":robot_face: 即実行モードで承認しました！実行を開始します...")
                         .await?;
                     tracing::info!("Task {} auto_approved via thread reply", task.id);
-                    state.wake_worker();
-                }
-                "awaiting_input" => {
-                    state.db.update_status(task.id, "executing")?;
-                    slack
-                        .reply_thread(channel, thread_ts, ":arrow_forward: 次のサブタスクを実行します...")
-                        .await?;
-                    tracing::info!("Task {} resumed from awaiting_input via thread reply", task.id);
                     state.wake_worker();
                 }
                 _ => {
@@ -554,7 +546,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         // 実行中タスクの停止
         "stop" | "cancel" | "中止" | "停止" => {
             match task.status.as_str() {
-                "executing" | "ci_pending" | "analyzing" | "decomposing" | "awaiting_input" => {
+                "executing" | "ci_pending" | "planning" => {
                     let prev_status = task.status.clone();
                     state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
                     slack
@@ -583,11 +575,9 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         cmd if cmd == "status" || cmd == "状態" || cmd.starts_with("進捗") => {
             let status_emoji = match task.status.as_str() {
                 "new" => ":inbox_tray:",
-                "analyzing" => ":brain:",
+                "planning" => ":brain:",
                 "proposed" => ":clipboard:",
                 "approved" | "auto_approved" => ":white_check_mark:",
-                "decomposing" => ":gear:",
-                "ready" => ":arrow_forward:",
                 "executing" => ":rocket:",
                 "ci_pending" => ":hourglass:",
                 "done" => ":tada:",
@@ -766,17 +756,6 @@ async fn classify_ops_message(
 
 /// RepoEntry から対応可能な作業の説明テキストを生成
 fn build_ops_description(repo_entry: &crate::repo_config::RepoEntry) -> String {
-    // tool ベース: ツール名と説明を列挙
-    if let Some(ref tools) = repo_entry.ops_tools {
-        if !tools.is_empty() {
-            return tools
-                .iter()
-                .map(|t| format!("- {}: {}", t.name, t.description))
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
-    }
-    // skill ベース: スキルファイルの存在だけ通知
     if let Some(ref skills) = repo_entry.ops_skills {
         if !skills.is_empty() {
             return "- スキルファイルに定義された定型作業".to_string();
@@ -806,7 +785,6 @@ async fn dispatch_ops_request(
     let repo_key = repo_entry.key.clone();
     let soul = crate::worker::context::read_soul(&state.repos_config.defaults.repos_base_dir);
     let max_turns = state.repos_config.defaults.claude_max_execute_turns;
-    let ops_tools = repo_entry.ops_tools.clone();
     let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
     let ops_download_dir = repo_entry.ops_download_dir.clone();
 
@@ -834,7 +812,10 @@ async fn dispatch_ops_request(
             if let Some(ref dl_dir) = ops_download_dir {
                 let download_dir = repo_path.join(dl_dir);
                 for f in &req.files {
-                    let dest = download_dir.join(&f.name);
+                    let safe_name = std::path::Path::new(&f.name)
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("download"));
+                    let dest = download_dir.join(safe_name);
                     if let Err(e) = slack.download_file(&f.url_private_download, &dest).await {
                         tracing::warn!("Failed to download file {}: {}", f.name, e);
                     }
@@ -847,22 +828,11 @@ async fn dispatch_ops_request(
             tracing::warn!("Failed to save ops context (user): {}", e);
         }
 
-        // ops_tools (tool ベース) と ops_skills (skill ベース) を分岐
-        let use_tools = ops_tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-
         let dl_dir_ref = ops_download_dir.as_deref();
-        let exec_result = if use_tools {
-            let tools = ops_tools.as_ref().unwrap();
-            crate::worker::ops::execute_ops_with_tools(
-                &req, &repo_path, tools, &soul,
-                Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
-            ).await
-        } else {
-            crate::worker::ops::execute_ops(
-                &req, &repo_path, &ops_skills, &soul,
-                max_turns, Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
-            ).await
-        };
+        let exec_result = crate::worker::ops::execute_ops(
+            &req, &repo_path, &ops_skills, &soul,
+            max_turns, Some(&log_dir), &runner_ctx, &history, dl_dir_ref,
+        ).await;
 
         match exec_result {
             Ok(output) => {

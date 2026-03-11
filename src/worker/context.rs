@@ -137,7 +137,7 @@ pub fn merged_memory(repos_base_dir: &str, repo: Option<&Path>) -> String {
 // WorkContext — AI モジュール共通の作業コンテキスト
 // ============================================================================
 
-/// analyzer / decomposer / executor に渡す共通コンテキスト
+/// analyzer / executor に渡す共通コンテキスト
 pub struct WorkContext {
     pub repo_path: std::path::PathBuf,
     pub max_turns: u32,

@@ -13,9 +13,9 @@ pub struct Workspace {
     pub main_repo_path: PathBuf,
 }
 
-/// git コマンドを実行して stdout を返す (タイムアウト + kill_on_drop)
-async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+/// 外部コマンドを実行して stdout を返す (タイムアウト + kill_on_drop)
+async fn run_cmd(cmd_name: &str, cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(cmd_name)
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true)
@@ -23,34 +23,22 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 
     let output = tokio::time::timeout(GIT_TIMEOUT, output)
         .await
-        .context("git command timed out")?
-        .context("failed to spawn git")?;
+        .context("command timed out")?
+        .with_context(|| format!("failed to spawn {}", cmd_name))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+        bail!("{} {} failed: {}", cmd_name, args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// gh コマンドを実行して stdout を返す
+async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+    run_cmd("git", cwd, args).await
+}
+
 async fn gh(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("gh")
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .output();
-
-    let output = tokio::time::timeout(GIT_TIMEOUT, output)
-        .await
-        .context("gh command timed out")?
-        .context("failed to spawn gh")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh {} failed: {}", args.join(" "), stderr.trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    run_cmd("gh", cwd, args).await
 }
 
 /// worktree を作成する

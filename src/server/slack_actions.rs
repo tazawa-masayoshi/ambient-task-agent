@@ -302,7 +302,7 @@ async fn process_action(
 
         "stop_task" => {
             match task.status.as_str() {
-                "executing" | "ci_pending" | "analyzing" | "decomposing" | "awaiting_input" => {
+                "executing" | "ci_pending" | "planning" => {
                     let prev_status = task.status.clone();
                     state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
 

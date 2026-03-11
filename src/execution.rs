@@ -205,7 +205,5 @@ pub struct RunnerContext {
     pub resolved_env: Vec<(String, String)>,
     /// LLM 実行バックエンド (デフォルト: claude -p)
     pub backend: Arc<dyn crate::claude::AgentBackend>,
-    /// ops 専用バックエンド (Bedrock)。None なら backend にフォールバック
-    pub ops_backend: Option<Arc<dyn crate::claude::AgentBackend>>,
 }
 

@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::db::CodingTask;
-use super::decomposer::Subtask;
+use crate::db::{CodingTask, Subtask};
 
 /// 優先度スコアを計算 (0.0-100.0)
 ///
@@ -30,7 +29,6 @@ pub fn calculate_priority_score(task: &CodingTask, now: &DateTime<Utc>) -> f64 {
         "in_progress" | "executing" => 15.0,
         "ready" => 10.0,
         "approved" | "auto_approved" => 5.0,
-        "decomposing" => 8.0,
         _ => 0.0,
     };
 

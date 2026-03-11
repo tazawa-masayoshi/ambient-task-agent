@@ -11,7 +11,7 @@ use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 
-use super::{analyzer, context, decomposer, executor, priority, scheduler, task_file, workflow, workspace};
+use super::{analyzer, context, executor, priority, scheduler, task_file, workflow, workspace};
 
 /// ハートビート間隔の下限
 const MIN_HEARTBEAT_SECS: u64 = 10;
@@ -147,12 +147,12 @@ impl Worker {
     async fn process_tasks(&self) -> bool {
         let mut had_error = false;
 
-        // 1. new タスク → analyzing → proposed
+        // 1. new → planning → proposed/auto_approved
         match self.db.get_new_task() {
             Ok(Some(task)) => {
-                tracing::info!("Analyzing task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.analyze_task(task).await {
-                    tracing::error!("Task analysis failed: {}", e);
+                tracing::info!("Planning task: {} ({})", task.asana_task_name, task.asana_task_gid);
+                if let Err(e) = self.plan_task(task).await {
+                    tracing::error!("Task planning failed: {}", e);
                 }
             }
             Ok(None) => {}
@@ -162,12 +162,12 @@ impl Worker {
             }
         }
 
-        // 2. approved タスク → decomposing → ready
+        // 2. approved → executing（手動承認後、--resume で実行）
         match self.db.get_approved_task() {
             Ok(Some(task)) => {
-                tracing::info!("Decomposing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.decompose_task(task).await {
-                    tracing::error!("Task decomposition failed: {}", e);
+                tracing::info!("Executing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
+                if let Err(e) = self.execute_approved_task(task).await {
+                    tracing::error!("Approved task execution failed: {}", e);
                 }
             }
             Ok(None) => {}
@@ -188,11 +188,11 @@ impl Worker {
             }
         }
 
-        // 3. auto_approved タスク → executing → ci_pending/done
+        // 3. auto_approved → executing（自動実行、--resume で実行）
         match self.db.get_auto_approved_task() {
             Ok(Some(task)) => {
                 tracing::info!("Auto-executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if let Err(e) = self.execute_auto_approved_task(task).await {
+                if let Err(e) = self.execute_approved_task(task).await {
                     tracing::error!("Auto-execution failed: {}", e);
                 }
             }
@@ -203,26 +203,7 @@ impl Worker {
             }
         }
 
-        // 4. executing + subtask ループ再開（awaiting_input → executing に遷移済み）
-        match self.db.get_resumable_task() {
-            Ok(Some(task)) => {
-                tracing::info!(
-                    "Resuming subtask loop for task: {} (subtask {})",
-                    task.asana_task_name,
-                    task.current_subtask_index.unwrap_or(0)
-                );
-                if let Err(e) = self.resume_subtask_execution(task).await {
-                    tracing::error!("Subtask resume failed: {}", e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("Failed to fetch resumable task: {}", e);
-                had_error = true;
-            }
-        }
-
-        // 5. ci_pending タスク → CI 結果確認 → done or リトライ
+        // 4. ci_pending タスク → CI 結果確認 → done or リトライ
         match self.db.get_ci_pending_task() {
             Ok(Some(task)) => {
                 tracing::debug!("Checking CI for task: {} ({})", task.asana_task_name, task.id);
@@ -276,8 +257,8 @@ impl Worker {
         had_error
     }
 
-    /// new → analyzing → proposed: 要件定義を生成して Block Kit ボタン付きで Slack 投稿
-    async fn analyze_task(&self, task: CodingTask) -> Result<()> {
+    /// new → planning → proposed/auto_approved: 実装計画を生成して Slack 投稿
+    async fn plan_task(&self, task: CodingTask) -> Result<()> {
         let channel = task
             .slack_channel
             .as_deref()
@@ -286,7 +267,7 @@ impl Worker {
         // Step 1: Slack 親メッセージ送信（再生成時は既存スレッドを再利用）
         let thread_ts = if let Some(ref existing_ts) = task.slack_thread_ts {
             self.slack
-                .reply_thread(channel, existing_ts, ":arrows_counterclockwise: 要件定義を再生成中...")
+                .reply_thread(channel, existing_ts, ":arrows_counterclockwise: 計画を再生成中...")
                 .await
                 .ok();
             existing_ts.clone()
@@ -309,8 +290,8 @@ impl Worker {
             }
         };
 
-        // Step 2: status → analyzing
-        self.db.update_status(task.id, "analyzing")?;
+        // Step 2: status → planning
+        self.db.update_status(task.id, "planning")?;
 
         // Step 3: リポジトリパスを解決
         let repo_path = match self.resolve_repo_path(&task) {
@@ -325,10 +306,10 @@ impl Worker {
             }
         };
 
-        // Step 4: claude -p で要件定義生成
+        // Step 4: claude -p で実装計画生成（Plan mode）
         let notes = task.description.as_deref().unwrap_or("");
         self.slack
-            .reply_thread(channel, &thread_ts, ":brain: 要件定義を作成中...")
+            .reply_thread(channel, &thread_ts, ":brain: 実装計画を作成中...")
             .await
             .ok();
 
@@ -344,7 +325,7 @@ impl Worker {
         };
 
         let log_dir = self.log_dir();
-        match analyzer::analyze_task(
+        match analyzer::plan_task(
             &task.asana_task_name,
             notes,
             &wc,
@@ -353,11 +334,17 @@ impl Worker {
         )
         .await
         {
-            Ok((analysis, complexity)) => {
-                self.db.update_analysis(task.id, &analysis)?;
-                if let Some(ref c) = complexity {
+            Ok(plan_result) => {
+                self.db.update_analysis(task.id, &plan_result.plan_text)?;
+                if let Some(ref c) = plan_result.complexity {
                     self.db.update_complexity(task.id, c)?;
                     tracing::info!("Task {} complexity: {}", task.id, c);
+                }
+
+                // session_id を保存（--resume で Act mode に使う）
+                if let Some(ref sid) = plan_result.session_id {
+                    self.db.update_session_id(task.id, sid)?;
+                    tracing::info!("Task {} session_id saved: {}", task.id, sid);
                 }
 
                 // auto_execute 判定
@@ -369,48 +356,48 @@ impl Worker {
                     .unwrap_or(false);
 
                 if is_auto_execute {
-                    // ボタンなしで情報投稿 → auto_approved へ
-                    let analysis_display = truncate_for_slack(&analysis, 2800);
-                    let blocks = build_info_blocks(task.id, analysis_display);
+                    // ボタンなしで情報投稿 → auto_approved へ（即実行）
+                    let plan_display = truncate_for_slack(&plan_result.plan_text, 2800);
+                    let blocks = build_info_blocks(plan_display);
                     let plan_ts = self
                         .slack
-                        .post_blocks(channel, &thread_ts, &blocks, "要件定義が完成しました（自動実行されます）")
+                        .post_blocks(channel, &thread_ts, &blocks, "実装計画が完成しました（自動実行されます）")
                         .await?;
                     self.db.update_plan_ts(task.id, &plan_ts)?;
                     self.db.update_status(task.id, "auto_approved")?;
 
                     tracing::info!(
-                        "Analysis posted for task {} (auto_execute, plan_ts: {})",
+                        "Plan posted for task {} (auto_execute, plan_ts: {})",
                         task.asana_task_gid,
                         plan_ts
                     );
                 } else {
-                    // 既存フロー: ボタン付き投稿 → proposed
+                    // 承認待ち: ボタン付き投稿 → proposed
                     self.db.update_status(task.id, "proposed")?;
 
-                    let analysis_display = truncate_for_slack(&analysis, 2800);
-                    let blocks = build_proposal_blocks(task.id, analysis_display);
+                    let plan_display = truncate_for_slack(&plan_result.plan_text, 2800);
+                    let blocks = build_proposal_blocks(plan_display);
                     let plan_ts = self
                         .slack
-                        .post_blocks(channel, &thread_ts, &blocks, "要件定義が完成しました（ボタンで操作してください）")
+                        .post_blocks(channel, &thread_ts, &blocks, "実装計画が完成しました（操作してください）")
                         .await?;
                     self.db.update_plan_ts(task.id, &plan_ts)?;
 
                     tracing::info!(
-                        "Analysis posted for task {} (plan_ts: {})",
+                        "Plan posted for task {} (plan_ts: {})",
                         task.asana_task_gid,
                         plan_ts
                     );
                 }
             }
             Err(e) => {
-                let err_msg = format!("Analysis failed: {}", e);
+                let err_msg = format!("Planning failed: {}", e);
                 self.db.set_error(task.id, &err_msg)?;
                 self.slack
                     .reply_thread(
                         channel,
                         &thread_ts,
-                        &format!(":x: 要件定義の作成に失敗しました\n```\n{}\n```", e),
+                        &format!(":x: 実装計画の作成に失敗しました\n```\n{}\n```", e),
                     )
                     .await
                     .ok();
@@ -421,255 +408,77 @@ impl Worker {
         Ok(())
     }
 
-    /// approved → decomposing → ready: タスク分解してファイル書き出し
-    async fn decompose_task(&self, task: CodingTask) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
-
-        // simple タスクは分解をスキップして直接 ready に
-        if task.complexity.as_deref() == Some("simple") {
-            tracing::info!("Task {} is simple, skipping decomposition", task.id);
-            self.db.update_status(task.id, "decomposing")?;
-
-            let auto_subtask = vec![decomposer::Subtask {
-                index: 1,
-                title: task.asana_task_name.clone(),
-                detail: task.analysis_text.clone().unwrap_or_default(),
-                depends_on: vec![],
-                estimated_minutes: task.estimated_minutes.and_then(|m| u32::try_from(m).ok()),
-                status: "pending".to_string(),
-                started_at: None,
-                completed_at: None,
-                actual_minutes: None,
-            }];
-            let json = serde_json::to_string(&auto_subtask)?;
-            self.db.update_subtasks(task.id, &json)?;
-            self.db.update_status(task.id, "ready")?;
-
-            self.slack
-                .reply_thread(
-                    channel,
-                    thread_ts,
-                    ":zap: simpleタスクのため分解をスキップしました",
-                )
-                .await
-                .ok();
-
-            return Ok(());
-        }
-
-        // Step 1: status → decomposing
-        self.db.update_status(task.id, "decomposing")?;
-        self.slack
-            .reply_thread(channel, thread_ts, ":gear: タスクを分解中...")
-            .await
-            .ok();
-
-        // Step 2: リポジトリパスを解決
-        let repo_path = match self.resolve_repo_path(&task) {
-            Ok(p) => p,
-            Err(e) => {
-                self.db.set_error(task.id, &e.to_string())?;
-                return Err(e);
-            }
-        };
-
-        let analysis = task.analysis_text.as_deref().unwrap_or("");
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let (work_context, work_memory) = prepare_repo_context(base_dir, &repo_path);
-
-        // complex タスクは max_turns を増やす
-        let plan_turns = match task.complexity.as_deref() {
-            Some("complex") => self.repos_config.defaults.claude_max_plan_turns.saturating_mul(2),
-            _ => self.repos_config.defaults.claude_max_plan_turns,
-        };
-
-        let wc = context::WorkContext {
-            repo_path: repo_path.clone(),
-            max_turns: plan_turns,
-            soul: context::merged_soul(base_dir, Some(&repo_path)),
-            skill: context::read_skill(base_dir),
-            context: work_context,
-            memory: work_memory,
-        };
-
-        // Step 3: claude -p でサブタスク生成
-        let log_dir = self.log_dir();
-        match decomposer::decompose_task(
-            &task.asana_task_name,
-            analysis,
-            &wc,
-            Some(&log_dir),
-            &self.runner_ctx,
-        )
-        .await
-        {
-            Ok(mut subtasks) => {
-                // ブロック検知
-                decomposer::detect_blocked_subtasks(&mut subtasks);
-
-                // DB に subtasks_json 保存
-                let json = serde_json::to_string(&subtasks)?;
-                self.db.update_subtasks(task.id, &json)?;
-
-                // 進捗率・見積もり時間を DB に保存
-                let progress = decomposer::calculate_progress(&subtasks);
-                self.db.update_progress(task.id, progress)?;
-                let estimated_total: i32 = subtasks
-                    .iter()
-                    .filter_map(|s| s.estimated_minutes)
-                    .sum::<u32>() as i32;
-                if estimated_total > 0 {
-                    let conn_task = self.db.get_task_by_id(task.id)?;
-                    if let Some(t) = conn_task {
-                        // estimated_minutes は DB 上で直接更新
-                        let now = chrono::Utc::now();
-                        let score = priority::calculate_priority_score(&t, &now);
-                        self.db.update_priority_score(task.id, score)?;
-                    }
-                }
-
-                // タスクファイル書き出し（優先度・進捗の更新を反映するため再取得）
-                let updated_task = self.db.get_task_by_id(task.id)?.unwrap_or(task.clone());
-                task_file::write_task_file(base_dir, &updated_task, &subtasks)?;
-
-                // status → ready
-                self.db.update_status(task.id, "ready")?;
-
-                // Slack にサブタスク一覧を投稿
-                let subtask_lines: Vec<String> = subtasks
-                    .iter()
-                    .map(|s| format!("{}. {}", s.index, s.title))
-                    .collect();
-                let msg = format!(
-                    ":white_check_mark: タスクを分解しました（{}件）\n\n{}\n\n`/task {}` で詳細を確認できます",
-                    subtasks.len(),
-                    subtask_lines.join("\n"),
-                    task.id
-                );
-                self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
-
-                // per-repo context にも記録
-                let entry = format!(
-                    "[DECOMPOSED] #{} {} ({}件のサブタスク)",
-                    task.id, task.asana_task_name, subtasks.len()
-                );
-                if let Err(e) = context::append_repo_context(&repo_path, &entry) {
-                    tracing::warn!("Failed to append to repo context: {}", e);
-                }
-
-                tracing::info!(
-                    "Task {} decomposed into {} subtasks",
-                    task.asana_task_gid,
-                    subtasks.len()
-                );
-            }
-            Err(e) => {
-                let err_msg = format!("Decomposition failed: {}", e);
-                self.db.set_error(task.id, &err_msg)?;
-                self.slack
-                    .reply_thread(
-                        channel,
-                        thread_ts,
-                        &format!(":x: タスク分解に失敗しました\n```\n{}\n```", e),
-                    )
-                    .await
-                    .ok();
-                tracing::error!("{}", err_msg);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// auto_approved → executing → done: 要件定義をプランとして自動実行
-    async fn execute_auto_approved_task(&self, task: CodingTask) -> Result<()> {
+    /// approved/auto_approved → executing → ci_pending/done: Plan mode の続きを Act mode で実行
+    ///
+    /// session_id があれば --resume で Plan セッションを継続、なければフルプロンプトで実行。
+    /// repo_entry があれば worktree 隔離実行、なければ直接実行。
+    async fn execute_approved_task(&self, task: CodingTask) -> Result<()> {
         let repo_entry = task
             .repo_key
             .as_deref()
             .and_then(|key| self.repos_config.find_repo_by_key(key));
 
-        // auto_execute リポジトリなら worktree 実行パスへ分岐
-        if repo_entry.map(|r| r.auto_execute).unwrap_or(false) {
-            return self.execute_in_worktree(task, repo_entry.unwrap()).await;
+        // worktree 隔離実行（PR作成つき）
+        if let Some(entry) = repo_entry {
+            return self.execute_in_worktree(task, entry).await;
         }
 
+        // フォールバック: worktree なし直接実行
         let channel = task
             .slack_channel
             .as_deref()
             .unwrap_or(&self.default_slack_channel);
         let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
 
-        // Step 1: executing に更新 + ストップボタン付き通知
         self.db.update_status(task.id, "executing")?;
-        let exec_blocks = build_executing_blocks(task.id, ":rocket: 自動実行中...");
+        let exec_blocks = build_executing_blocks(task.id, ":rocket: 実行中...");
         self.slack
-            .post_blocks(channel, thread_ts, &exec_blocks, "自動実行中...")
+            .post_blocks(channel, thread_ts, &exec_blocks, "実行中...")
             .await
             .ok();
 
-        // Step 2: リポジトリパスを解決
-        let repo_path = repo_entry.map(|r| self.repos_config.repo_local_path(r));
-
-        // analysis_text をプランとして使う
         let plan_text = task.analysis_text.as_deref().unwrap_or("");
         let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let (work_context, work_memory) = if let Some(ref rp) = repo_path {
-            prepare_repo_context(base_dir, rp)
-        } else {
-            (
-                context::merged_context(base_dir, None),
-                context::merged_memory(base_dir, None),
-            )
-        };
-        // WORKFLOW.md から設定を読み込み
-        let wf = repo_path.as_deref().and_then(workflow::load);
+        let (work_context, work_memory) = (
+            context::merged_context(base_dir, None),
+            context::merged_memory(base_dir, None),
+        );
 
-        // complex タスクは max_turns を増やす
-        let base_turns = wf.as_ref()
-            .and_then(|w| w.config.max_execute_turns)
-            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
-        let execute_turns = match task.complexity.as_deref() {
+        let base_turns = self.repos_config.defaults.claude_max_execute_turns;
+        let max_turns = match task.complexity.as_deref() {
             Some("complex") => base_turns.saturating_mul(2),
             _ => base_turns,
         };
-
         let wc = context::WorkContext {
-            repo_path: repo_path.clone().unwrap_or_else(|| std::path::PathBuf::from(base_dir)),
-            max_turns: execute_turns,
-            soul: context::merged_soul(base_dir, repo_path.as_deref()),
+            repo_path: std::path::PathBuf::from(base_dir),
+            max_turns,
+            soul: context::merged_soul(base_dir, None),
             skill: context::read_skill(base_dir),
             context: work_context,
             memory: work_memory,
         };
 
-        // Step 3: executor 呼び出し
         let log_dir = self.log_dir();
-        let result = executor::execute_task(
+        let session_id = task.claude_session_id.as_deref();
+        let result = executor::execute_task_with_session(
             &task.asana_task_name,
             plan_text,
-            repo_entry,
-            repo_path.as_deref(),
+            None,
+            None,
             &wc,
             Some(&log_dir),
             &self.runner_ctx,
+            session_id,
         )
         .await?;
 
-        // Step 4: 結果を Slack に投稿
         if result.success {
             self.db.update_status(task.id, "done")?;
-
-            // context.md に完了記録（global + per-repo）
-            let base_dir = &self.repos_config.defaults.repos_base_dir;
-            context::append_completed_task(base_dir, &task, repo_path.as_deref());
+            context::append_completed_task(base_dir, &task, None);
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
-                ":white_check_mark: 自動実行完了\n```\n{}\n```",
+                ":white_check_mark: 実行完了\n```\n{}\n```",
                 output_summary
             );
             self.slack
@@ -682,7 +491,7 @@ impl Worker {
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
-                ":x: 自動実行失敗\n```\n{}\n```",
+                ":x: 実行失敗\n```\n{}\n```",
                 output_summary
             );
             self.slack
@@ -694,7 +503,7 @@ impl Worker {
         Ok(())
     }
 
-    /// worktree 隔離実行: worktree 作成 → サブタスクループ or ワンショット → PR 作成
+    /// worktree 隔離実行: worktree 作成 → Act mode 実行 → PR 作成
     async fn execute_in_worktree(
         &self,
         task: CodingTask,
@@ -739,58 +548,32 @@ impl Worker {
 
         // Step 3: status → executing（ストップボタン付き通知）
         self.db.update_status(task.id, "executing")?;
-        let exec_msg = format!(":rocket: worktree で自動実行中... (branch: `{}`)", ws.branch_name);
+        let exec_msg = format!(":rocket: worktree で実行中... (branch: `{}`)", ws.branch_name);
         let exec_blocks = build_executing_blocks(task.id, &exec_msg);
         self.slack
             .post_blocks(channel, thread_ts, &exec_blocks, &exec_msg)
             .await
             .ok();
 
-        // サブタスクの有無で分岐
-        let subtasks = parse_subtasks(&task);
-
-        if subtasks.len() > 1 {
-            // サブタスクループ: 最初のサブタスクを実行
-            self.db.update_current_subtask_index(task.id, 1)?;
-            self.execute_single_subtask(&task, repo_entry, &ws, &subtasks, 1, None)
-                .await
-        } else {
-            // ワンショット実行（サブタスクなし or 1つだけ）
-            self.execute_worktree_oneshot(&task, repo_entry, &ws).await
-        }
+        // Step 4: Act mode 実行（--resume で Plan セッションを継続）
+        self.execute_worktree_act(&task, repo_entry, &ws).await
     }
 
-    /// worktree ワンショット実行（サブタスクループなし）
-    async fn execute_worktree_oneshot(
+    /// worktree Act mode 実行: --resume で Plan セッションを継続
+    async fn execute_worktree_act(
         &self,
         task: &CodingTask,
         repo_entry: &crate::repo_config::RepoEntry,
         ws: &workspace::Workspace,
     ) -> Result<()> {
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
         let plan_text = task.analysis_text.as_deref().unwrap_or("");
-        let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
-
-        let wf = workflow::load(&ws.worktree_path);
-        let base_turns = wf.as_ref()
-            .and_then(|w| w.config.max_execute_turns)
-            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
-        let execute_turns = match task.complexity.as_deref() {
-            Some("complex") => base_turns.saturating_mul(2),
-            _ => base_turns,
-        };
-
-        let wc = context::WorkContext {
-            repo_path: ws.worktree_path.clone(),
-            max_turns: execute_turns,
-            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
-            skill: context::read_skill(base_dir),
-            context: work_context,
-            memory: work_memory,
-        };
+        let max_turns = self.resolve_execute_turns(&ws.worktree_path, task.complexity.as_deref());
+        let has_session = task.claude_session_id.is_some();
+        let wc = self.build_worktree_context(ws, max_turns, has_session);
 
         let log_dir = self.log_dir();
-        let result = executor::execute_task(
+        let session_id = task.claude_session_id.as_deref();
+        let result = executor::execute_task_with_session(
             &task.asana_task_name,
             plan_text,
             Some(repo_entry),
@@ -798,187 +581,18 @@ impl Worker {
             &wc,
             Some(&log_dir),
             &self.runner_ctx,
+            session_id,
         )
         .await;
 
         self.handle_worktree_result(task, repo_entry, ws, result)
-            .await?;
-        workspace::remove(ws).await.ok();
-        Ok(())
-    }
-
-    /// サブタスクループ: 1つのサブタスクを実行し、次があれば awaiting_input に遷移
-    async fn execute_single_subtask(
-        &self,
-        task: &CodingTask,
-        repo_entry: &crate::repo_config::RepoEntry,
-        ws: &workspace::Workspace,
-        subtasks: &[decomposer::Subtask],
-        current_index: u32,
-        resume_session_id: Option<&str>,
-    ) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-
-        let subtask = match subtasks.iter().find(|s| s.index == current_index) {
-            Some(s) => s,
-            None => {
-                // 指定インデックスのサブタスクが見つからない → 全完了扱い
-                return self.finalize_worktree(task, repo_entry, ws).await;
-            }
-        };
-
-        self.slack
-            .reply_thread(
-                channel,
-                thread_ts,
-                &format!(
-                    ":hammer: サブタスク {}/{} 実行中: *{}*",
-                    current_index, subtasks.len(), subtask.title
-                ),
-            )
             .await
-            .ok();
-
-        // サブタスク用プロンプト
-        let prompt = format!(
-            "## サブタスク {}/{}: {}\n{}\n\n## 全体の要件定義\n{}",
-            current_index,
-            subtasks.len(),
-            subtask.title,
-            subtask.detail,
-            task.analysis_text.as_deref().unwrap_or("")
-        );
-
-        let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
-        let wf = workflow::load(&ws.worktree_path);
-        let base_turns = wf.as_ref()
-            .and_then(|w| w.config.max_execute_turns)
-            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
-
-        let wc = context::WorkContext {
-            repo_path: ws.worktree_path.clone(),
-            max_turns: base_turns,
-            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
-            skill: context::read_skill(base_dir),
-            context: work_context,
-            memory: work_memory,
-        };
-
-        let log_dir = self.log_dir();
-        let result = executor::execute_task_with_session(
-            &format!("[{}/{}] {}", current_index, subtasks.len(), subtask.title),
-            &prompt,
-            Some(repo_entry),
-            Some(ws.worktree_path.as_path()),
-            &wc,
-            Some(&log_dir),
-            &self.runner_ctx,
-            resume_session_id,
-        )
-        .await;
-
-        match result {
-            Ok(exec_result) if exec_result.success => {
-                // セッション ID を保存
-                if let Some(ref sid) = exec_result.session_id {
-                    self.db.update_session_id(task.id, sid)?;
-                }
-
-                let next_index = current_index + 1;
-                let remaining: Vec<_> = subtasks
-                    .iter()
-                    .filter(|s| s.index >= next_index)
-                    .collect();
-
-                if remaining.is_empty() {
-                    // 全サブタスク完了 → PR 作成
-                    self.finalize_worktree(task, repo_entry, ws).await?;
-                } else {
-                    // 次のサブタスクがある → awaiting_input に遷移
-                    self.db.update_current_subtask_index(task.id, next_index as i32)?;
-                    self.db.update_status(task.id, "awaiting_input")?;
-
-                    let output_summary = truncate_for_slack(&exec_result.output, 1500);
-                    let msg = format!(
-                        ":white_check_mark: サブタスク {}/{} 完了: *{}*\n```\n{}\n```\n\n\
-                         次は *{}* です。\n\
-                         `go` で続行 / 指示を返信 / `stop` で中断",
-                        current_index,
-                        subtasks.len(),
-                        subtask.title,
-                        output_summary,
-                        remaining[0].title
-                    );
-                    self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
-                }
-            }
-            Ok(exec_result) => {
-                self.db
-                    .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
-                let output_summary = truncate_for_slack(&exec_result.output, 3700);
-                let msg = format!(
-                    ":x: サブタスク {}/{} 失敗\n```\n{}\n```",
-                    current_index,
-                    subtasks.len(),
-                    output_summary
-                );
-                self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
-                workspace::remove(ws).await.ok();
-            }
-            Err(e) => {
-                self.db
-                    .set_error(task.id, &format!("Execution error: {}", e))?;
-                let msg = format!(":x: 実行エラー\n```\n{}\n```", e);
-                self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
-                workspace::remove(ws).await.ok();
-            }
-        }
-
-        Ok(())
-    }
-
-    /// awaiting_input → executing: サブタスクループを再開
-    async fn resume_subtask_execution(&self, task: CodingTask) -> Result<()> {
-        let repo_entry = match task
-            .repo_key
-            .as_deref()
-            .and_then(|key| self.repos_config.find_repo_by_key(key))
-        {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let current_index = task.current_subtask_index.unwrap_or(1) as u32;
-        let subtasks = parse_subtasks(&task);
-        let session_id = task.claude_session_id.clone();
-
-        // 既存の worktree を再利用（create_for_retry と同じパターン）
-        let ws = workspace::create_for_retry(
-            base_dir,
-            &repo_entry.key,
-            task.id,
-            task.branch_name.as_deref().unwrap_or(""),
-        )
-        .await?;
-
-        self.execute_single_subtask(
-            &task,
-            repo_entry,
-            &ws,
-            &subtasks,
-            current_index,
-            session_id.as_deref(),
-        )
-        .await
     }
 
     /// worktree 実行結果の共通処理: PR 作成 or エラー
+    ///
+    /// 成功時: `finalize_worktree`（PR作成 + remove）に委譲
+    /// 失敗時: ここで remove する
     async fn handle_worktree_result(
         &self,
         task: &CodingTask,
@@ -994,17 +608,19 @@ impl Worker {
 
         match result {
             Ok(exec_result) if exec_result.success => {
+                // finalize_worktree が remove まで担当
                 self.finalize_worktree(task, repo_entry, ws).await?;
             }
             Ok(exec_result) => {
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
-                let msg = format!(":x: 自動実行失敗\n```\n{}\n```", output_summary);
+                let msg = format!(":x: 実行失敗\n```\n{}\n```", output_summary);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
                     .await
                     .ok();
+                workspace::remove(ws).await.ok();
             }
             Err(e) => {
                 self.db
@@ -1014,9 +630,53 @@ impl Worker {
                     .reply_thread(channel, thread_ts, &msg)
                     .await
                     .ok();
+                workspace::remove(ws).await.ok();
             }
         }
         Ok(())
+    }
+
+    /// WORKFLOW.md → defaults → complex*2 の順で max_turns を解決
+    fn resolve_execute_turns(&self, worktree_path: &Path, complexity: Option<&str>) -> u32 {
+        let wf = workflow::load(worktree_path);
+        let base = wf
+            .as_ref()
+            .and_then(|w| w.config.max_execute_turns)
+            .unwrap_or(self.repos_config.defaults.claude_max_execute_turns);
+        match complexity {
+            Some("complex") => base.saturating_mul(2),
+            _ => base,
+        }
+    }
+
+    /// worktree 用 WorkContext を構築
+    ///
+    /// - `has_session=true` の場合: ディレクトリ設定のみ行い context/memory の読み込みをスキップ
+    ///   （--resume 時は Plan セッションにコンテキストが既にある）
+    fn build_worktree_context(
+        &self,
+        ws: &workspace::Workspace,
+        max_turns: u32,
+        has_session: bool,
+    ) -> context::WorkContext {
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+        setup_repo_dirs(&ws.worktree_path);
+        let (work_context, work_memory) = if has_session {
+            (String::new(), String::new())
+        } else {
+            (
+                context::merged_context(base_dir, Some(&ws.worktree_path)),
+                context::merged_memory(base_dir, Some(&ws.worktree_path)),
+            )
+        };
+        context::WorkContext {
+            repo_path: ws.worktree_path.clone(),
+            max_turns,
+            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
+            skill: context::read_skill(base_dir),
+            context: work_context,
+            memory: work_memory,
+        }
     }
 
     /// worktree → PR 作成 → ci_pending or done
@@ -1243,15 +903,8 @@ impl Worker {
         );
 
         // executor 実行（CI エラーをプロンプトに含める）
-        let (work_context, work_memory) = prepare_repo_context(base_dir, &ws.worktree_path);
-        let wc = context::WorkContext {
-            repo_path: ws.worktree_path.clone(),
-            max_turns: self.repos_config.defaults.claude_max_execute_turns,
-            soul: context::merged_soul(base_dir, Some(&ws.worktree_path)),
-            skill: context::read_skill(base_dir),
-            context: work_context,
-            memory: work_memory,
-        };
+        let max_turns = self.resolve_execute_turns(&ws.worktree_path, task.complexity.as_deref());
+        let wc = self.build_worktree_context(&ws, max_turns, false);
 
         let log_dir = self.log_dir();
         let result = executor::execute_task(
@@ -1335,14 +988,14 @@ impl Worker {
     }
 }
 
-/// Block Kit の要件定義表示ブロック（承認はスレッド返信で行う）
-fn build_proposal_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Value {
+/// Block Kit の計画表示ブロック（承認はスレッド返信で行う）
+fn build_proposal_blocks(plan_text: &str) -> serde_json::Value {
     serde_json::json!([
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!(":clipboard: *要件定義*\n\n{}", analysis_text)
+                "text": format!(":clipboard: *実装計画*\n\n{}", plan_text)
             }
         },
         {
@@ -1358,13 +1011,13 @@ fn build_proposal_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Valu
 }
 
 /// Block Kit の情報表示ブロック（ボタンなし、auto_execute 用）
-fn build_info_blocks(_task_id: i64, analysis_text: &str) -> serde_json::Value {
+fn build_info_blocks(plan_text: &str) -> serde_json::Value {
     serde_json::json!([
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!(":clipboard: *要件定義*\n\n{}", analysis_text)
+                "text": format!(":clipboard: *実装計画*\n\n{}", plan_text)
             }
         },
         {
@@ -1408,17 +1061,18 @@ fn build_executing_blocks(task_id: i64, message: &str) -> serde_json::Value {
     ])
 }
 
-/// リポジトリの初期セットアップ + merged context/memory を返す
-fn prepare_repo_context(base_dir: &str, repo_path: &Path) -> (String, String) {
-    // .agent/ ディレクトリ作成（create_dir_all は冪等）
+/// リポジトリの初期セットアップ（ディレクトリ作成 + デフォルトルール生成）
+fn setup_repo_dirs(repo_path: &Path) {
     let agent_dir = repo_path.join(".agent");
     if let Err(e) = std::fs::create_dir_all(&agent_dir) {
         tracing::warn!("Failed to create repo .agent dir: {}", e);
     }
-
-    // .claude/rules/agent.md が無ければデフォルトルールを生成
     ensure_repo_agent_rules(repo_path);
+}
 
+/// リポジトリの初期セットアップ + merged context/memory を返す
+fn prepare_repo_context(base_dir: &str, repo_path: &Path) -> (String, String) {
+    setup_repo_dirs(repo_path);
     (
         context::merged_context(base_dir, Some(repo_path)),
         context::merged_memory(base_dir, Some(repo_path)),
@@ -1471,10 +1125,3 @@ pub(crate) fn truncate_for_slack(text: &str, max_len: usize) -> &str {
     crate::claude::truncate_str(text, max_len)
 }
 
-/// subtasks_json をパースして Subtask 配列を返す
-fn parse_subtasks(task: &CodingTask) -> Vec<decomposer::Subtask> {
-    task.subtasks_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default()
-}

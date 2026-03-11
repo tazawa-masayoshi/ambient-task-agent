@@ -3,50 +3,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-// ============================================================================
-// OpsToolDef — repos.toml で宣言する domain-specific tool
-// ============================================================================
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpsToolDef {
-    /// Bedrock tool_use で使われる名前 (snake_case)
-    pub name: String,
-    /// LLM に表示する説明
-    pub description: String,
-    /// 実行するコマンド (repo_path からの相対パス)
-    pub command: String,
-    /// コマンドのタイムアウト (秒)
-    #[serde(default = "default_tool_timeout")]
-    pub timeout_secs: u64,
-    /// パラメータ定義 (name -> ParamDef)
-    #[serde(default)]
-    pub params: HashMap<String, ParamDef>,
-}
-
-fn default_tool_timeout() -> u64 {
-    30
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParamDef {
-    /// JSON Schema の型 ("string", "integer", "boolean")
-    #[serde(rename = "type", default = "default_param_type")]
-    pub param_type: String,
-    /// LLM に表示する説明
-    pub description: String,
-    /// 必須パラメータか
-    #[serde(default = "default_true")]
-    pub required: bool,
-}
-
-fn default_param_type() -> String {
-    "string".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecMode {
@@ -95,10 +51,6 @@ pub struct Defaults {
     pub module_policy: HashMap<String, ModulePolicy>,
     /// ops 完了時に詳細結果を通知する管理者の Slack ユーザーID
     pub ops_admin_user: Option<String>,
-    /// Bedrock モデル ID (設定時に ops を Bedrock バックエンドで実行)
-    pub bedrock_model_id: Option<String>,
-    /// Bedrock リージョン (省略時は AWS_DEFAULT_REGION)
-    pub bedrock_region: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -116,7 +68,7 @@ fn default_max_execute_turns() -> u32 {
 }
 
 fn default_heartbeat_secs() -> u64 {
-    60
+    15
 }
 
 fn default_stagnation_hours() -> i64 {
@@ -159,12 +111,8 @@ pub struct RepoEntry {
     pub allowed_tools: Option<Vec<String>>,
     pub max_execute_turns: Option<u32>,
     pub ops_channel: Option<String>,
-    /// 旧方式: skill ベース (フォールバック)
     #[serde(default)]
     pub ops_skills: Option<Vec<String>>,
-    /// 新方式: tool ベース (優先)
-    #[serde(default)]
-    pub ops_tools: Option<Vec<OpsToolDef>>,
     /// Slack 添付ファイルの保存先ディレクトリ（repo_path からの相対パス）
     /// 未設定の場合はファイルをダウンロードしない
     pub ops_download_dir: Option<String>,

@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::worker::decomposer::{self, Subtask};
+use crate::db::{get_actionable_subtasks, Subtask};
 use crate::worker::task_file;
 
 use super::http::AppState;
@@ -69,7 +69,7 @@ pub async fn next_task(
     for task in &tasks {
         if let Some(ref json) = task.subtasks_json {
             if let Ok(subtasks) = serde_json::from_str::<Vec<Subtask>>(json) {
-                let actionable = decomposer::get_actionable_subtasks(&subtasks);
+                let actionable = get_actionable_subtasks(&subtasks);
                 if let Some(next) = actionable.first() {
                     let reason = if next.depends_on.is_empty() {
                         "依存なし — 即着手可能".to_string()

@@ -15,24 +15,6 @@ const MAX_LOG_FILES: usize = 100;
 // AgentBackend trait — LLM 実行バックエンドの抽象
 // ============================================================================
 
-/// 追加ツールのメタデータ (Bedrock tool 定義用)
-pub struct ToolMeta {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-}
-
-/// Bedrock の tool ループで built-in 以外のツールをディスパッチする trait
-#[async_trait]
-pub trait ExtraToolDispatcher: Send + Sync {
-    async fn dispatch(
-        &self,
-        tool_name: &str,
-        input: &serde_json::Value,
-        cwd: &std::path::Path,
-    ) -> Option<(String, bool)>; // (output, success)
-}
-
 /// LLM バックエンドに渡すリクエスト
 pub struct AgentRequest {
     pub prompt: String,
@@ -45,10 +27,6 @@ pub struct AgentRequest {
     pub max_output_bytes: Option<usize>,
     /// セッション継続用: 前回の session_id を指定すると --resume で再開
     pub resume_session_id: Option<String>,
-    /// Bedrock 用: 追加ツール定義 (domain-specific tools)
-    pub extra_tool_defs: Vec<ToolMeta>,
-    /// Bedrock 用: 追加ツールのハンドラ。ClaudeCliBackend では無視される
-    pub tool_dispatcher: Option<Arc<dyn ExtraToolDispatcher>>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -394,8 +372,6 @@ pub struct ClaudeRunner {
     non_blocking: bool,
     hooks: Option<Arc<crate::execution::HookRegistry>>,
     backend: Option<Arc<dyn AgentBackend>>,
-    extra_tool_defs: Vec<ToolMeta>,
-    tool_dispatcher: Option<Arc<dyn ExtraToolDispatcher>>,
     /// セッション継続用: 前回の session_id
     resume_session_id: Option<String>,
 }
@@ -418,8 +394,6 @@ impl ClaudeRunner {
             non_blocking: false,
             hooks: None,
             backend: None,
-            extra_tool_defs: Vec::new(),
-            tool_dispatcher: None,
             resume_session_id: None,
         }
     }
@@ -500,17 +474,6 @@ impl ClaudeRunner {
         self
     }
 
-    /// domain-specific tool を追加 (Bedrock 用)
-    pub fn extra_tools(
-        mut self,
-        defs: Vec<ToolMeta>,
-        dispatcher: Arc<dyn ExtraToolDispatcher>,
-    ) -> Self {
-        self.extra_tool_defs = defs;
-        self.tool_dispatcher = Some(dispatcher);
-        self
-    }
-
     /// RunnerContext から防御設定+フック+バックエンドを一括注入
     pub fn with_context(mut self, ctx: &RunnerContext) -> Self {
         let (exec_mode, timeout) = ctx.defaults.resolve_for_module(&self.module);
@@ -530,19 +493,11 @@ impl ClaudeRunner {
             self.semaphore = Some(ctx.semaphore.clone());
         }
         self.hooks = Some(ctx.hooks.clone());
-        // モジュール別バックエンド選択: ops → ops_backend (Bedrock)
-        self.backend = Some(match self.module.as_str() {
-            "ops" => ctx
-                .ops_backend
-                .as_ref()
-                .unwrap_or(&ctx.backend)
-                .clone(),
-            _ => ctx.backend.clone(),
-        });
+        self.backend = Some(ctx.backend.clone());
         self
     }
 
-    pub async fn run(mut self) -> Result<AgentOutput> {
+    pub async fn run(self) -> Result<AgentOutput> {
         // 0. Hook: before_run
         if let Some(ref hooks) = self.hooks {
             let prompt_summary = truncate_str(&self.prompt, 200);
@@ -619,8 +574,6 @@ impl ClaudeRunner {
             timeout_secs: self.timeout_secs,
             max_output_bytes: self.max_output_bytes,
             resume_session_id: self.resume_session_id.clone(),
-            extra_tool_defs: self.extra_tool_defs.drain(..).collect(),
-            tool_dispatcher: self.tool_dispatcher.take(),
         };
 
         let backend = self.backend.as_ref()
