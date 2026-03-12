@@ -940,7 +940,18 @@ impl Db {
         Ok(rows)
     }
 
+    /// ops スレッドの会話履歴を削除（Inception リビジョン時にターン1からやり直す）
+    pub fn clear_ops_context(&self, channel: &str, thread_ts: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ops_contexts WHERE channel = ?1 AND thread_ts = ?2",
+            params![channel, thread_ts],
+        )?;
+        Ok(())
+    }
+
     /// ops スレッドの repo_key を取得
+    #[allow(dead_code)]
     pub fn get_ops_repo_key(&self, channel: &str, thread_ts: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
@@ -960,6 +971,7 @@ impl Db {
     // ========================================================================
 
     /// ops キューにアイテムを追加（同一 channel+message_ts の重複は無視）
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_ops(
         &self,
         channel: &str,
@@ -1237,6 +1249,7 @@ pub struct OpsQueueItem {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OpsFollowupItem {
     pub id: i64,
     pub channel: String,

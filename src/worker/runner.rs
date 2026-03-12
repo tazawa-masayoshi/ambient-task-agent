@@ -112,6 +112,7 @@ impl Worker {
             // ops フォローアップチェック（1時間ごと、業務時間 9-18 JST のみ）
             let now = Utc::now();
             let jst_hour = (now.hour() + 9) % 24; // UTC → JST 簡易変換
+            #[allow(clippy::manual_range_contains)]
             let should_check_followup = jst_hour >= 9 && jst_hour < 18
                 && last_followup_check
                     .map(|last| (now - last).num_minutes() >= 60)
@@ -363,13 +364,31 @@ impl Worker {
             files,
         };
 
-        let plan_only = repo_entry.ops_mode == crate::repo_config::OpsMode::Plan;
+        // OpsMode → OpsExecMode に変換（Inception は2ターン固定設計）
+        // ターン判定: assistant の応答履歴の有無で Turn1/Turn2 を決定。
+        // 3ターン以上の返信が来ても常に Turn2 として処理される（設計上の上限）。
+        // 注意: append_ops_context("user") 後に get_ops_context を呼んでいるため
+        // history には既に今回の user メッセージが含まれている。
+        let exec_mode = match repo_entry.ops_mode {
+            crate::repo_config::OpsMode::Plan => super::ops::OpsExecMode::PlanOnly,
+            crate::repo_config::OpsMode::Inception => {
+                if history.iter().any(|m| m.role == "assistant") {
+                    super::ops::OpsExecMode::InceptionTurn2
+                } else {
+                    super::ops::OpsExecMode::InceptionTurn1
+                }
+            }
+            crate::repo_config::OpsMode::Execute => super::ops::OpsExecMode::Execute,
+        };
+        let is_plan_only = exec_mode == super::ops::OpsExecMode::PlanOnly;
+        let is_inception_turn1 = exec_mode == super::ops::OpsExecMode::InceptionTurn1;
+        let is_inception_turn2 = exec_mode == super::ops::OpsExecMode::InceptionTurn2;
 
         let dl_dir_ref = ops_download_dir.as_deref();
         let exec_result = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
-            plan_only,
+            exec_mode,
         ).await;
 
         // admin ユーザーへのメンション（完了通知に含める）
@@ -389,19 +408,83 @@ impl Worker {
                 if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "assistant", &output) {
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
+
+                // Inception ターン1: 質問を投稿してユーザー返信待ち
+                if is_inception_turn1 {
+                    let truncated = crate::claude::truncate_str(&output, 2800);
+                    let msg = format!(":bulb: *要件ヒアリング*{}\n{}", admin_mention, truncated);
+                    slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+                    self.db.mark_ops_done(item.id)?;
+                    tracing::info!("inception turn1 done for ops item {}, waiting for user reply", item.id);
+                    return Ok(());
+                }
+
+                // Inception ターン2: 要件整理 + タスク分解完了 → 承認ゲートボタン
+                if is_inception_turn2 {
+                    let truncated = crate::claude::truncate_str(&output, 2800);
+                    let blocks = serde_json::json!([
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": format!(":memo: *要件定義完了*{}\n```\n{}\n```", admin_mention, truncated)
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{2705} 承認（Asana登録）" },
+                                    "style": "primary",
+                                    "action_id": "ops_inception_approve",
+                                    "value": item.id.to_string()
+                                },
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{1f527} 修正して" },
+                                    "action_id": "ops_inception_revise",
+                                    "value": item.id.to_string()
+                                },
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{274c} キャンセル" },
+                                    "style": "danger",
+                                    "action_id": "ops_inception_cancel",
+                                    "value": item.id.to_string()
+                                }
+                            ]
+                        }
+                    ]);
+                    let fallback = format!(":memo: *要件定義完了*{}\n{}", admin_mention, truncated);
+                    match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
+                        Ok(ts) => {
+                            self.db.set_ops_notify_ts(item.id, &ts).ok();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to post inception blocks: {}", e);
+                            slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
+                        }
+                    }
+                    self.db.mark_ops_done(item.id)?;
+                    tracing::info!("inception turn2 done for ops item {}, awaiting approval", item.id);
+                    return Ok(());
+                }
+
+                // 通常モード（Execute / Plan）
                 let is_no_action = output.contains("対応不要")
                     || output.contains("作業対象外")
                     || output.contains("スコープ外");
                 let emoji = if is_no_action {
                     ":information_source:"
-                } else if plan_only {
+                } else if is_plan_only {
                     ":memo:"
                 } else {
                     ":white_check_mark:"
                 };
                 let label = if is_no_action {
                     "対応不要"
-                } else if plan_only {
+                } else if is_plan_only {
                     "分析完了"
                 } else {
                     "ops 完了"

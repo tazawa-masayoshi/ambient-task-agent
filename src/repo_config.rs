@@ -21,6 +21,8 @@ pub enum OpsMode {
     Execute,
     /// 分析・計画のみ（read-only、実行はしない）
     Plan,
+    /// 要件定義モード: 2ターンで Intent 分析 → 要件整理 + タスク分解 → Asana 登録
+    Inception,
 }
 
 #[derive(Debug, Clone, Deserialize)]

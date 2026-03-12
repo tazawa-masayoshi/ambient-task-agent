@@ -175,6 +175,16 @@ async fn process_action(
     if action_id == "ops_escalate" {
         return process_ops_escalate(state, action_value, channel, message_ts, thread_ts).await;
     }
+    // Inception モード 承認ゲート
+    if action_id == "ops_inception_approve" {
+        return process_ops_inception_approve(state, action_value, channel, message_ts).await;
+    }
+    if action_id == "ops_inception_revise" {
+        return process_ops_inception_revise(state, action_value, channel, message_ts).await;
+    }
+    if action_id == "ops_inception_cancel" {
+        return process_ops_inception_cancel(state, action_value, channel, message_ts).await;
+    }
 
     let task_id: i64 = action_value
         .parse()
@@ -381,7 +391,7 @@ async fn process_ops_escalate(
     let task_name = crate::claude::truncate_str(&item.message_text, 100);
     let task_id = state.db.create_task_from_ops(
         ops_id,
-        &task_name,
+        task_name,
         &item.message_text,
         &item.repo_key,
         channel,
@@ -456,6 +466,237 @@ async fn process_ops_resolve(
         ]);
         slack
             .update_blocks(channel, msg_ts, &updated_blocks, "対応完了")
+            .await
+            .ok();
+    }
+
+    Ok(())
+}
+
+/// ops_inception_approve ボタンの処理: タスク分解結果を Asana に登録
+async fn process_ops_inception_approve(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    let item = match state.db.get_ops_item(ops_id)? {
+        Some(i) => i,
+        None => {
+            tracing::warn!("inception approve: ops item {} not found", ops_id);
+            return Ok(());
+        }
+    };
+
+    // IDOR 防止: ボタンが押されたチャンネルと ops アイテムのチャンネルが一致するか検証
+    if item.channel != channel {
+        tracing::warn!("inception approve: channel mismatch ops_id={} (expected={}, got={})", ops_id, item.channel, channel);
+        return Ok(());
+    }
+
+    // ボタンを更新
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *承認されました — Asana 登録中...*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "Asana 登録中...")
+            .await
+            .ok();
+    }
+
+    // ops_contexts から最新の assistant 出力（ターン2の要件定義）を取得
+    // runner.rs と同じロジックで reply_ts を決定（item ベース統一、Slack payload は使わない）
+    let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+    let history = state.db.get_ops_context(channel, reply_ts)?;
+    let last_output = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.as_str())
+        .unwrap_or(&item.message_text);
+
+    // TASKS_JSON を抽出して各タスクを登録
+    let tasks = crate::worker::ops::extract_tasks_json(last_output);
+    let slack = state.slack_client();
+
+    // タスク数の上限ガード（Claude 出力暴走時の安全弁）
+    if tasks.len() > 50 {
+        tracing::warn!("inception approve: too many tasks ({}) from ops item {}, truncating to 50", tasks.len(), ops_id);
+    }
+    let tasks = if tasks.len() > 50 { &tasks[..50] } else { &tasks[..] };
+
+    if tasks.is_empty() {
+        // TASKS_JSON がない場合は単一タスクとして登録
+        let task_name = crate::claude::truncate_str(&item.message_text, 100);
+        let task_id = state.db.create_task_from_ops(
+            ops_id,
+            task_name,
+            last_output,
+            &item.repo_key,
+            channel,
+            reply_ts,
+        )?;
+        tracing::info!("inception: registered task #{} (single) from ops item {}", task_id, ops_id);
+        slack
+            .reply_thread(
+                channel,
+                reply_ts,
+                &format!(":clipboard: タスクを登録しました (task #{})\n計画 → 実行のフローに入ります", task_id),
+            )
+            .await
+            .ok();
+    } else {
+        // 複数タスクを登録
+        let mut registered_ids = Vec::new();
+        for task_json in tasks {
+            let title = task_json.get("title").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("Inception task");
+            let description = task_json.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+            let task_id = state.db.create_task_from_ops(
+                ops_id,
+                title,
+                description,
+                &item.repo_key,
+                channel,
+                reply_ts,
+            )?;
+            registered_ids.push(task_id);
+            tracing::info!("inception: registered task #{} '{}' from ops item {}", task_id, title, ops_id);
+        }
+        let ids_str: Vec<String> = registered_ids.iter().map(|id| format!("#{}", id)).collect();
+        slack
+            .reply_thread(
+                channel,
+                reply_ts,
+                &format!(
+                    ":clipboard: {} 件のタスクを登録しました ({})\n計画 → 実行のフローに入ります",
+                    registered_ids.len(),
+                    ids_str.join(", ")
+                ),
+            )
+            .await
+            .ok();
+    }
+
+    state.db.resolve_ops(ops_id)?;
+    state.wake_worker();
+    Ok(())
+}
+
+/// ops_inception_revise ボタンの処理: ops_contexts をリセットしてターン1からやり直し
+async fn process_ops_inception_revise(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    let item = match state.db.get_ops_item(ops_id)? {
+        Some(i) => i,
+        None => {
+            tracing::warn!("inception revise: ops item {} not found", ops_id);
+            return Ok(());
+        }
+    };
+
+    // IDOR 防止: ボタンが押されたチャンネルと ops アイテムのチャンネルが一致するか検証
+    if item.channel != channel {
+        tracing::warn!("inception revise: channel mismatch ops_id={} (expected={}, got={})", ops_id, item.channel, channel);
+        return Ok(());
+    }
+
+    // ボタンを更新
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":arrows_counterclockwise: *修正中... ターン1からやり直します*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "修正中...")
+            .await
+            .ok();
+    }
+
+    // ops_contexts をクリア（スレッド履歴をリセットしてターン1に戻す）
+    // runner.rs と同じロジックで reply_ts を決定（item ベース統一）
+    let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+    state.db.clear_ops_context(channel, reply_ts)?;
+
+    // ops_queue に新しいアイテムとして再エンキュー
+    let new_id = state.db.enqueue_ops(
+        channel,
+        &format!("{}_revise_{}", item.message_ts, ops_id),
+        item.thread_ts.as_deref().or(Some(reply_ts)),
+        &item.repo_key,
+        &item.message_text,
+        &item.event_json,
+        "ready",
+    )?;
+    tracing::info!("inception revise: re-enqueued as ops item {} from ops item {}", new_id, ops_id);
+
+    state.db.resolve_ops(ops_id)?;
+
+    let slack = state.slack_client();
+    slack
+        .reply_thread(
+            channel,
+            reply_ts,
+            ":arrows_counterclockwise: フィードバックをもとに要件定義をやり直します。少々お待ちください...",
+        )
+        .await
+        .ok();
+
+    state.wake_worker();
+    Ok(())
+}
+
+/// ops_inception_cancel ボタンの処理
+async fn process_ops_inception_cancel(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    state.db.resolve_ops(ops_id)?;
+    tracing::info!("inception: ops item {} cancelled", ops_id);
+
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *キャンセルされました*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "キャンセルされました")
             .await
             .ok();
     }

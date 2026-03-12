@@ -435,8 +435,14 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                     enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
                 }
             }
-            // スレッド返信 + メンションなし → 無視（人同士の会話）
-            (Some(_), false) => {}
+            // スレッド返信 + メンションなし → 通常は無視（人同士の会話）
+            // Inception モードはターン2へ継続するためエンキュー
+            (Some(tts), false) => {
+                if repo_entry.ops_mode == crate::repo_config::OpsMode::Inception {
+                    tracing::info!("inception: thread reply enqueued for turn2 in {}", channel);
+                    enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
+                }
+            }
         }
         return Ok(());
     }
@@ -743,6 +749,7 @@ async fn handle_asana_url_link(
 ///
 /// - status = "pending": 分類が必要（ops_monitor 自動検出）
 /// - status = "ready": 分類不要で即実行（⚡手動トリガー、@メンション、スレッド返信）
+#[allow(clippy::too_many_arguments)]
 fn enqueue_ops_request(
     state: &Arc<AppState>,
     event: &serde_json::Value,
