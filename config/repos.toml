@@ -31,18 +31,23 @@ project_gid = "1209044193035773"
 key = "hikken_schedule"
 github = "amu-tazawa-scripts/hikken_schedule"
 ops_channel = "必見自動化"
+ops_description = "必見パチ/スロ系のサブカテ画像追加・hikken_scheduleの運用作業"
 ops_skills = [".claude/commands/ops.md"]
 
 [[repo]]
 key = "send_survey_mail"
 github = "amu-tazawa-scripts/send_survey_mail"
 ops_channel = "amz_結果アンケート自動化"
+ops_description = "結果アンケート自動送信の設定追加・サブカテ登録（GASベース）"
 ops_skills = [".claude/skills/add-subcategory/SKILL.md"]
 
 [[repo]]
 key = "favorite_pop"
 github = "amu-tazawa-scripts/favorite_pop"
 ops_channel = "amz_企画チーム_自動化支援"
+ops_monitor = true
+ops_mode = "plan"
+ops_description = "新規取材タイプの追加・企画チーム自動化支援の分析"
 ops_skills = [".claude/skills/add-interview/SKILL.md"]
 
 # ── スケジュールジョブ ──────────────────────

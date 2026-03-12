@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Timelike, Utc};
 use tokio::sync::Notify;
 
 use crate::db::{CodingTask, Db, OpsQueueItem};
@@ -94,6 +95,7 @@ impl Worker {
 
         let worker = Arc::new(self);
         let mut consecutive_errors: u32 = 0;
+        let mut last_followup_check: Option<DateTime<Utc>> = None;
 
         loop {
             let mut had_error = false;
@@ -106,6 +108,18 @@ impl Worker {
 
             // スケジューラージョブチェック（軽量なので直接 await）
             had_error |= worker.run_scheduler().await;
+
+            // ops フォローアップチェック（1時間ごと、業務時間 9-18 JST のみ）
+            let now = Utc::now();
+            let jst_hour = (now.hour() + 9) % 24; // UTC → JST 簡易変換
+            let should_check_followup = jst_hour >= 9 && jst_hour < 18
+                && last_followup_check
+                    .map(|last| (now - last).num_minutes() >= 60)
+                    .unwrap_or(true);
+            if should_check_followup {
+                worker.check_ops_followups().await;
+                last_followup_check = Some(now);
+            }
 
             // エラー時バックオフ、通常時はハートビートまたは Notify 待ち
             if had_error {
@@ -262,37 +276,44 @@ impl Worker {
     /// - pending: classify → actionable なら実行、そうでなければ skipped
     /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
     async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
-        let repo_entry = match self.repos_config.find_repo_by_key(&item.repo_key) {
-            Some(r) => r.clone(),
-            None => {
-                let err = format!("Unknown repo key: {}", item.repo_key);
-                self.db.mark_ops_failed(item.id, &err)?;
+        // コンテンツベースのopsルーティング（全経路共通）
+        let repo_entry = match self.route_ops(&item).await {
+            Ok(Some(idx)) => {
+                let entry = self.repos_config.repo[idx].clone();
+                tracing::info!("ops item {} routed to scope: {} ({})",
+                    item.id, entry.key,
+                    entry.ops_description.as_deref().unwrap_or("no description"));
+                entry
+            }
+            Ok(None) if item.status == "pending" => {
+                tracing::debug!("ops item {} classified as non-actionable", item.id);
+                self.db.mark_ops_skipped(item.id)?;
+                return Ok(());
+            }
+            Ok(None) => {
+                // ready アイテム: チャンネルのデフォルトスコープにフォールバック
+                match self.repos_config.find_repo_by_ops_channel(&item.channel) {
+                    Some(r) => {
+                        tracing::info!("ops item {} routing: no match, fallback to channel default", item.id);
+                        r.clone()
+                    }
+                    None => {
+                        let err = format!("No matching ops scope for item {}", item.id);
+                        self.db.mark_ops_failed(item.id, &err)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ops routing failed for item {}: {}", item.id, e);
+                if item.retry_count + 1 >= max_retries {
+                    self.db.mark_ops_failed(item.id, &e.to_string())?;
+                } else {
+                    self.db.mark_ops_retry(item.id, &e.to_string())?;
+                }
                 return Ok(());
             }
         };
-
-        // pending → 分類が必要
-        if item.status == "pending" {
-            match self.classify_ops(&item, &repo_entry).await {
-                Ok(true) => {
-                    tracing::info!("ops item {} classified as actionable", item.id);
-                }
-                Ok(false) => {
-                    tracing::debug!("ops item {} classified as non-actionable", item.id);
-                    self.db.mark_ops_skipped(item.id)?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!("ops classification failed for item {}: {}", item.id, e);
-                    if item.retry_count + 1 >= max_retries {
-                        self.db.mark_ops_failed(item.id, &e.to_string())?;
-                    } else {
-                        self.db.mark_ops_retry(item.id, &e.to_string())?;
-                    }
-                    return Ok(());
-                }
-            }
-        }
 
         // 実行
         let event: serde_json::Value =
@@ -342,26 +363,93 @@ impl Worker {
             files,
         };
 
+        let plan_only = repo_entry.ops_mode == crate::repo_config::OpsMode::Plan;
+
         let dl_dir_ref = ops_download_dir.as_deref();
         let exec_result = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
+            plan_only,
         ).await;
 
+        // admin ユーザーへのメンション（完了通知に含める）
+        let admin_mention = self.repos_config.defaults.ops_admin_user
+            .as_deref()
+            .map(|uid| format!(" <@{}>", uid))
+            .unwrap_or_default();
+
         match exec_result {
-            Ok(output) => {
+            Ok(raw_output) => {
+                let output = if raw_output.trim().is_empty() {
+                    tracing::warn!("ops item {}: Claude returned empty output, using fallback", item.id);
+                    "（作業完了 — Claude からのテキスト出力なし。ツール操作のみ実行された可能性があります）".to_string()
+                } else {
+                    raw_output
+                };
                 if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "assistant", &output) {
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
-                // 「対応不要」系の応答はスレッドに投稿しない（静かにスキップ）
                 let is_no_action = output.contains("対応不要")
                     || output.contains("作業対象外")
                     || output.contains("スコープ外");
-                if !is_no_action {
-                    let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
-                    slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
+                let emoji = if is_no_action {
+                    ":information_source:"
+                } else if plan_only {
+                    ":memo:"
                 } else {
-                    tracing::info!("ops item {} result: no action needed, skipping notification", item.id);
+                    ":white_check_mark:"
+                };
+                let label = if is_no_action {
+                    "対応不要"
+                } else if plan_only {
+                    "分析完了"
+                } else {
+                    "ops 完了"
+                };
+                let truncated = crate::claude::truncate_str(&output, 2800);
+                // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
+                if is_no_action {
+                    let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);
+                    slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+                    self.db.resolve_ops(item.id).ok();
+                } else {
+                    let blocks = serde_json::json!([
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{2705} 完了" },
+                                    "style": "primary",
+                                    "action_id": "ops_resolve",
+                                    "value": item.id.to_string()
+                                },
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                                    "action_id": "ops_escalate",
+                                    "value": item.id.to_string()
+                                }
+                            ]
+                        }
+                    ]);
+                    let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);
+                    match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
+                        Ok(ts) => {
+                            self.db.set_ops_notify_ts(item.id, &ts).ok();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to post ops blocks: {}", e);
+                            slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
+                        }
+                    }
                 }
                 self.db.mark_ops_done(item.id)?;
             }
@@ -381,32 +469,126 @@ impl Worker {
         Ok(())
     }
 
-    /// ops メッセージを分類（claude -p で作業対象かどうか判定）
-    async fn classify_ops(&self, item: &OpsQueueItem, repo_entry: &crate::repo_config::RepoEntry) -> Result<bool> {
-        if item.message_text.trim().len() < 5 {
-            return Ok(false);
-        }
-
-        let ops_desc = if let Some(ref skills) = repo_entry.ops_skills {
-            if !skills.is_empty() {
-                "- スキルファイルに定義された定型作業".to_string()
-            } else {
-                return Ok(false);
+    /// ops フォローアップチェック: 未解決アイテムにリマインドを送信
+    ///
+    /// - 1日後: 1回目リマインド
+    /// - 3日後: 2回目リマインド
+    /// - 7日後: 3回目リマインド + 保留に移行
+    async fn check_ops_followups(self: &Arc<Self>) {
+        let items = match self.db.get_ops_needing_followup() {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!("Failed to get ops followups: {}", e);
+                return;
             }
-        } else {
-            return Ok(false);
         };
 
+        let now = chrono::Utc::now();
+        let admin_mention = self.repos_config.defaults.ops_admin_user
+            .as_deref()
+            .map(|uid| format!("<@{}>", uid))
+            .unwrap_or_default();
+
+        for item in items {
+            let done_at = match item.done_at.parse::<DateTime<Utc>>() {
+                Ok(dt) => dt,
+                Err(_) => continue,
+            };
+            let elapsed = now - done_at;
+            let elapsed_days = elapsed.num_days();
+
+            // リマインドのタイミング判定
+            let should_remind = match item.reminder_count {
+                0 => elapsed_days >= 1,
+                1 => elapsed_days >= 3,
+                2 => elapsed_days >= 7,
+                _ => false,
+            };
+
+            if !should_remind {
+                continue;
+            }
+
+            let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+            let slack = self.slack.clone();
+            let short_text = crate::claude::truncate_str(&item.message_text, 80);
+
+            if item.reminder_count >= 2 {
+                // 7日後: 保留に移行
+                let msg = format!(
+                    ":file_folder: *保留に移行* {}\n1週間未対応のため保留にしました: _{}_",
+                    admin_mention, short_text
+                );
+                slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+                self.db.mark_ops_on_hold(item.id).ok();
+                tracing::info!("ops item {} moved to on_hold after 7 days", item.id);
+            } else {
+                // 1日後 / 3日後: リマインド
+                let label = if item.reminder_count == 0 { "1日" } else { "3日" };
+                let msg = format!(
+                    ":bell: *リマインド* {}\n{}経過: _{}_",
+                    admin_mention, label, short_text
+                );
+                slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+                self.db.increment_ops_reminder(item.id).ok();
+                tracing::info!("ops item {} reminder {} sent ({}d elapsed)", item.id, item.reminder_count + 1, elapsed_days);
+            }
+        }
+    }
+
+    /// ops メッセージをルーティング（コンテンツベースで最適なopsスコープを選択）
+    ///
+    /// 全opsスコープの説明を提示し、Claude に最適なスコープを選ばせる。
+    /// 該当なしの場合は None を返す。
+    async fn route_ops(&self, item: &OpsQueueItem) -> Result<Option<usize>> {
+        if item.message_text.trim().len() < 5 {
+            tracing::debug!("route_ops: message too short, skipping");
+            return Ok(None);
+        }
+
+        let ops_entries = self.repos_config.get_all_ops_entries();
+        if ops_entries.is_empty() {
+            tracing::warn!("route_ops: no ops entries found in config");
+            return Ok(None);
+        }
+
+        // スコープが1つしかない場合は分類不要
+        if ops_entries.len() == 1 {
+            tracing::info!("route_ops: single scope, auto-selecting: {}", ops_entries[0].1.key);
+            return Ok(Some(ops_entries[0].0));
+        }
+
+        let scopes: Vec<String> = ops_entries
+            .iter()
+            .enumerate()
+            .map(|(i, (_, entry))| {
+                let desc = entry
+                    .ops_description
+                    .as_deref()
+                    .unwrap_or(&entry.key);
+                format!("{}. {}", i + 1, desc)
+            })
+            .collect();
+
+        tracing::info!(
+            "route_ops: classifying item {} across {} scopes: [{}]",
+            item.id,
+            ops_entries.len(),
+            scopes.join(", ")
+        );
+
         let prompt = format!(
-            "以下のSlackメッセージは、このチャンネルで対応すべき作業依頼ですか？\n\n\
-             ## 対応可能な作業\n{}\n\n\
+            "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\n\
+             ## 作業スコープ一覧\n{}\n\n\
              ## メッセージ\n{}\n\n\
-             作業依頼であれば YES、そうでなければ NO とだけ答えてください。",
-            ops_desc, item.message_text
+             該当するスコープの番号を1つだけ答えてください。どれにも該当しない場合は 0 と答えてください。\n\
+             番号のみ出力してください。",
+            scopes.join("\n"),
+            item.message_text
         );
 
         let log_dir = self.log_dir();
-        let result = crate::claude::ClaudeRunner::new("classify", &prompt)
+        let result = crate::claude::ClaudeRunner::new("route", &prompt)
             .max_turns(1)
             .allowed_tools("")
             .log_dir(&log_dir)
@@ -415,11 +597,34 @@ impl Worker {
             .await?;
 
         if !result.success {
-            anyhow::bail!("classify claude -p failed: {}", result.stderr);
+            anyhow::bail!("route claude -p failed: {}", result.stderr);
         }
 
-        let answer = result.stdout.trim().to_uppercase();
-        Ok(answer.split_whitespace().any(|w| w == "YES"))
+        let answer = result.stdout.trim();
+        tracing::info!("route_ops: Claude answer='{}' for item {}", answer, item.id);
+
+        let num: usize = answer
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+
+        if num == 0 || num > ops_entries.len() {
+            tracing::info!("route_ops: no match (answer='{}', parsed={})", answer, num);
+            return Ok(None);
+        }
+
+        let selected = &ops_entries[num - 1].1;
+        tracing::info!(
+            "route_ops: selected scope {} '{}' for item {}",
+            num,
+            selected.ops_description.as_deref().unwrap_or(&selected.key),
+            item.id
+        );
+
+        // ops_entries[num-1] の .0 がグローバル repo 配列のインデックス
+        Ok(Some(ops_entries[num - 1].0))
     }
 
     /// スケジューラージョブを実行。エラーがあれば true を返す

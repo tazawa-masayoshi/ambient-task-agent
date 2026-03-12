@@ -12,6 +12,17 @@ pub enum ExecMode {
     DryRun,
 }
 
+/// ops チャンネルの実行モード
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsMode {
+    /// 分析 + 実行（デフォルト）
+    #[default]
+    Execute,
+    /// 分析・計画のみ（read-only、実行はしない）
+    Plan,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReposConfig {
     pub defaults: Defaults,
@@ -120,6 +131,11 @@ pub struct RepoEntry {
     /// false/未設定: ⚡リアクションによる手動トリガーのみ
     #[serde(default)]
     pub ops_monitor: bool,
+    /// ops 実行モード: "execute"（デフォルト）= 実行まで、"plan" = 分析・計画のみ
+    #[serde(default)]
+    pub ops_mode: OpsMode,
+    /// ops スコープの説明（コンテンツベースルーティングで使用）
+    pub ops_description: Option<String>,
     /// true: 分析後に自動実行 + PR 作成（承認スキップ）
     #[serde(default)]
     pub auto_execute: bool,
@@ -202,6 +218,20 @@ impl ReposConfig {
         self.repo
             .iter()
             .find(|r| r.ops_channel.as_deref() == Some(channel))
+    }
+
+    /// ops スキルが設定されている全リポジトリエントリを (index, entry) で返す
+    pub fn get_all_ops_entries(&self) -> Vec<(usize, &RepoEntry)> {
+        self.repo
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.ops_skills
+                    .as_ref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     pub fn find_repo_by_key(&self, key: &str) -> Option<&RepoEntry> {

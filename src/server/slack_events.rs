@@ -401,12 +401,14 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
 
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
         let sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
-        let is_admin = state.repos_config.defaults.ops_admin_user
-            .as_deref()
-            .is_some_and(|admin| admin == sender);
+        let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
+        let is_admin = admin_user_id.is_some_and(|admin| admin == sender);
+        // @admin ユーザー宛メンションの検出（@bot 以外で admin 宛の依頼）
+        let has_admin_mention = admin_user_id
+            .is_some_and(|admin| text.contains(&format!("<@{}", admin)));
 
         match (thread_ts, has_mention) {
-            // スレッド返信 + @メンション → admin のみ ops 即実行
+            // スレッド返信 + @bot メンション → admin のみ ops 即実行
             (Some(tts), true) if is_admin => {
                 tracing::info!("ops thread mention by admin in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
@@ -414,13 +416,18 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             (Some(_), true) => {
                 tracing::info!("ops thread mention by non-admin {} ignored", sender);
             }
-            // トップレベル + @メンション → ops_monitor のチャンネルのみ即実行
+            // トップレベル + @bot メンション → ops_monitor のチャンネルのみ即実行
             (None, true) if repo_entry.ops_monitor => {
                 tracing::info!("ops top-level mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
             }
             (None, true) => {
                 tracing::debug!("ops_monitor=false, top-level mention ignored in {}", channel);
+            }
+            // トップレベル + @admin メンション → admin 宛依頼として即実行
+            (None, false) if has_admin_mention => {
+                tracing::info!("ops admin-mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
             }
             // トップレベル + メンションなし → 自動分類
             (None, false) => {

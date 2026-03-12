@@ -6,16 +6,41 @@ use crate::db::OpsMessage;
 use crate::execution::RunnerContext;
 
 const OPS_ALLOWED_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep";
+const OPS_PLAN_ALLOWED_TOOLS: &str = "Read,Glob,Grep,Bash";
 
 const FALLBACK_OPS_SOUL: &str = "\
 あなたは定型保守作業を実行する自律エージェントです。
 スキルファイルの手順に従い、正確に作業を完了してください。";
 
+const FALLBACK_OPS_PLAN_SOUL: &str = "\
+あなたは依頼内容を分析し、作業計画を立てるエージェントです。
+コードを読んで問題を特定し、何をどう修正すべきかを具体的に報告してください。";
+
 const OPS_RULES: &str = "\
 ## ルール
 - 作業手順に従って処理すること
-- 完了時に作業内容の要約を出力すること
-- 不明な点があれば作業を中断し、確認が必要な内容を報告すること";
+- 不明な点があれば作業を中断し、確認が必要な内容を報告すること
+
+## 出力（重要）
+最後に必ずテキストで作業結果を出力すること。ツール操作だけで終了してはいけない。
+以下の形式で要約を出力:
+- 何を確認/実行したか
+- 結果（成功/失敗/対応不要）
+- 対応不要の場合はその理由";
+
+const OPS_PLAN_RULES: &str = "\
+## ルール
+- ファイルの読み取り・検索のみ行い、書き込み・編集は一切行わないこと
+- 問題の特定と原因分析を行うこと
+- 具体的な修正方針（どのファイルのどの箇所をどう変更すべきか）を報告すること
+- 不明な点があれば、その旨を明記すること
+
+## 出力（重要）
+最後に必ずテキストで分析結果を出力すること。ツール操作だけで終了してはいけない。
+日本語で箇条書きにまとめ、以下を含めること:
+- 問題の特定結果
+- 原因分析
+- 具体的な修正方針（対応不要の場合はその理由）";
 
 pub struct OpsRequest {
     pub message_text: String,
@@ -128,25 +153,35 @@ pub async fn execute_ops(
     runner_ctx: &RunnerContext,
     history: &[OpsMessage],
     download_dir: Option<&str>,
+    plan_only: bool,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
-    if skill_content.is_empty() {
-        anyhow::bail!("No skill files found for ops execution");
-    }
+
+    // plan モードではスキルファイルが無くても動作可能
+    let (base_soul, rules, tools) = if plan_only {
+        let soul = if soul.is_empty() { FALLBACK_OPS_PLAN_SOUL } else { soul };
+        (soul, OPS_PLAN_RULES, OPS_PLAN_ALLOWED_TOOLS)
+    } else {
+        if skill_content.is_empty() {
+            anyhow::bail!("No skill files found for ops execution");
+        }
+        let soul = if soul.is_empty() { FALLBACK_OPS_SOUL } else { soul };
+        (soul, OPS_RULES, OPS_ALLOWED_TOOLS)
+    };
 
     // システムプロンプト構築
-    let base_soul = if soul.is_empty() { FALLBACK_OPS_SOUL } else { soul };
-    let system_prompt = format!(
-        "{}\n\n## 作業手順\n{}\n\n{}",
-        base_soul, skill_content, OPS_RULES
-    );
+    let system_prompt = if skill_content.is_empty() {
+        format!("{}\n\n{}", base_soul, rules)
+    } else {
+        format!("{}\n\n## 作業手順\n{}\n\n{}", base_soul, skill_content, rules)
+    };
 
     let prompt = build_ops_prompt(req, history, download_dir);
 
     let result = ClaudeRunner::new("ops", &prompt)
         .system_prompt(&system_prompt)
         .max_turns(max_turns)
-        .allowed_tools(OPS_ALLOWED_TOOLS)
+        .allowed_tools(tools)
         .cwd(repo_path)
         .optional_log_dir(log_dir)
         .with_context(runner_ctx)

@@ -286,9 +286,13 @@ impl Db {
             ("current_subtask_index", "INTEGER"), // v10: サブタスクループ進捗
         ])?;
 
-        // ops_queue: thread_ts カラム追加
+        // ops_queue: 追加カラム
         self.add_missing_columns(&conn, "ops_queue", &[
             ("thread_ts", "TEXT"),
+            ("done_at", "TEXT"),
+            ("resolved_at", "TEXT"),
+            ("reminder_count", "INTEGER DEFAULT 0"),
+            ("notify_ts", "TEXT"),
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -1043,10 +1047,138 @@ impl Db {
     pub fn mark_ops_done(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE ops_queue SET status = 'done', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            "UPDATE ops_queue SET status = 'done', \
+             done_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![id],
         )?;
         Ok(())
+    }
+
+    /// 完了通知メッセージの ts を記録（ボタン更新用）
+    pub fn set_ops_notify_ts(&self, id: i64, ts: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET notify_ts = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id, ts],
+        )?;
+        Ok(())
+    }
+
+    /// ops アイテムを解決済みにする（ボタン押下時）
+    pub fn resolve_ops(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// フォローアップが必要な ops アイテムを取得
+    /// （done + resolved_at IS NULL + done_at が指定時間以上経過）
+    pub fn get_ops_needing_followup(&self) -> Result<Vec<OpsFollowupItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, \
+             done_at, reminder_count, notify_ts \
+             FROM ops_queue \
+             WHERE status = 'done' AND resolved_at IS NULL AND done_at IS NOT NULL \
+             ORDER BY done_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OpsFollowupItem {
+                id: row.get(0)?,
+                channel: row.get(1)?,
+                message_ts: row.get(2)?,
+                thread_ts: row.get(3)?,
+                repo_key: row.get(4)?,
+                message_text: row.get(5)?,
+                done_at: row.get(6)?,
+                reminder_count: row.get(7)?,
+                notify_ts: row.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// リマインダー送信後にカウントを更新
+    pub fn increment_ops_reminder(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET reminder_count = reminder_count + 1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// ops アイテムを保留にする（7日後）
+    pub fn mark_ops_on_hold(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'on_hold', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// ops アイテムを ID で取得
+    pub fn get_ops_item(&self, id: i64) -> Result<Option<OpsQueueItem>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count \
+             FROM ops_queue WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(OpsQueueItem {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    message_ts: row.get(2)?,
+                    thread_ts: row.get(3)?,
+                    repo_key: row.get(4)?,
+                    message_text: row.get(5)?,
+                    event_json: row.get(6)?,
+                    status: row.get(7)?,
+                    retry_count: row.get(8)?,
+                })
+            },
+        );
+        match result {
+            Ok(item) => Ok(Some(item)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// ops アイテムから coding_task を作成（エスカレーション）
+    pub fn create_task_from_ops(
+        &self,
+        ops_id: i64,
+        task_name: &str,
+        description: &str,
+        repo_key: &str,
+        channel: &str,
+        thread_ts: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, description, repo_key, \
+             status, slack_channel, slack_thread_ts) \
+             VALUES (?1, ?2, ?3, ?4, 'new', ?5, ?6)",
+            params![
+                format!("ops_{}", ops_id),
+                task_name,
+                description,
+                repo_key,
+                channel,
+                thread_ts,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// キューアイテムをスキップ（対応不要と分類）
@@ -1102,4 +1234,17 @@ pub struct OpsQueueItem {
     pub event_json: String,
     pub status: String,
     pub retry_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpsFollowupItem {
+    pub id: i64,
+    pub channel: String,
+    pub message_ts: String,
+    pub thread_ts: Option<String>,
+    pub repo_key: String,
+    pub message_text: String,
+    pub done_at: String,
+    pub reminder_count: i64,
+    pub notify_ts: Option<String>,
 }

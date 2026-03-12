@@ -78,39 +78,30 @@ pub async fn handle_slack_action(
         None => return (StatusCode::OK, "no action").into_response(),
     };
 
-    let task_id_str = action.value.as_deref().unwrap_or("");
-    let task_id: i64 = match task_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            tracing::error!("Invalid task_id in action: {}", task_id_str);
-            return (StatusCode::OK, "invalid task_id").into_response();
-        }
-    };
+    let action_value = action.value.as_deref().unwrap_or("").to_string();
+    let action_id = action.action_id.clone();
 
     let channel_id = payload
         .channel
         .as_ref()
         .map(|c| c.id.as_str())
-        .unwrap_or(&state.slack_channel);
+        .unwrap_or(&state.slack_channel)
+        .to_string();
 
-    let message_ts = payload.message.as_ref().map(|m| m.ts.as_str());
+    let message_ts = payload.message.as_ref().map(|m| m.ts.clone());
     let thread_ts = payload
         .message
         .as_ref()
-        .and_then(|m| m.thread_ts.as_deref());
+        .and_then(|m| m.thread_ts.clone());
 
     // 非同期で処理
     let state_clone = state.clone();
-    let action_id = action.action_id.clone();
-    let channel_id = channel_id.to_string();
-    let message_ts = message_ts.map(|s| s.to_string());
-    let thread_ts = thread_ts.map(|s| s.to_string());
 
     tokio::spawn(async move {
         if let Err(e) = process_action(
             &state_clone,
             &action_id,
-            task_id,
+            &action_value,
             &channel_id,
             message_ts.as_deref(),
             thread_ts.as_deref(),
@@ -145,12 +136,7 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
         None => return Ok(()),
     };
 
-    let task_id: i64 = action
-        .value
-        .as_deref()
-        .unwrap_or("")
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid task_id"))?;
+    let action_value = action.value.as_deref().unwrap_or("");
 
     let channel = action_payload
         .channel
@@ -166,7 +152,7 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
     process_action(
         state,
         &action.action_id,
-        task_id,
+        action_value,
         channel,
         message_ts,
         thread_ts,
@@ -177,11 +163,23 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
 async fn process_action(
     state: &AppState,
     action_id: &str,
-    task_id: i64,
+    action_value: &str,
     channel: &str,
     message_ts: Option<&str>,
     thread_ts: Option<&str>,
 ) -> anyhow::Result<()> {
+    // ops 系アクションは task_id ではなく ops_queue の id を使う
+    if action_id == "ops_resolve" {
+        return process_ops_resolve(state, action_value, channel, message_ts).await;
+    }
+    if action_id == "ops_escalate" {
+        return process_ops_escalate(state, action_value, channel, message_ts, thread_ts).await;
+    }
+
+    let task_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid task_id: {}", action_value))?;
+
     let task = match state.db.get_task_by_id(task_id)? {
         Some(t) => t,
         None => {
@@ -352,6 +350,114 @@ async fn process_action(
         _ => {
             tracing::debug!("Unknown action_id: {}", action_id);
         }
+    }
+
+    Ok(())
+}
+
+/// ops_escalate ボタンの処理: ops アイテムを coding_task に昇格
+async fn process_ops_escalate(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+    thread_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    // ops アイテムの情報を取得
+    let item = state.db.get_ops_item(ops_id)?;
+    let item = match item {
+        Some(i) => i,
+        None => {
+            tracing::warn!("ops item {} not found for escalation", ops_id);
+            return Ok(());
+        }
+    };
+
+    // coding_task を作成（asana_task_gid は ops_{id} でダミー、後で Asana 連携可能）
+    let task_name = crate::claude::truncate_str(&item.message_text, 100);
+    let task_id = state.db.create_task_from_ops(
+        ops_id,
+        &task_name,
+        &item.message_text,
+        &item.repo_key,
+        channel,
+        thread_ts.or(item.thread_ts.as_deref()).unwrap_or(&item.message_ts),
+    )?;
+
+    // ops 側を解決済みに
+    state.db.resolve_ops(ops_id)?;
+    tracing::info!("ops item {} escalated to task {}", ops_id, task_id);
+
+    let slack = state.slack_client();
+
+    // ボタンを更新
+    if let Some(msg_ts) = message_ts {
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!(":clipboard: *タスク化済み* (task #{})", task_id)
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, &format!("タスク化済み (task #{})", task_id))
+            .await
+            .ok();
+    }
+
+    // スレッドに通知
+    let reply_ts = thread_ts
+        .or(item.thread_ts.as_deref())
+        .unwrap_or(&item.message_ts);
+    slack
+        .reply_thread(
+            channel,
+            reply_ts,
+            &format!(":clipboard: タスクとして登録しました (task #{})\n計画 → 実行のフローに入ります", task_id),
+        )
+        .await
+        .ok();
+
+    state.wake_worker();
+    Ok(())
+}
+
+/// ops_resolve ボタンの処理
+async fn process_ops_resolve(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    state.db.resolve_ops(ops_id)?;
+    tracing::info!("ops item {} resolved via button", ops_id);
+
+    // ボタンを除去してメッセージを更新
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *対応完了*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "対応完了")
+            .await
+            .ok();
     }
 
     Ok(())
