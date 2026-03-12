@@ -70,6 +70,9 @@ async fn get_ws_url(app_token: &str) -> anyhow::Result<String> {
 
 /// WebSocket に接続してイベントを処理
 async fn connect_and_listen(state: &Arc<AppState>, app_token: &str) -> anyhow::Result<()> {
+    // Slack は通常10秒間隔で ping を送るので、60秒無通信なら接続が死んでいると判断
+    const READ_TIMEOUT_SECS: u64 = 60;
+
     let ws_url = get_ws_url(app_token).await?;
     tracing::info!("Socket Mode connecting to WebSocket...");
 
@@ -78,11 +81,24 @@ async fn connect_and_listen(state: &Arc<AppState>, app_token: &str) -> anyhow::R
 
     let (mut write, mut read) = ws_stream.split();
 
-    while let Some(msg) = read.next().await {
+    loop {
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+            read.next(),
+        ).await;
+
         let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(e))) => {
                 tracing::error!("WebSocket read error: {}", e);
+                break;
+            }
+            Ok(None) => {
+                // ストリーム終了
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("Socket Mode: no message for {}s, reconnecting...", READ_TIMEOUT_SECS);
                 break;
             }
         };

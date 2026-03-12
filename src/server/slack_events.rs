@@ -149,9 +149,11 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
     let command = extract_command(text);
     tracing::info!("App mention command: '{}' in {}", command, channel);
 
-    // ops チャンネルでのメンション → キューに追加（ready: 分類不要）
-    if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-        return enqueue_ops_request(state, event, channel, thread_ts, text, repo_entry, "ready");
+    // ops チャンネルでのメンション → トップレベルのみキューに追加（スレッド内は通常処理へ）
+    if event.get("thread_ts").is_none() {
+        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+            return enqueue_ops_request(state, event, channel, thread_ts, text, repo_entry, "ready");
+        }
     }
 
     let slack = state.slack_client();
@@ -372,18 +374,13 @@ async fn generate_briefing_response(state: &Arc<AppState>) -> Result<String> {
 // ============================================================================
 
 async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Result<()> {
-    // bot 自身のメッセージを無視（無限ループ防止）
+    // Bot 自身のメッセージを無視（無限ループ防止）
     if event.get("bot_id").is_some() || event.get("bot_profile").is_some() {
         return Ok(());
     }
 
     // サブタイプ付きメッセージ（message_changed 等）は無視
     if event.get("subtype").is_some() {
-        return Ok(());
-    }
-
-    // Bot 自身のメッセージは無視
-    if event.get("bot_id").is_some() {
         return Ok(());
     }
 

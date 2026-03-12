@@ -350,8 +350,16 @@ impl Worker {
                 if let Err(e) = self.db.append_ops_context(&item.channel, &item.message_ts, repo_key, "assistant", &output) {
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
-                let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
-                slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                // 「対応不要」系の応答はスレッドに投稿しない（静かにスキップ）
+                let is_no_action = output.contains("対応不要")
+                    || output.contains("作業対象外")
+                    || output.contains("スコープ外");
+                if !is_no_action {
+                    let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
+                    slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                } else {
+                    tracing::info!("ops item {} result: no action needed, skipping notification", item.id);
+                }
                 self.db.mark_ops_done(item.id)?;
             }
             Err(e) => {
