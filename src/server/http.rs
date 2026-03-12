@@ -24,6 +24,8 @@ pub struct AppState {
     pub slack_workspace: Option<String>,
     pub worker_notify: std::sync::Arc<tokio::sync::Notify>,
     pub runner_ctx: crate::execution::RunnerContext,
+    /// ボット自身の Slack user ID（@メンション判定用）
+    pub bot_user_id: String,
 }
 
 impl AppState {

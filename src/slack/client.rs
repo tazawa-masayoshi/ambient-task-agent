@@ -151,6 +151,33 @@ impl SlackClient {
         Ok(())
     }
 
+    fn check_ok(data: &serde_json::Value, api_name: &str) -> Result<()> {
+        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+            anyhow::bail!("{} error: {}", api_name, err);
+        }
+        Ok(())
+    }
+
+    /// auth.test でボットの user ID を取得
+    pub async fn fetch_bot_user_id(&self) -> Result<String> {
+        let resp = self
+            .client
+            .post("https://slack.com/api/auth.test")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .send()
+            .await
+            .context("Slack auth.test request failed")?;
+
+        let data: serde_json::Value = resp.json().await?;
+        Self::check_ok(&data, "auth.test")?;
+
+        data.get("user_id")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .context("No user_id in auth.test response")
+    }
+
     /// conversations.history でメッセージ1件を取得（リアクション→ops 用）
     pub async fn fetch_message(&self, channel: &str, ts: &str) -> Result<serde_json::Value> {
         let resp = self
@@ -168,11 +195,7 @@ impl SlackClient {
             .context("Slack conversations.history request failed")?;
 
         let data: serde_json::Value = resp.json().await.context("Failed to parse response")?;
-
-        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-            anyhow::bail!("conversations.history error: {}", err);
-        }
+        Self::check_ok(&data, "conversations.history")?;
 
         data.get("messages")
             .and_then(|m| m.as_array())
@@ -197,16 +220,65 @@ impl SlackClient {
             .context("Slack conversations.replies request failed")?;
 
         let data: serde_json::Value = resp.json().await.context("Failed to parse response")?;
-
-        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-            anyhow::bail!("conversations.replies error: {}", err);
-        }
+        Self::check_ok(&data, "conversations.replies")?;
 
         Ok(data.get("messages")
             .and_then(|m| m.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// ボットが参加しているチャンネル一覧を取得 (name → id)
+    pub async fn fetch_bot_channels(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut channels = std::collections::HashMap::new();
+        let mut cursor = String::new();
+
+        loop {
+            let mut query = vec![
+                ("types", "public_channel,private_channel"),
+                ("exclude_archived", "true"),
+                ("limit", "200"),
+            ];
+            if !cursor.is_empty() {
+                query.push(("cursor", &cursor));
+            }
+
+            let resp = self
+                .client
+                .get("https://slack.com/api/users.conversations")
+                .header("Authorization", format!("Bearer {}", self.config.bot_token))
+                .query(&query)
+                .send()
+                .await
+                .context("Slack users.conversations request failed")?;
+
+            let data: serde_json::Value = resp.json().await?;
+            Self::check_ok(&data, "users.conversations")?;
+
+            if let Some(arr) = data.get("channels").and_then(|c| c.as_array()) {
+                for ch in arr {
+                    if let (Some(id), Some(name)) = (
+                        ch.get("id").and_then(|v| v.as_str()),
+                        ch.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        channels.insert(name.to_string(), id.to_string());
+                    }
+                }
+            }
+
+            // ページネーション
+            let next = data
+                .get("response_metadata")
+                .and_then(|m| m.get("next_cursor"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if next.is_empty() {
+                break;
+            }
+            cursor = next.to_string();
+        }
+
+        Ok(channels)
     }
 
     async fn send_message(

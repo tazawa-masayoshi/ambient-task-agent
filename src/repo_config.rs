@@ -33,6 +33,8 @@ pub struct Defaults {
     #[serde(default = "default_heartbeat_secs")]
     pub worker_heartbeat_secs: u64,
     pub google_calendar_id: Option<String>,
+    /// ops スレッド返信を許可する Slack ユーザーID
+    pub ops_admin_user: Option<String>,
     /// wez-sidebar 用タスクキャッシュファイルのパス
     pub tasks_cache_file: Option<String>,
     #[serde(default = "default_stagnation_hours")]
@@ -208,5 +210,27 @@ impl ReposConfig {
 
     pub fn repo_local_path(&self, repo: &RepoEntry) -> PathBuf {
         PathBuf::from(&self.defaults.repos_base_dir).join(&repo.key)
+    }
+
+    /// ops_channel のチャンネル名を Slack チャンネルID に解決する。
+    /// channel_map: チャンネル名 → チャンネルID のマッピング（Slack API から取得）
+    pub fn resolve_ops_channels(&mut self, channel_map: &HashMap<String, String>) {
+        for repo in &mut self.repo {
+            if let Some(ref name) = repo.ops_channel {
+                // 既に Slack チャンネルID（C + 大文字英数字、9文字以上）の場合はスキップ
+                if name.starts_with('C')
+                    && name.len() >= 9
+                    && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                {
+                    continue;
+                }
+                if let Some(id) = channel_map.get(name) {
+                    tracing::info!("Resolved ops_channel: {} -> {}", name, id);
+                    repo.ops_channel = Some(id.clone());
+                } else {
+                    tracing::warn!("ops_channel '{}' not found in bot's channels (repo: {})", name, repo.key);
+                }
+            }
+        }
     }
 }

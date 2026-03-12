@@ -237,6 +237,7 @@ impl Db {
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel       TEXT NOT NULL,
                 message_ts    TEXT NOT NULL,
+                thread_ts     TEXT,
                 repo_key      TEXT NOT NULL,
                 message_text  TEXT NOT NULL,
                 event_json    TEXT NOT NULL DEFAULT '{}',
@@ -248,6 +249,8 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_ops_queue_status
                 ON ops_queue(status, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_queue_channel_ts
+                ON ops_queue(channel, message_ts);
 
             CREATE TABLE IF NOT EXISTS ops_contexts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +284,11 @@ impl Db {
             ("complexity", "TEXT"),         // v9
             ("claude_session_id", "TEXT"),  // v10: セッション継続用
             ("current_subtask_index", "INTEGER"), // v10: サブタスクループ進捗
+        ])?;
+
+        // ops_queue: thread_ts カラム追加
+        self.add_missing_columns(&conn, "ops_queue", &[
+            ("thread_ts", "TEXT"),
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -952,6 +960,7 @@ impl Db {
         &self,
         channel: &str,
         message_ts: &str,
+        thread_ts: Option<&str>,
         repo_key: &str,
         message_text: &str,
         event_json: &str,
@@ -969,9 +978,9 @@ impl Db {
             return Ok(0);
         }
         conn.execute(
-            "INSERT INTO ops_queue (channel, message_ts, repo_key, message_text, event_json, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![channel, message_ts, repo_key, message_text, event_json, status],
+            "INSERT INTO ops_queue (channel, message_ts, thread_ts, repo_key, message_text, event_json, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![channel, message_ts, thread_ts, repo_key, message_text, event_json, status],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -994,7 +1003,7 @@ impl Db {
     pub fn dequeue_ops_item(&self) -> Result<Option<OpsQueueItem>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, channel, message_ts, repo_key, message_text, event_json, status, retry_count \
+            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count \
              FROM ops_queue WHERE status IN ('pending', 'ready') \
              AND repo_key NOT IN (SELECT DISTINCT repo_key FROM ops_queue WHERE status = 'processing') \
              ORDER BY created_at ASC LIMIT 1",
@@ -1004,11 +1013,12 @@ impl Db {
                     id: row.get(0)?,
                     channel: row.get(1)?,
                     message_ts: row.get(2)?,
-                    repo_key: row.get(3)?,
-                    message_text: row.get(4)?,
-                    event_json: row.get(5)?,
-                    status: row.get(6)?,
-                    retry_count: row.get(7)?,
+                    thread_ts: row.get(3)?,
+                    repo_key: row.get(4)?,
+                    message_text: row.get(5)?,
+                    event_json: row.get(6)?,
+                    status: row.get(7)?,
+                    retry_count: row.get(8)?,
                 })
             },
         );
@@ -1085,6 +1095,8 @@ pub struct OpsQueueItem {
     pub id: i64,
     pub channel: String,
     pub message_ts: String,
+    /// スレッド返信先の ts（None ならトップレベル → message_ts をスレッドに使う）
+    pub thread_ts: Option<String>,
     pub repo_key: String,
     pub message_text: String,
     pub event_json: String,

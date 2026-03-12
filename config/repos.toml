@@ -30,19 +30,19 @@ project_gid = "1209044193035773"
 [[repo]]
 key = "hikken_schedule"
 github = "amu-tazawa-scripts/hikken_schedule"
-ops_channel = "C_HIKKEN"  # TODO: 実際のチャンネルIDに差し替え
+ops_channel = "必見自動化"
 ops_skills = [".claude/commands/ops.md"]
 
 [[repo]]
 key = "send_survey_mail"
 github = "amu-tazawa-scripts/send_survey_mail"
-ops_channel = "C_SURVEY"  # TODO: 実際のチャンネルIDに差し替え
+ops_channel = "amz_結果アンケート自動化"
 ops_skills = [".claude/skills/add-subcategory/SKILL.md"]
 
 [[repo]]
 key = "favorite_pop"
 github = "amu-tazawa-scripts/favorite_pop"
-ops_channel = "C_POP"     # TODO: 実際のチャンネルIDに差し替え
+ops_channel = "amz_企画チーム_自動化支援"
 ops_skills = [".claude/skills/add-interview/SKILL.md"]
 
 # ── スケジュールジョブ ──────────────────────

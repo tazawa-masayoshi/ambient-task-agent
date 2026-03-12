@@ -298,8 +298,11 @@ impl Worker {
         let event: serde_json::Value =
             serde_json::from_str(&item.event_json).unwrap_or_default();
 
+        // スレッド返信先: thread_ts があればそちら、なければ message_ts 自体がスレッドの起点
+        let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+
         let slack = self.slack.clone();
-        slack.reply_thread(&item.channel, &item.message_ts, ":gear: 処理中...").await.ok();
+        slack.reply_thread(&item.channel, reply_ts, ":gear: 処理中...").await.ok();
 
         // ファイルダウンロード
         let files = super::ops::extract_slack_files_from_json(&event);
@@ -322,11 +325,11 @@ impl Worker {
         let repo_key = &item.repo_key;
         let message_text = crate::server::slack_events::extract_command(&item.message_text).to_string();
 
-        // 会話履歴を保存 & 取得
-        if let Err(e) = self.db.append_ops_context(&item.channel, &item.message_ts, repo_key, "user", &message_text) {
+        // 会話履歴を保存 & 取得（スレッドの ts で管理）
+        if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "user", &message_text) {
             tracing::warn!("Failed to save ops context (user): {}", e);
         }
-        let history = self.db.get_ops_context(&item.channel, &item.message_ts)?;
+        let history = self.db.get_ops_context(&item.channel, reply_ts)?;
 
         let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
         let ops_download_dir = repo_entry.ops_download_dir.clone();
@@ -347,7 +350,7 @@ impl Worker {
 
         match exec_result {
             Ok(output) => {
-                if let Err(e) = self.db.append_ops_context(&item.channel, &item.message_ts, repo_key, "assistant", &output) {
+                if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "assistant", &output) {
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
                 // 「対応不要」系の応答はスレッドに投稿しない（静かにスキップ）
@@ -356,7 +359,7 @@ impl Worker {
                     || output.contains("スコープ外");
                 if !is_no_action {
                     let detail = format!(":white_check_mark: *ops 完了*\n```\n{}\n```", output);
-                    slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                    slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
                 } else {
                     tracing::info!("ops item {} result: no action needed, skipping notification", item.id);
                 }
@@ -366,7 +369,7 @@ impl Worker {
                 let err_str = e.to_string();
                 if item.retry_count + 1 >= max_retries {
                     let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```", err_str);
-                    slack.reply_thread(&item.channel, &item.message_ts, &detail).await.ok();
+                    slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
                     self.db.mark_ops_failed(item.id, &err_str)?;
                 } else {
                     tracing::warn!("ops execution failed for item {} (retry {}): {}", item.id, item.retry_count, err_str);

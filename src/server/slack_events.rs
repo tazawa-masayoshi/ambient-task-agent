@@ -98,7 +98,7 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
                     Ok(msg) => {
                         let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                         tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                        enqueue_ops_request(state, &msg, channel, message_ts, text, repo_entry, "ready")?;
+                        enqueue_ops_request(state, &msg, channel, message_ts, None, text, repo_entry, "ready")?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);
@@ -139,21 +139,18 @@ async fn handle_app_mention(state: &Arc<AppState>, event: &serde_json::Value) ->
         .get("text")
         .and_then(|t| t.as_str())
         .unwrap_or_default();
-    let thread_ts = event
-        .get("thread_ts")
-        .or_else(|| event.get("ts"))
-        .and_then(|t| t.as_str())
-        .unwrap_or_default();
+    let event_ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or_default();
+    let event_thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
+    // スレッド返信先: thread_ts があればそれ、なければ ts 自体
+    let thread_ts = event_thread_ts.unwrap_or(event_ts);
 
     // メンション部分を除去してコマンドを抽出
     let command = extract_command(text);
     tracing::info!("App mention command: '{}' in {}", command, channel);
 
-    // ops チャンネルでのメンション → トップレベルのみキューに追加（スレッド内は通常処理へ）
-    if event.get("thread_ts").is_none() {
-        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-            return enqueue_ops_request(state, event, channel, thread_ts, text, repo_entry, "ready");
-        }
+    // ops チャンネルでのメンション → キューに追加
+    if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+        return enqueue_ops_request(state, event, channel, event_ts, event_thread_ts, text, repo_entry, "ready");
     }
 
     let slack = state.slack_client();
@@ -399,15 +396,42 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
 
     // ops チャンネル判定（トップレベル・スレッド返信の両方で使う）
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
+    let bot_mention = format!("<@{}", state.bot_user_id);
+    let has_mention = !state.bot_user_id.is_empty() && text.contains(&bot_mention);
 
-    // ops チャンネル: トップレベルのみキュー対象、スレッド返信は通常のコーディングモードへ
-    if thread_ts.is_none() {
-        if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-            if repo_entry.ops_monitor {
-                enqueue_ops_request(state, event, channel, message_ts, text, repo_entry, "pending")?;
+    if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
+        let sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
+        let is_admin = state.repos_config.defaults.ops_admin_user
+            .as_deref()
+            .is_some_and(|admin| admin == sender);
+
+        match (thread_ts, has_mention) {
+            // スレッド返信 + @メンション → admin のみ ops 即実行
+            (Some(tts), true) if is_admin => {
+                tracing::info!("ops thread mention by admin in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
             }
-            return Ok(());
+            (Some(_), true) => {
+                tracing::info!("ops thread mention by non-admin {} ignored", sender);
+            }
+            // トップレベル + @メンション → ops_monitor のチャンネルのみ即実行
+            (None, true) if repo_entry.ops_monitor => {
+                tracing::info!("ops top-level mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
+            }
+            (None, true) => {
+                tracing::debug!("ops_monitor=false, top-level mention ignored in {}", channel);
+            }
+            // トップレベル + メンションなし → 自動分類
+            (None, false) => {
+                if repo_entry.ops_monitor {
+                    enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
+                }
+            }
+            // スレッド返信 + メンションなし → 無視（人同士の会話）
+            (Some(_), false) => {}
         }
+        return Ok(());
     }
 
     if thread_ts.is_none() {
@@ -717,13 +741,14 @@ fn enqueue_ops_request(
     event: &serde_json::Value,
     channel: &str,
     message_ts: &str,
+    thread_ts: Option<&str>,
     text: &str,
     repo_entry: &crate::repo_config::RepoEntry,
     status: &str,
 ) -> Result<()> {
     let event_json = serde_json::to_string(event).unwrap_or_default();
     let id = state.db.enqueue_ops(
-        channel, message_ts, &repo_entry.key, text, &event_json, status,
+        channel, message_ts, thread_ts, &repo_entry.key, text, &event_json, status,
     )?;
     tracing::info!("Enqueued ops item {} (status={}, channel={})", id, status, channel);
     state.wake_worker();

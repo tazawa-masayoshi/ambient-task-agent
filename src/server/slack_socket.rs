@@ -11,10 +11,15 @@ pub async fn run_socket_mode(state: Arc<AppState>, app_token: String) {
     const MAX_RETRIES: u32 = 30;
     const MAX_BACKOFF_SECS: u64 = 60;
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client");
+
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        match connect_and_listen(&state, &app_token).await {
+        match connect_and_listen(&state, &app_token, &http_client).await {
             Ok(()) => {
                 // 正常切断（disconnect メッセージ等）→ カウンタリセット
                 consecutive_failures = 0;
@@ -45,10 +50,7 @@ pub async fn run_socket_mode(state: Arc<AppState>, app_token: String) {
 }
 
 /// apps.connections.open を呼んで WebSocket URL を取得
-async fn get_ws_url(app_token: &str) -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+async fn get_ws_url(client: &reqwest::Client, app_token: &str) -> anyhow::Result<String> {
     let resp = client
         .post("https://slack.com/api/apps.connections.open")
         .header("Authorization", format!("Bearer {}", app_token))
@@ -69,11 +71,11 @@ async fn get_ws_url(app_token: &str) -> anyhow::Result<String> {
 }
 
 /// WebSocket に接続してイベントを処理
-async fn connect_and_listen(state: &Arc<AppState>, app_token: &str) -> anyhow::Result<()> {
+async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client: &reqwest::Client) -> anyhow::Result<()> {
     // Slack は通常10秒間隔で ping を送るので、60秒無通信なら接続が死んでいると判断
     const READ_TIMEOUT_SECS: u64 = 60;
 
-    let ws_url = get_ws_url(app_token).await?;
+    let ws_url = get_ws_url(http_client, app_token).await?;
     tracing::info!("Socket Mode connecting to WebSocket...");
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
@@ -123,6 +125,7 @@ async fn connect_and_listen(state: &Arc<AppState>, app_token: &str) -> anyhow::R
                 }
 
                 let msg_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                tracing::debug!("Socket Mode received type={}", msg_type);
 
                 match msg_type {
                     "events_api" => {
@@ -166,6 +169,12 @@ async fn handle_events_api(state: &Arc<AppState>, payload: &serde_json::Value) {
     let event = payload
         .get("payload")
         .and_then(|p| p.get("event"));
+
+    let event_type = event
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("none");
+    tracing::debug!("Socket Mode event_type={}", event_type);
 
     if let Some(event) = event {
         let state = state.clone();

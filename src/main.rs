@@ -430,7 +430,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     let asana_config = load_asana_config()?;
 
     let db = db::Db::open(&server_config.db_path)?;
-    let repos_config = repo_config::ReposConfig::load(&server_config.repos_config_path)?;
+    let mut repos_config = repo_config::ReposConfig::load(&server_config.repos_config_path)?;
 
     // 旧パス → .agent/ へのマイグレーション
     if let Err(e) = worker::context::migrate_context_files(&repos_config.defaults.repos_base_dir) {
@@ -438,6 +438,27 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     }
 
     let slack_client = SlackClient::new(slack_config.clone());
+
+    // bot user ID 取得 + ops_channel のチャンネル名 → ID 解決
+    let bot_user_id = match slack_client.fetch_bot_user_id().await {
+        Ok(id) => {
+            tracing::info!("Bot user ID: {}", id);
+            id
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch bot user ID: {}", e);
+            String::new()
+        }
+    };
+    match slack_client.fetch_bot_channels().await {
+        Ok(channel_map) => {
+            tracing::info!("Fetched {} bot channels from Slack", channel_map.len());
+            repos_config.resolve_ops_channels(&channel_map);
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch bot channels: {}", e);
+        }
+    }
     let default_channel = repos_config.defaults.slack_channel.clone();
 
     let worker_notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -480,6 +501,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         slack_workspace: slack_config.workspace.clone(),
         worker_notify: worker_notify.clone(),
         runner_ctx: runner_ctx.clone(),
+        bot_user_id: bot_user_id.clone(),
     };
 
     // Google Calendar クライアント初期化
