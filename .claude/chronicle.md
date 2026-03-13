@@ -3,6 +3,8 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [03/13 17:01, end] -
+- [03/13 14:54, auto] jj pull
 - [03/13 14:46, end] ## 前回の会話履歴
 - [03/13 14:41, end] ## 前回の会話履歴
 - [03/12 20:56, end] jj pull
@@ -31,5 +33,3 @@
 - [03/04 18:34, auto] Implement the following plan:
 - [03/03 18:03, auto] Implement the following plan:
 - [03/03 14:44, auto] Implement the following plan:
-- [03/03 13:29, auto] Implement the following plan:
-- [03/03 12:01, auto] Implement the following plan:
