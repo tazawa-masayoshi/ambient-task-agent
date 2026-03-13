@@ -488,6 +488,10 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         backend: std::sync::Arc::new(claude::ClaudeCliBackend),
     };
 
+    if slack_config.signing_secret.is_none() {
+        tracing::warn!("SLACK_SIGNING_SECRET is not set — HTTP webhook signature verification is disabled. Safe if using Socket Mode only.");
+    }
+
     let app_state = server::http::AppState {
         db: db.clone(),
         repos_config: repos_config.clone(),

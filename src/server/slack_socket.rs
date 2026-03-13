@@ -20,10 +20,25 @@ pub async fn run_socket_mode(state: Arc<AppState>, app_token: String) {
 
     loop {
         match connect_and_listen(&state, &app_token, &http_client).await {
-            Ok(()) => {
-                // 正常切断（disconnect メッセージ等）→ カウンタリセット
-                consecutive_failures = 0;
-                tracing::info!("Socket Mode connection closed, reconnecting...");
+            Ok(established) => {
+                if established {
+                    // hello 受信後の正常切断 → カウンタリセット、最低1秒待って再接続
+                    consecutive_failures = 0;
+                    tracing::info!("Socket Mode connection closed, reconnecting in 1s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                } else {
+                    // hello 前の即 disconnect → バックオフ（古い接続のローテーション）
+                    consecutive_failures += 1;
+                    let backoff = std::cmp::min(
+                        1u64 << consecutive_failures.min(5),
+                        MAX_BACKOFF_SECS,
+                    );
+                    tracing::info!(
+                        "Socket Mode: disconnected before handshake ({}/{}), retrying in {}s...",
+                        consecutive_failures, MAX_RETRIES, backoff
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                }
             }
             Err(e) => {
                 consecutive_failures += 1;
@@ -34,7 +49,6 @@ pub async fn run_socket_mode(state: Arc<AppState>, app_token: String) {
                     );
                     return;
                 }
-                // エクスポネンシャルバックオフ: 1, 2, 4, 8, ... 秒（上限60秒）
                 let backoff = std::cmp::min(
                     1u64 << (consecutive_failures - 1),
                     MAX_BACKOFF_SECS,
@@ -70,8 +84,9 @@ async fn get_ws_url(client: &reqwest::Client, app_token: &str) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("No URL in apps.connections.open response"))
 }
 
-/// WebSocket に接続してイベントを処理
-async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client: &reqwest::Client) -> anyhow::Result<()> {
+/// WebSocket に接続してイベントを処理。
+/// 戻り値: Ok(true) = hello 受信後の正常切断, Ok(false) = hello 前の disconnect
+async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client: &reqwest::Client) -> anyhow::Result<bool> {
     // Slack は通常10秒間隔で ping を送るので、60秒無通信なら接続が死んでいると判断
     const READ_TIMEOUT_SECS: u64 = 60;
 
@@ -82,6 +97,7 @@ async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client:
     tracing::info!("Socket Mode connected");
 
     let (mut write, mut read) = ws_stream.split();
+    let mut established = false;
 
     loop {
         let msg = tokio::time::timeout(
@@ -135,10 +151,11 @@ async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client:
                         handle_interactive(state, &payload).await;
                     }
                     "disconnect" => {
-                        tracing::info!("Socket Mode received disconnect, will reconnect");
+                        tracing::info!("Socket Mode received disconnect (established={}), will reconnect", established);
                         break;
                     }
                     "hello" => {
+                        established = true;
                         tracing::info!("Socket Mode handshake complete");
                     }
                     _ => {
@@ -160,7 +177,7 @@ async fn connect_and_listen(state: &Arc<AppState>, app_token: &str, http_client:
         }
     }
 
-    Ok(())
+    Ok(established)
 }
 
 /// events_api タイプのペイロードを処理

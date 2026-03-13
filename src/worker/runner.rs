@@ -277,8 +277,15 @@ impl Worker {
     /// - pending: classify → actionable なら実行、そうでなければ skipped
     /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
     async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
-        // コンテンツベースのopsルーティング（全経路共通）
-        let repo_entry = match self.route_ops(&item).await {
+        // チャンネルが ops_channel に紐づいている場合はそのエントリを直接使う（ルーティング不要）
+        // 紐づいていない場合のみコンテンツベースルーティングにフォールバック
+        let repo_entry = if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
+            tracing::info!("ops item {} channel-matched to scope: {} ({})",
+                item.id, direct.key,
+                direct.ops_description.as_deref().unwrap_or("no description"));
+            direct.clone()
+        } else {
+            match self.route_ops(&item).await {
             Ok(Some(idx)) => {
                 let entry = self.repos_config.repo[idx].clone();
                 tracing::info!("ops item {} routed to scope: {} ({})",
@@ -292,18 +299,9 @@ impl Worker {
                 return Ok(());
             }
             Ok(None) => {
-                // ready アイテム: チャンネルのデフォルトスコープにフォールバック
-                match self.repos_config.find_repo_by_ops_channel(&item.channel) {
-                    Some(r) => {
-                        tracing::info!("ops item {} routing: no match, fallback to channel default", item.id);
-                        r.clone()
-                    }
-                    None => {
-                        let err = format!("No matching ops scope for item {}", item.id);
-                        self.db.mark_ops_failed(item.id, &err)?;
-                        return Ok(());
-                    }
-                }
+                let err = format!("No matching ops scope for item {}", item.id);
+                self.db.mark_ops_failed(item.id, &err)?;
+                return Ok(());
             }
             Err(e) => {
                 tracing::warn!("ops routing failed for item {}: {}", item.id, e);
@@ -314,6 +312,7 @@ impl Worker {
                 }
                 return Ok(());
             }
+        }
         };
 
         // 実行
@@ -435,9 +434,15 @@ impl Worker {
                             "elements": [
                                 {
                                     "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{2705} 承認（Asana登録）" },
+                                    "text": { "type": "plain_text", "text": "\u{2705} 承認（自動実行）" },
                                     "style": "primary",
                                     "action_id": "ops_inception_approve",
+                                    "value": item.id.to_string()
+                                },
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "\u{1f4cb} Asana登録のみ" },
+                                    "action_id": "ops_inception_asana",
                                     "value": item.id.to_string()
                                 },
                                 {
@@ -539,7 +544,7 @@ impl Worker {
             Err(e) => {
                 let err_str = e.to_string();
                 if item.retry_count + 1 >= max_retries {
-                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```", err_str);
+                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}", err_str, ERROR_LOG_HINT);
                     slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
                     self.db.mark_ops_failed(item.id, &err_str)?;
                 } else {
@@ -779,7 +784,7 @@ impl Worker {
             Err(e) => {
                 self.db.set_error(task.id, &e.to_string())?;
                 self.slack
-                    .reply_thread(channel, &thread_ts, &format!(":x: エラー: {}", e))
+                    .reply_thread(channel, &thread_ts, &format!(":x: エラー: {}{}", e, ERROR_LOG_HINT))
                     .await
                     .ok();
                 return Err(e);
@@ -877,7 +882,7 @@ impl Worker {
                     .reply_thread(
                         channel,
                         &thread_ts,
-                        &format!(":x: 実装計画の作成に失敗しました\n```\n{}\n```", e),
+                        &format!(":x: 実装計画の作成に失敗しました\n```\n{}\n```{}", e, ERROR_LOG_HINT),
                     )
                     .await
                     .ok();
@@ -973,8 +978,8 @@ impl Worker {
 
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
-                ":x: 実行失敗\n```\n{}\n```",
-                output_summary
+                ":x: 実行失敗\n```\n{}\n```{}",
+                output_summary, ERROR_LOG_HINT
             );
             self.slack
                 .reply_thread(channel, thread_ts, &msg)
@@ -1100,7 +1105,7 @@ impl Worker {
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
-                let msg = format!(":x: 実行失敗\n```\n{}\n```", output_summary);
+                let msg = format!(":x: 実行失敗\n```\n{}\n```{}", output_summary, ERROR_LOG_HINT);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
                     .await
@@ -1110,7 +1115,7 @@ impl Worker {
             Err(e) => {
                 self.db
                     .set_error(task.id, &format!("Execution error: {}", e))?;
-                let msg = format!(":x: 実行エラー\n```\n{}\n```", e);
+                let msg = format!(":x: 実行エラー\n```\n{}\n```{}", e, ERROR_LOG_HINT);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
                     .await
@@ -1346,8 +1351,8 @@ impl Worker {
                         .set_error(task.id, &format!("CI failed after {} retries: {}", new_count, summary))?;
 
                     let msg = format!(
-                        ":x: CI 失敗（リトライ上限 {} 回に到達）\n```\n{}\n```",
-                        max_retry, summary
+                        ":x: CI 失敗（リトライ上限 {} 回に到達）\n```\n{}\n```{}",
+                        max_retry, summary, ERROR_LOG_HINT
                     );
                     self.slack
                         .reply_thread(channel, thread_ts, &msg)
@@ -1502,7 +1507,7 @@ impl Worker {
                     .reply_thread(
                         channel,
                         thread_ts,
-                        &format!(":x: CI 修正の実行中にエラー: {}", e),
+                        &format!(":x: CI 修正の実行中にエラー: {}{}", e, ERROR_LOG_HINT),
                     )
                     .await
                     .ok();
@@ -1665,4 +1670,6 @@ fn ensure_repo_agent_rules(repo_path: &Path) {
 pub(crate) fn truncate_for_slack(text: &str, max_len: usize) -> &str {
     crate::claude::truncate_str(text, max_len)
 }
+
+const ERROR_LOG_HINT: &str = "\n_詳細ログ: `journalctl --user -u sdtab-ambient-task-agent -n 50`_";
 

@@ -160,9 +160,15 @@ fn build_ops_prompt(req: &OpsRequest, history: &[OpsMessage], download_dir: Opti
             .iter()
             .map(|m| format!("[{}] {}", m.role, m.content))
             .collect();
-        parts.push(format!("## 前回の会話履歴\n{}", history_text.join("\n\n")));
+        parts.push(format!(
+            "## 前回の会話履歴\n<conversation_history>\n{}\n</conversation_history>",
+            history_text.join("\n\n")
+        ));
     }
-    parts.push(format!("## Slackメッセージ\n{}", req.message_text));
+    parts.push(format!(
+        "## Slackメッセージ\n<user_input>\n{}\n</user_input>",
+        req.message_text
+    ));
     if !req.files.is_empty() {
         if let Some(dir) = download_dir {
             let file_list: Vec<String> = req

@@ -14,6 +14,12 @@ struct SlackActionPayload {
     actions: Vec<SlackAction>,
     channel: Option<ChannelInfo>,
     message: Option<MessageInfo>,
+    user: Option<UserInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInfo {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +99,7 @@ pub async fn handle_slack_action(
         .message
         .as_ref()
         .and_then(|m| m.thread_ts.clone());
+    let user_id = payload.user.map(|u| u.id);
 
     // 非同期で処理
     let state_clone = state.clone();
@@ -105,6 +112,7 @@ pub async fn handle_slack_action(
             &channel_id,
             message_ts.as_deref(),
             thread_ts.as_deref(),
+            user_id.as_deref(),
         )
         .await
         {
@@ -148,6 +156,7 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
         .message
         .as_ref()
         .and_then(|m| m.thread_ts.as_deref());
+    let user_id = action_payload.user.as_ref().map(|u| u.id.as_str());
 
     process_action(
         state,
@@ -156,6 +165,7 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
         channel,
         message_ts,
         thread_ts,
+        user_id,
     )
     .await
 }
@@ -167,6 +177,7 @@ async fn process_action(
     channel: &str,
     message_ts: Option<&str>,
     thread_ts: Option<&str>,
+    user_id: Option<&str>,
 ) -> anyhow::Result<()> {
     // ops 系アクションは task_id ではなく ops_queue の id を使う
     if action_id == "ops_resolve" {
@@ -175,7 +186,27 @@ async fn process_action(
     if action_id == "ops_escalate" {
         return process_ops_escalate(state, action_value, channel, message_ts, thread_ts).await;
     }
-    // Inception モード 承認ゲート
+    // Inception モード 承認ゲート（admin 権限チェック）
+    if action_id.starts_with("ops_inception_") {
+        if let Some(admin) = state.repos_config.defaults.ops_admin_user.as_deref() {
+            let actor = user_id.unwrap_or_default();
+            if actor != admin {
+                tracing::warn!(
+                    "inception action denied: user {} is not admin {} for action {}",
+                    actor, admin, action_id,
+                );
+                if let Some(msg_ts) = message_ts {
+                    let slack = state.slack_client();
+                    slack.reply_thread(
+                        channel,
+                        msg_ts,
+                        &format!(":no_entry: この操作は管理者 (<@{}>) のみ実行できます。", admin),
+                    ).await.ok();
+                }
+                return Ok(());
+            }
+        }
+    }
     if action_id == "ops_inception_approve" {
         return process_ops_inception_approve(state, action_value, channel, message_ts).await;
     }
@@ -184,6 +215,9 @@ async fn process_action(
     }
     if action_id == "ops_inception_cancel" {
         return process_ops_inception_cancel(state, action_value, channel, message_ts).await;
+    }
+    if action_id == "ops_inception_asana" {
+        return process_ops_inception_asana(state, action_value, channel, message_ts).await;
     }
 
     let task_id: i64 = action_value
@@ -619,7 +653,7 @@ async fn process_ops_inception_revise(
         return Ok(());
     }
 
-    // ボタンを更新
+    // ボタンを更新（修正待ち状態を表示）
     if let Some(msg_ts) = message_ts {
         let slack = state.slack_client();
         let updated_blocks = serde_json::json!([
@@ -627,32 +661,21 @@ async fn process_ops_inception_revise(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": ":arrows_counterclockwise: *修正中... ターン1からやり直します*"
+                    "text": ":arrows_counterclockwise: *修正リクエスト — スレッドに修正内容を返信してください*"
                 }
             }
         ]);
         slack
-            .update_blocks(channel, msg_ts, &updated_blocks, "修正中...")
+            .update_blocks(channel, msg_ts, &updated_blocks, "修正待ち...")
             .await
             .ok();
     }
 
-    // ops_contexts をクリア（スレッド履歴をリセットしてターン1に戻す）
-    // runner.rs と同じロジックで reply_ts を決定（item ベース統一）
     let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
-    state.db.clear_ops_context(channel, reply_ts)?;
 
-    // ops_queue に新しいアイテムとして再エンキュー
-    let new_id = state.db.enqueue_ops(
-        channel,
-        &format!("{}_revise_{}", item.message_ts, ops_id),
-        item.thread_ts.as_deref().or(Some(reply_ts)),
-        &item.repo_key,
-        &item.message_text,
-        &item.event_json,
-        "ready",
-    )?;
-    tracing::info!("inception revise: re-enqueued as ops item {} from ops item {}", new_id, ops_id);
+    // ops_contexts は保持（Turn2 再実行時に履歴＋修正フィードバックをコンテキストとして使う）
+    // 再エンキューもしない — ユーザーのスレッド返信を待ち、
+    // slack_events.rs の Inception スレッド返信ハンドリングで自動エンキューされる
 
     state.db.resolve_ops(ops_id)?;
 
@@ -661,12 +684,120 @@ async fn process_ops_inception_revise(
         .reply_thread(
             channel,
             reply_ts,
-            ":arrows_counterclockwise: フィードバックをもとに要件定義をやり直します。少々お待ちください...",
+            ":pencil2: 修正内容をこのスレッドに返信してください。返信をもとに要件定義をやり直します。",
         )
         .await
         .ok();
 
-    state.wake_worker();
+    Ok(())
+}
+
+/// ops_inception_asana ボタンの処理: TASKS_JSON をローカル DB に登録（自動実行なし）
+async fn process_ops_inception_asana(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    let item = match state.db.get_ops_item(ops_id)? {
+        Some(i) => i,
+        None => {
+            tracing::warn!("inception asana: ops item {} not found", ops_id);
+            return Ok(());
+        }
+    };
+
+    if item.channel != channel {
+        tracing::warn!("inception asana: channel mismatch ops_id={}", ops_id);
+        return Ok(());
+    }
+
+    // ボタンを更新
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":clipboard: *Asana 登録中...*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "Asana 登録中...")
+            .await
+            .ok();
+    }
+
+    let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+    let history = state.db.get_ops_context(channel, reply_ts)?;
+    let last_output = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.as_str())
+        .unwrap_or(&item.message_text);
+
+    let tasks = crate::worker::ops::extract_tasks_json(last_output);
+    let slack = state.slack_client();
+
+    if tasks.len() > 50 {
+        tracing::warn!("inception asana: too many tasks ({}) from ops item {}", tasks.len(), ops_id);
+    }
+    let tasks = if tasks.len() > 50 { &tasks[..50] } else { &tasks[..] };
+
+    if tasks.is_empty() {
+        let task_name = crate::claude::truncate_str(&item.message_text, 100);
+        let task_id = state.db.create_task_from_ops(
+            ops_id, task_name, last_output, &item.repo_key, channel, reply_ts,
+        )?;
+        // 'registered' にして worker に拾わせない
+        state.db.update_status(task_id, "registered")?;
+        tracing::info!("inception asana: registered task #{} (single, no-exec) from ops item {}", task_id, ops_id);
+        slack
+            .reply_thread(
+                channel,
+                reply_ts,
+                &format!(":clipboard: タスクを登録しました (task #{})\n_※ 自動実行なし — Asana 連携は今後実装予定_", task_id),
+            )
+            .await
+            .ok();
+    } else {
+        let mut registered_ids = Vec::new();
+        for task_json in tasks {
+            let title = task_json.get("title").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("Inception task");
+            let description = task_json.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+            let task_id = state.db.create_task_from_ops(
+                ops_id, title, description, &item.repo_key, channel, reply_ts,
+            )?;
+            state.db.update_status(task_id, "registered")?;
+            registered_ids.push((task_id, title.to_string()));
+            tracing::info!("inception asana: registered task #{} '{}' (no-exec) from ops item {}", task_id, title, ops_id);
+        }
+        let task_list: Vec<String> = registered_ids
+            .iter()
+            .map(|(id, title)| format!("• #{} {}", id, title))
+            .collect();
+        slack
+            .reply_thread(
+                channel,
+                reply_ts,
+                &format!(
+                    ":clipboard: {} 件のタスクを登録しました:\n{}\n_※ 自動実行なし — Asana 連携は今後実装予定_",
+                    registered_ids.len(),
+                    task_list.join("\n")
+                ),
+            )
+            .await
+            .ok();
+    }
+
+    state.db.resolve_ops(ops_id)?;
     Ok(())
 }
 
