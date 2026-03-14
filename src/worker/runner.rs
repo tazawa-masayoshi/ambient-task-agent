@@ -11,7 +11,7 @@ use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 
-use super::{analyzer, context, executor, priority, scheduler, task_file, workflow, workspace};
+use super::{context, executor, priority, scheduler, task_file, workflow, workspace};
 
 /// ハートビート間隔の下限
 const MIN_HEARTBEAT_SECS: u64 = 10;
@@ -157,23 +157,45 @@ impl Worker {
     fn process_tasks(self: &Arc<Self>) -> bool {
         let mut had_error = false;
 
-        // 1. new(source=asana) → planning（Slack 起点タスクは step 5 で処理するのでスキップ）
+        // 1. new → classify → executing / conversing
         match self.db.get_new_task() {
-            Ok(Some(task)) if task.source != "slack" => {
-                tracing::info!("Planning task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if self.db.update_status(task.id, "planning").is_ok() {
-                    let task_id = task.id;
-                    self.spawn_task(task_id, |w| async move { w.plan_task(task).await });
+            Ok(Some(task)) => {
+                let classification = classify_new_task(&task, &self.repos_config);
+                match classification {
+                    TaskClassification::Execute => {
+                        tracing::info!("Auto-executing task: {} ({})",
+                            task.asana_task_name, task.asana_task_gid);
+                        if self.db.update_status(task.id, "executing").is_ok() {
+                            let task_id = task.id;
+                            self.spawn_task(task_id, |w| async move {
+                                w.execute_approved_task(task).await
+                            });
+                        }
+                    }
+                    TaskClassification::Converse => {
+                        tracing::info!("Starting conversation for task: {} ({})",
+                            task.asana_task_name, task.asana_task_gid);
+                        if self.db.update_status(task.id, "conversing").is_ok() {
+                            let task_id = task.id;
+                            self.spawn_task(task_id, |w| async move {
+                                w.start_conversing_task(task).await
+                            });
+                        }
+                    }
                 }
             }
-            Ok(_) => {}
+            Ok(None) => {}
             Err(e) => {
                 tracing::error!("Failed to fetch new task: {}", e);
                 had_error = true;
             }
         }
 
-        // 2. approved → executing（手動承認後、--resume で実行）
+        // 2. conversing タスクの継続処理（ユーザー返信があれば次の Claude ターンを実行）
+        had_error |= self.process_conversing_tasks();
+
+        // 2.5 (並存期間) approved / auto_approved → executing
+        // v12 マイグレーション完了後に削除
         match self.db.get_approved_task() {
             Ok(Some(task)) => {
                 tracing::info!("Executing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
@@ -188,19 +210,6 @@ impl Worker {
                 had_error = true;
             }
         }
-
-        // 2.5. 全アクティブタスクの優先度を再計算
-        if let Ok(active_tasks) = self.db.get_active_tasks() {
-            let now = chrono::Utc::now();
-            for t in &active_tasks {
-                let score = priority::calculate_priority_score(t, &now);
-                if let Err(e) = self.db.update_priority_score(t.id, score) {
-                    tracing::warn!("Failed to update priority for task {}: {}", t.id, e);
-                }
-            }
-        }
-
-        // 3. auto_approved → executing（自動実行、--resume で実行）
         match self.db.get_auto_approved_task() {
             Ok(Some(task)) => {
                 tracing::info!("Auto-executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
@@ -216,6 +225,17 @@ impl Worker {
             }
         }
 
+        // 3. 全アクティブタスクの優先度を再計算
+        if let Ok(active_tasks) = self.db.get_active_tasks() {
+            let now = chrono::Utc::now();
+            for t in &active_tasks {
+                let score = priority::calculate_priority_score(t, &now);
+                if let Err(e) = self.db.update_priority_score(t.id, score) {
+                    tracing::warn!("Failed to update priority for task {}: {}", t.id, e);
+                }
+            }
+        }
+
         // 4. ci_pending タスク → CI 結果確認 → done or リトライ
         match self.db.get_ci_pending_task() {
             Ok(Some(task)) => {
@@ -226,24 +246,6 @@ impl Worker {
             Ok(None) => {}
             Err(e) => {
                 tracing::error!("Failed to fetch ci_pending task: {}", e);
-                had_error = true;
-            }
-        }
-
-        // 5. new(source=slack) → conversing（Slack 起点タスクは明確化フロー優先）
-        match self.db.get_new_task() {
-            Ok(Some(task)) if task.source == "slack" => {
-                tracing::info!("Slack-sourced task {} → conversing", task.id);
-                if self.db.update_status(task.id, "conversing").is_ok() {
-                    let task_id = task.id;
-                    self.spawn_task(task_id, |w| async move {
-                        w.start_conversing_task(task).await
-                    });
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("Failed to fetch new task (slack check): {}", e);
                 had_error = true;
             }
         }
@@ -767,155 +769,7 @@ impl Worker {
         had_error
     }
 
-    /// new → planning → proposed/auto_approved: 実装計画を生成して Slack 投稿
-    async fn plan_task(&self, task: CodingTask) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-
-        // Step 1: Slack 親メッセージ送信（再生成時は既存スレッドを再利用）
-        let thread_ts = if let Some(ref existing_ts) = task.slack_thread_ts {
-            self.slack
-                .reply_thread(channel, existing_ts, ":arrows_counterclockwise: 計画を再生成中...")
-                .await
-                .ok();
-            existing_ts.clone()
-        } else {
-            let parent_msg = format!(
-                ":inbox_tray: タスクを受信しました\n*{}*\nhttps://app.asana.com/0/0/{}",
-                task.asana_task_name, task.asana_task_gid
-            );
-            match self.slack.post_message(channel, &parent_msg).await {
-                Ok(ts) => {
-                    self.db.update_slack_thread(task.id, channel, &ts)?;
-                    ts
-                }
-                Err(e) => {
-                    tracing::error!("Failed to post Slack message: {}", e);
-                    self.db
-                        .set_error(task.id, &format!("Slack post failed: {}", e))?;
-                    return Err(e);
-                }
-            }
-        };
-
-        // Step 2: リポジトリパスを解決（status は spawn 前に "planning" に更新済み）
-        let repo_path = match self.resolve_repo_path(&task) {
-            Ok(p) => p,
-            Err(e) => {
-                self.db.set_error(task.id, &e.to_string())?;
-                self.slack
-                    .reply_thread(channel, &thread_ts, &format!(":x: エラー: {}{}", e, ERROR_LOG_HINT))
-                    .await
-                    .ok();
-                return Err(e);
-            }
-        };
-
-        // Step 4: claude -p で実装計画生成（Plan mode）
-        let notes = task.description.as_deref().unwrap_or("");
-        self.slack
-            .reply_thread(channel, &thread_ts, ":brain: 実装計画を作成中...")
-            .await
-            .ok();
-
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let (work_context, work_memory) = prepare_repo_context(base_dir, &repo_path);
-        let wc = context::WorkContext {
-            repo_path: repo_path.clone(),
-            max_turns: self.repos_config.defaults.claude_max_plan_turns,
-            soul: context::merged_soul(base_dir, Some(&repo_path)),
-            skill: context::read_skill(base_dir),
-            context: work_context,
-            memory: work_memory,
-        };
-
-        let log_dir = self.log_dir();
-        match analyzer::plan_task(
-            &task.asana_task_name,
-            notes,
-            &wc,
-            Some(&log_dir),
-            &self.runner_ctx,
-        )
-        .await
-        {
-            Ok(plan_result) => {
-                self.db.update_analysis(task.id, &plan_result.plan_text)?;
-                if let Some(ref c) = plan_result.complexity {
-                    self.db.update_complexity(task.id, c)?;
-                    tracing::info!("Task {} complexity: {}", task.id, c);
-                }
-
-                // session_id を保存（--resume で Act mode に使う）
-                if let Some(ref sid) = plan_result.session_id {
-                    self.db.update_session_id(task.id, sid)?;
-                    tracing::info!("Task {} session_id saved: {}", task.id, sid);
-                }
-
-                // auto_execute 判定
-                let is_auto_execute = task
-                    .repo_key
-                    .as_deref()
-                    .and_then(|key| self.repos_config.find_repo_by_key(key))
-                    .map(|r| r.auto_execute)
-                    .unwrap_or(false);
-
-                if is_auto_execute {
-                    // ボタンなしで情報投稿 → auto_approved へ（即実行）
-                    let plan_display = truncate_for_slack(&plan_result.plan_text, 2800);
-                    let blocks = build_info_blocks(plan_display);
-                    let plan_ts = self
-                        .slack
-                        .post_blocks(channel, &thread_ts, &blocks, "実装計画が完成しました（自動実行されます）")
-                        .await?;
-                    self.db.update_plan_ts(task.id, &plan_ts)?;
-                    self.db.update_status(task.id, "auto_approved")?;
-
-                    tracing::info!(
-                        "Plan posted for task {} (auto_execute, plan_ts: {})",
-                        task.asana_task_gid,
-                        plan_ts
-                    );
-                } else {
-                    // 承認待ち: ボタン付き投稿 → proposed
-                    self.db.update_status(task.id, "proposed")?;
-
-                    let plan_display = truncate_for_slack(&plan_result.plan_text, 2800);
-                    let blocks = build_proposal_blocks(plan_display);
-                    let plan_ts = self
-                        .slack
-                        .post_blocks(channel, &thread_ts, &blocks, "実装計画が完成しました（操作してください）")
-                        .await?;
-                    self.db.update_plan_ts(task.id, &plan_ts)?;
-
-                    tracing::info!(
-                        "Plan posted for task {} (plan_ts: {})",
-                        task.asana_task_gid,
-                        plan_ts
-                    );
-                }
-            }
-            Err(e) => {
-                let err_msg = format!("Planning failed: {}", e);
-                self.db.set_error(task.id, &err_msg)?;
-                self.slack
-                    .reply_thread(
-                        channel,
-                        &thread_ts,
-                        &format!(":x: 実装計画の作成に失敗しました\n```\n{}\n```{}", e, ERROR_LOG_HINT),
-                    )
-                    .await
-                    .ok();
-                tracing::error!("{}", err_msg);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// approved/auto_approved → executing → ci_pending/done: Plan mode の続きを Act mode で実行
+    /// approved/auto_approved/executing → ci_pending/done: タスクを実行
     ///
     /// session_id があれば --resume で Plan セッションを継続、なければフルプロンプトで実行。
     /// repo_entry があれば worktree 隔離実行、なければ直接実行。
@@ -1284,62 +1138,143 @@ impl Worker {
         Ok(())
     }
 
-    /// Slack 起点の新規タスクを conversing ステータスに遷移させ、ユーザーに確認を求める
+    /// conversing タスクの継続処理。ユーザー返信があれば次の Claude ターンを spawn する。
+    fn process_conversing_tasks(self: &Arc<Self>) -> bool {
+        match self.db.get_conversing_tasks_needing_response() {
+            Ok(tasks) => {
+                for task in tasks {
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move {
+                        w.continue_conversing_task(task).await
+                    });
+                }
+                false
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch conversing tasks: {}", e);
+                true
+            }
+        }
+    }
+
+    /// conversing 開始: Slack スレッド作成 + 要件ヒアリング質問生成
     async fn start_conversing_task(&self, task: CodingTask) -> Result<()> {
         let channel = task
             .slack_channel
             .as_deref()
             .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
 
-        // Block Kit: 実行開始 / 指示追加 / スキップ の3ボタン
-        let blocks = serde_json::json!([
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": format!(
-                        ":speech_balloon: タスクを受信しました\n*{}*\n\n要件を確認してください。実行してよければ「実行開始」を押してください。",
-                        task.asana_task_name
-                    )
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "実行開始" },
-                        "style": "primary",
-                        "action_id": "task_execute",
-                        "value": task.id.to_string()
-                    },
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "指示追加" },
-                        "action_id": "task_converse",
-                        "value": task.id.to_string()
-                    },
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "スキップ" },
-                        "action_id": "task_skip",
-                        "value": task.id.to_string()
-                    }
-                ]
-            }
-        ]);
+        // 1. Slack スレッドを作成（まだなければ）
+        let thread_ts = if let Some(ref existing_ts) = task.slack_thread_ts {
+            existing_ts.clone()
+        } else {
+            let msg = format!(
+                ":speech_balloon: *要件ヒアリング開始*\n*{}*",
+                task.asana_task_name
+            );
+            let ts = self.slack.post_message(channel, &msg).await?;
+            self.db.update_slack_thread(task.id, channel, &ts)?;
+            ts
+        };
 
-        if let Err(e) = self
-            .slack
-            .post_blocks(channel, thread_ts, &blocks, "タスク確認")
-            .await
-        {
-            tracing::warn!("Failed to post conversing blocks for task {}: {}", task.id, e);
-            // Slack 送信失敗でも conversing のままにしておく
+        // 2. converse_thread_ts を設定
+        self.db.update_converse_thread_ts(task.id, &thread_ts)?;
+
+        // 3. ops_contexts にタスク情報を追加
+        let repo_key = task.repo_key.as_deref().unwrap_or("default");
+        let initial_context = format!(
+            "タスク: {}\n説明: {}",
+            task.asana_task_name,
+            task.description.as_deref().unwrap_or("(なし)")
+        );
+        self.db.append_ops_context(channel, &thread_ts, repo_key, "user", &initial_context)?;
+
+        // 4. Inception Turn1 相当のプロンプトで Claude を実行（要件ヒアリング質問生成）
+        let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
+            std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
+        });
+        let history = self.db.get_ops_context(channel, &thread_ts)?;
+        let soul = context::read_soul(&self.repos_config.defaults.repos_base_dir);
+        let log_dir = self.log_dir();
+
+        let req = super::ops::OpsRequest {
+            message_text: initial_context,
+            files: vec![],
+        };
+
+        let output = super::ops::execute_ops(
+            &req, &repo_path, &[], &soul,
+            5, Some(&log_dir), &self.runner_ctx, &history, None,
+            super::ops::OpsExecMode::InceptionTurn1,
+        ).await?;
+
+        // 5. assistant 出力を保存
+        self.db.append_ops_context(channel, &thread_ts, repo_key, "assistant", &output)?;
+
+        // 6. 質問を Slack スレッドに投稿（conversing ボタン付き）
+        let truncated = crate::claude::truncate_str(&output, 2800);
+        let blocks = build_conversing_blocks(task.id, truncated);
+        self.slack.post_blocks(channel, &thread_ts, &blocks,
+            &format!(":speech_balloon: {}", truncated)).await?;
+
+        tracing::info!("Task {} is now conversing, waiting for user reply", task.id);
+        Ok(())
+    }
+
+    /// conversing 継続: ユーザー返信を受けて次の Claude ターンを実行
+    async fn continue_conversing_task(&self, task: CodingTask) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.converse_thread_ts.as_deref()
+            .or(task.slack_thread_ts.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("No converse_thread_ts for task {}", task.id))?;
+
+        let repo_key = task.repo_key.as_deref().unwrap_or("default");
+        let history = self.db.get_ops_context(channel, thread_ts)?;
+
+        let latest_user_msg = history.iter().rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
+            std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
+        });
+        let soul = context::read_soul(&self.repos_config.defaults.repos_base_dir);
+        let log_dir = self.log_dir();
+
+        let req = super::ops::OpsRequest {
+            message_text: latest_user_msg.to_string(),
+            files: vec![],
+        };
+
+        // 常に InceptionTurn2 相当（要件確認の継続）
+        let output = super::ops::execute_ops(
+            &req, &repo_path, &[], &soul,
+            5, Some(&log_dir), &self.runner_ctx, &history, None,
+            super::ops::OpsExecMode::InceptionTurn2,
+        ).await?;
+
+        // assistant 出力を保存
+        self.db.append_ops_context(channel, thread_ts, repo_key, "assistant", &output)?;
+
+        // REQUIREMENTS_CONFIRMED: 検出 → 自動的に executing に遷移
+        if output.contains("REQUIREMENTS_CONFIRMED:") {
+            self.db.update_status(task.id, "executing")?;
+            self.db.update_analysis(task.id, &output)?;
+            self.slack.reply_thread(channel, thread_ts,
+                ":white_check_mark: 要件が確定しました。実行を開始します...").await.ok();
+            return Ok(());
         }
 
-        tracing::info!("Task {} is now conversing, waiting for user confirmation", task.id);
+        // 通常の会話継続: 応答を Slack に投稿（conversing ボタン付き）
+        let truncated = crate::claude::truncate_str(&output, 2800);
+        let blocks = build_conversing_blocks(task.id, truncated);
+        self.slack.post_blocks(channel, thread_ts, &blocks,
+            &format!(":speech_balloon: {}", truncated)).await?;
+
         Ok(())
     }
 
@@ -1602,49 +1537,7 @@ impl Worker {
     }
 }
 
-/// Block Kit の計画表示ブロック（承認はスレッド返信で行う）
-fn build_proposal_blocks(plan_text: &str) -> serde_json::Value {
-    serde_json::json!([
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": format!(":clipboard: *実装計画*\n\n{}", plan_text)
-            }
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": "スレッドに返信して操作: `ok` 承認 / `go` 即実行 / `ng` 却下 / `再生成` やり直し"
-                }
-            ]
-        }
-    ])
-}
-
-/// Block Kit の情報表示ブロック（ボタンなし、auto_execute 用）
-fn build_info_blocks(plan_text: &str) -> serde_json::Value {
-    serde_json::json!([
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": format!(":clipboard: *実装計画*\n\n{}", plan_text)
-            }
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": ":gear: auto_execute が有効なため、worktree で自動実行されます"
-                }
-            ]
-        }
-    ])
-}
+// 旧 build_proposal_blocks / build_info_blocks は削除（conversing フローに置き換え済み）
 
 /// Block Kit の実行中ブロック（ストップボタン付き）
 fn build_executing_blocks(task_id: i64, message: &str) -> serde_json::Value {
@@ -1684,14 +1577,7 @@ fn setup_repo_dirs(repo_path: &Path) {
     ensure_repo_agent_rules(repo_path);
 }
 
-/// リポジトリの初期セットアップ + merged context/memory を返す
-fn prepare_repo_context(base_dir: &str, repo_path: &Path) -> (String, String) {
-    setup_repo_dirs(repo_path);
-    (
-        context::merged_context(base_dir, Some(repo_path)),
-        context::merged_memory(base_dir, Some(repo_path)),
-    )
-}
+// 旧 prepare_repo_context は削除（start_conversing_task で直接構築）
 
 /// .claude/rules/agent.md が無ければデフォルトルールを生成
 fn ensure_repo_agent_rules(repo_path: &Path) {
@@ -1770,4 +1656,122 @@ fn count_business_days(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
 }
 
 const ERROR_LOG_HINT: &str = "\n_詳細ログ: `journalctl --user -u sdtab-ambient-task-agent -n 50`_";
+
+// ============================================================================
+// タスク分類（new → executing / conversing）
+// ============================================================================
+
+enum TaskClassification {
+    Execute,
+    Converse,
+}
+
+/// new タスクを executing（即実行）か conversing（要件ヒアリング）に分類
+fn classify_new_task(task: &CodingTask, repos_config: &ReposConfig) -> TaskClassification {
+    let is_slack_origin = task.asana_task_gid.starts_with("slack_")
+        || task.asana_task_gid.starts_with("ops_");
+
+    let has_repo = task.repo_key.is_some();
+
+    let auto_execute = task.repo_key.as_deref()
+        .and_then(|key| repos_config.find_repo_by_key(key))
+        .map(|r| r.auto_execute)
+        .unwrap_or(false);
+
+    if is_slack_origin {
+        // Slack/ops 入口: analysis_text に要件定義が入っていれば即実行
+        if task.analysis_text.is_some() {
+            TaskClassification::Execute
+        } else {
+            TaskClassification::Converse
+        }
+    } else {
+        // Asana 入口: auto_execute フラグを尊重
+        if auto_execute && has_repo {
+            TaskClassification::Execute
+        } else {
+            TaskClassification::Converse
+        }
+    }
+}
+
+// ============================================================================
+// Block Kit ヘルパー（conversing / manual）
+// ============================================================================
+
+/// conversing 状態のボタンレイアウト: [実行開始] [指示追加] [手動修正] [スキップ]
+fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(":speech_balloon: {}", message)
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "実行開始" },
+                    "style": "primary",
+                    "action_id": "task_execute",
+                    "value": task_id.to_string()
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "指示追加" },
+                    "action_id": "task_add_instruction",
+                    "value": task_id.to_string()
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "手動修正" },
+                    "action_id": "task_manual",
+                    "value": task_id.to_string()
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "スキップ" },
+                    "style": "danger",
+                    "action_id": "task_skip",
+                    "value": task_id.to_string()
+                }
+            ]
+        }
+    ])
+}
+
+/// manual 状態のボタンレイアウト: [再開] [完了]
+#[allow(dead_code)]
+fn build_manual_blocks(task_id: i64) -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":wrench: *手動対応モード*\nターミナルで作業を行い、完了後に以下のボタンを押してください:"
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "再開" },
+                    "style": "primary",
+                    "action_id": "task_resume",
+                    "value": task_id.to_string()
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "完了" },
+                    "action_id": "task_done",
+                    "value": task_id.to_string()
+                }
+            ]
+        }
+    ])
+}
 

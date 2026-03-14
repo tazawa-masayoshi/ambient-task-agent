@@ -1,4 +1,3 @@
-pub mod analyzer;
 pub mod context;
 pub mod executor;
 pub mod ops;

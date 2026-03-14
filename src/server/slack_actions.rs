@@ -392,54 +392,95 @@ async fn process_action(
         }
 
         "task_execute" => {
-            // conversing/proposed → approved（worker ループが executing に遷移して実行）
-            if task.status == "conversing" || task.status == "proposed" || task.status == "manual" {
-                state.db.update_status(task.id, "approved")?;
+            // conversing/manual → executing（直接実行開始）
+            if matches!(task.status.as_str(), "conversing" | "proposed" | "manual") {
+                state.db.update_status(task.id, "executing")?;
                 slack
-                    .reply_thread(channel, reply_ts, ":white_check_mark: 実行を開始します...")
+                    .reply_thread(channel, reply_ts, ":rocket: 実行を開始します...")
                     .await?;
-                tracing::info!("Task {} approved via task_execute button", task.id);
+                tracing::info!("Task {} → executing via task_execute button", task.id);
                 state.wake_worker();
             }
         }
 
+        "task_add_instruction" => {
+            // conversing 継続: 追加指示を促す
+            if task.status == "conversing" {
+                slack
+                    .reply_thread(
+                        channel,
+                        reply_ts,
+                        ":pencil2: 追加の指示をこのスレッドに返信してください。返信内容をもとにヒアリングを継続します。",
+                    )
+                    .await?;
+                tracing::info!("Task {} add_instruction requested", task.id);
+            }
+        }
+
+        // 旧ボタン互換（task_converse → task_add_instruction と同等）
         "task_converse" => {
-            // ステータス変更なし（次のスレッド返信を待つ）
             slack
                 .reply_thread(
                     channel,
                     reply_ts,
-                    ":speech_balloon: スレッドに追加の指示を入力してください",
+                    ":pencil2: 追加の指示をこのスレッドに返信してください。",
                 )
                 .await?;
         }
 
         "task_manual" => {
-            state.db.update_status(task.id, "manual")?;
-            let branch_info = task
-                .branch_name
-                .as_deref()
-                .map(|b| format!("\nブランチ: `{}`", b))
-                .unwrap_or_default();
-            slack
-                .reply_thread(
-                    channel,
-                    reply_ts,
-                    &format!(
-                        ":hammer: 手動修正モードに入りました{}\n完了したら `直した` と返信してください",
-                        branch_info
-                    ),
-                )
-                .await?;
-            tracing::info!("Task {} set to manual mode via task_manual button", task.id);
+            if matches!(task.status.as_str(), "conversing" | "executing") {
+                state.db.update_status(task.id, "manual")?;
+                let branch_info = task
+                    .branch_name
+                    .as_deref()
+                    .map(|b| format!("\nブランチ: `{}`", b))
+                    .unwrap_or_default();
+                slack
+                    .reply_thread(
+                        channel,
+                        reply_ts,
+                        &format!(
+                            ":wrench: 手動対応モードに入りました{}\n完了したら「再開」ボタンまたは `直した` と返信してください",
+                            branch_info
+                        ),
+                    )
+                    .await?;
+                tracing::info!("Task {} → manual via task_manual button", task.id);
+            }
         }
 
         "task_skip" => {
-            state.db.update_status(task.id, "done")?;
-            slack
-                .reply_thread(channel, reply_ts, ":fast_forward: タスクをスキップしました")
-                .await?;
-            tracing::info!("Task {} skipped via task_skip button", task.id);
+            if matches!(task.status.as_str(), "conversing" | "manual") {
+                state.db.update_status(task.id, "done")?;
+                slack
+                    .reply_thread(channel, reply_ts, ":fast_forward: タスクをスキップしました")
+                    .await?;
+                tracing::info!("Task {} skipped via task_skip button", task.id);
+            }
+        }
+
+        "task_resume" => {
+            // manual → executing（手動修正後に再開）
+            if task.status == "manual" {
+                state.db.update_status(task.id, "executing")?;
+                slack
+                    .reply_thread(channel, reply_ts, ":rocket: 修正を確認しました。実行を再開します...")
+                    .await?;
+                tracing::info!("Task {} → executing via task_resume button", task.id);
+                state.wake_worker();
+            }
+        }
+
+        "task_done" => {
+            // manual → done（手動で完了宣言）
+            if task.status == "manual" {
+                state.db.update_status(task.id, "done")?;
+                slack
+                    .reply_thread(channel, reply_ts, ":white_check_mark: タスクを完了しました")
+                    .await?;
+                tracing::info!("Task {} → done via task_done button", task.id);
+            }
         }
 
         _ => {
@@ -622,42 +663,45 @@ async fn process_ops_inception_approve(
     }
     let tasks = if tasks.len() > 50 { &tasks[..50] } else { &tasks[..] };
 
+    // Inception 要件定義完了済み → executing で直接登録（二重分析を廃止）
     if tasks.is_empty() {
         // TASKS_JSON がない場合は単一タスクとして登録
         let task_name = crate::claude::truncate_str(&item.message_text, 100);
-        let task_id = state.db.create_task_from_ops(
+        let task_id = state.db.create_task_from_ops_with_status(
             ops_id,
             task_name,
             last_output,
             &item.repo_key,
             channel,
             reply_ts,
+            "executing",
         )?;
-        tracing::info!("inception: registered task #{} (single) from ops item {}", task_id, ops_id);
+        tracing::info!("inception: registered task #{} (single, executing) from ops item {}", task_id, ops_id);
         slack
             .reply_thread(
                 channel,
                 reply_ts,
-                &format!(":clipboard: タスクを登録しました (task #{})\n計画 → 実行のフローに入ります", task_id),
+                &format!(":rocket: タスクを登録し、即実行を開始します (task #{})", task_id),
             )
             .await
             .ok();
     } else {
-        // 複数タスクを登録
+        // 複数タスクを登録（executing で即実行）
         let mut registered_ids = Vec::new();
         for task_json in tasks {
             let title = task_json.get("title").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("Inception task");
             let description = task_json.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
-            let task_id = state.db.create_task_from_ops(
+            let task_id = state.db.create_task_from_ops_with_status(
                 ops_id,
                 title,
                 description,
                 &item.repo_key,
                 channel,
                 reply_ts,
+                "executing",
             )?;
             registered_ids.push(task_id);
-            tracing::info!("inception: registered task #{} '{}' from ops item {}", task_id, title, ops_id);
+            tracing::info!("inception: registered task #{} '{}' (executing) from ops item {}", task_id, title, ops_id);
         }
         let ids_str: Vec<String> = registered_ids.iter().map(|id| format!("#{}", id)).collect();
         slack
@@ -665,7 +709,7 @@ async fn process_ops_inception_approve(
                 channel,
                 reply_ts,
                 &format!(
-                    ":clipboard: {} 件のタスクを登録しました ({})\n計画 → 実行のフローに入ります",
+                    ":rocket: {} 件のタスクを登録し、即実行を開始します ({})",
                     registered_ids.len(),
                     ids_str.join(", ")
                 ),

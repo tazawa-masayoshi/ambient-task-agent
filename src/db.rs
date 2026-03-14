@@ -506,15 +506,6 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn update_plan_ts(&self, id: i64, plan_ts: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET slack_plan_ts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![plan_ts, id],
-        )?;
-        Ok(())
-    }
-
     /// slack_thread_ts または slack_plan_ts でタスクを検索
     pub fn find_task_by_slack_ts(&self, channel: &str, ts: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
@@ -1326,6 +1317,31 @@ impl Db {
         let mut stmt = conn.prepare(&sql)?;
         let task = stmt.query_row(params![channel, thread_ts], row_to_task).ok();
         Ok(task)
+    }
+
+    /// conversing 状態のタスクのうち、ユーザーが返信済み（ops_contexts の最新が user ロール）のものを取得
+    pub fn get_conversing_tasks_needing_response(&self) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks ct \
+             WHERE ct.status = 'conversing' \
+               AND ct.converse_thread_ts IS NOT NULL \
+               AND EXISTS ( \
+                 SELECT 1 FROM ops_contexts oc \
+                 WHERE oc.channel = ct.slack_channel \
+                   AND oc.thread_ts = ct.converse_thread_ts \
+                   AND oc.role = 'user' \
+                   AND oc.id = ( \
+                     SELECT MAX(id) FROM ops_contexts \
+                     WHERE channel = oc.channel AND thread_ts = oc.thread_ts \
+                   ) \
+               )",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let tasks = stmt.query_map([], row_to_task)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
     }
 
     /// キューアイテムをスキップ（対応不要と分類）
