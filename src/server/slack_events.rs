@@ -504,6 +504,17 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             state.wake_worker();
         }
 
+        "直した" | "fixed" | "修正完了" => {
+            if task.status == "manual" {
+                state.db.update_status(task.id, "executing")?;
+                slack
+                    .reply_thread(channel, thread_ts, ":rocket: 確認しました。実行を再開します...")
+                    .await?;
+                tracing::info!("Task {} resumed from manual mode via thread reply", task.id);
+                state.wake_worker();
+            }
+        }
+
         "archive" => {
             state.db.update_status(task.id, "archived")?;
             slack
@@ -609,10 +620,12 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         cmd if cmd == "status" || cmd == "状態" || cmd.starts_with("進捗") => {
             let status_emoji = match task.status.as_str() {
                 "new" => ":inbox_tray:",
-                "planning" => ":brain:",
+                "analyzing" | "planning" => ":brain:",
                 "proposed" => ":clipboard:",
+                "conversing" => ":speech_balloon:",
                 "approved" | "auto_approved" => ":white_check_mark:",
                 "executing" => ":rocket:",
+                "manual" => ":hammer:",
                 "ci_pending" => ":hourglass:",
                 "done" => ":tada:",
                 "error" => ":x:",
@@ -636,7 +649,25 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         }
 
         _ => {
-            // 認識できないスレッド返信は無視
+            // conversing タスクへの追加指示: description に追記してユーザーに確認
+            if task.status == "conversing" {
+                let current_desc = task.description.as_deref().unwrap_or("");
+                let new_desc = if current_desc.is_empty() {
+                    text.to_string()
+                } else {
+                    format!("{}\n\n[追加指示] {}", current_desc, text)
+                };
+                state.db.update_description(task.id, &new_desc)?;
+                slack
+                    .reply_thread(
+                        channel,
+                        thread_ts,
+                        ":memo: 指示を追加しました。「実行開始」ボタンを押して実行してください。",
+                    )
+                    .await?;
+                tracing::info!("Task {} conversing: appended instruction", task.id);
+            }
+            // それ以外の認識できないスレッド返信は無視
         }
     }
 

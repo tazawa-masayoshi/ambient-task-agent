@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{Datelike, DateTime, Timelike, Utc};
 use tokio::sync::Notify;
 
 use crate::db::{CodingTask, Db, OpsQueueItem};
@@ -112,8 +112,11 @@ impl Worker {
             // ops フォローアップチェック（1時間ごと、業務時間 9-18 JST のみ）
             let now = Utc::now();
             let jst_hour = (now.hour() + 9) % 24; // UTC → JST 簡易変換
+            let jst_weekday = (now + chrono::Duration::hours(9)).weekday();
+            let is_weekday = !matches!(jst_weekday, chrono::Weekday::Sat | chrono::Weekday::Sun);
             #[allow(clippy::manual_range_contains)]
-            let should_check_followup = jst_hour >= 9 && jst_hour < 18
+            let should_check_followup = is_weekday
+                && jst_hour >= 9 && jst_hour < 18
                 && last_followup_check
                     .map(|last| (now - last).num_minutes() >= 60)
                     .unwrap_or(true);
@@ -154,16 +157,16 @@ impl Worker {
     fn process_tasks(self: &Arc<Self>) -> bool {
         let mut had_error = false;
 
-        // 1. new → planning（spawn 前にステータスを claim して二重 pickup 防止）
+        // 1. new(source=asana) → planning（Slack 起点タスクは step 5 で処理するのでスキップ）
         match self.db.get_new_task() {
-            Ok(Some(task)) => {
+            Ok(Some(task)) if task.source != "slack" => {
                 tracing::info!("Planning task: {} ({})", task.asana_task_name, task.asana_task_gid);
                 if self.db.update_status(task.id, "planning").is_ok() {
                     let task_id = task.id;
                     self.spawn_task(task_id, |w| async move { w.plan_task(task).await });
                 }
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!("Failed to fetch new task: {}", e);
                 had_error = true;
@@ -223,6 +226,24 @@ impl Worker {
             Ok(None) => {}
             Err(e) => {
                 tracing::error!("Failed to fetch ci_pending task: {}", e);
+                had_error = true;
+            }
+        }
+
+        // 5. new(source=slack) → conversing（Slack 起点タスクは明確化フロー優先）
+        match self.db.get_new_task() {
+            Ok(Some(task)) if task.source == "slack" => {
+                tracing::info!("Slack-sourced task {} → conversing", task.id);
+                if self.db.update_status(task.id, "conversing").is_ok() {
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move {
+                        w.start_conversing_task(task).await
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("Failed to fetch new task (slack check): {}", e);
                 had_error = true;
             }
         }
@@ -559,9 +580,11 @@ impl Worker {
 
     /// ops フォローアップチェック: 未解決アイテムにリマインドを送信
     ///
-    /// - 1日後: 1回目リマインド
-    /// - 3日後: 2回目リマインド
-    /// - 7日後: 3回目リマインド + 保留に移行
+    /// - 営業日1日後: 1回目リマインド
+    /// - 営業日3日後: 2回目リマインド
+    /// - 営業日5日後: 3回目リマインド + 保留に移行
+    ///
+    /// 土日はカウント対象外（営業日ベース）。
     async fn check_ops_followups(self: &Arc<Self>) {
         let items = match self.db.get_ops_needing_followup() {
             Ok(items) => items,
@@ -582,14 +605,13 @@ impl Worker {
                 Ok(dt) => dt,
                 Err(_) => continue,
             };
-            let elapsed = now - done_at;
-            let elapsed_days = elapsed.num_days();
+            let business_days = count_business_days(done_at, now);
 
-            // リマインドのタイミング判定
+            // リマインドのタイミング判定（営業日ベース）
             let should_remind = match item.reminder_count {
-                0 => elapsed_days >= 1,
-                1 => elapsed_days >= 3,
-                2 => elapsed_days >= 7,
+                0 => business_days >= 1,
+                1 => business_days >= 3,
+                2 => business_days >= 5,
                 _ => false,
             };
 
@@ -602,24 +624,24 @@ impl Worker {
             let short_text = crate::claude::truncate_str(&item.message_text, 80);
 
             if item.reminder_count >= 2 {
-                // 7日後: 保留に移行
+                // 営業日5日後: 保留に移行
                 let msg = format!(
-                    ":file_folder: *保留に移行* {}\n1週間未対応のため保留にしました: _{}_",
+                    ":file_folder: *保留に移行* {}\n営業日5日未対応のため保留にしました: _{}_",
                     admin_mention, short_text
                 );
                 slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
                 self.db.mark_ops_on_hold(item.id).ok();
-                tracing::info!("ops item {} moved to on_hold after 7 days", item.id);
+                tracing::info!("ops item {} moved to on_hold after {} business days", item.id, business_days);
             } else {
-                // 1日後 / 3日後: リマインド
-                let label = if item.reminder_count == 0 { "1日" } else { "3日" };
+                // 営業日1日 / 3日後: リマインド
+                let label = if item.reminder_count == 0 { "1営業日" } else { "3営業日" };
                 let msg = format!(
                     ":bell: *リマインド* {}\n{}経過: _{}_",
                     admin_mention, label, short_text
                 );
                 slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
                 self.db.increment_ops_reminder(item.id).ok();
-                tracing::info!("ops item {} reminder {} sent ({}d elapsed)", item.id, item.reminder_count + 1, elapsed_days);
+                tracing::info!("ops item {} reminder {} sent ({}bd elapsed)", item.id, item.reminder_count + 1, business_days);
             }
         }
     }
@@ -669,16 +691,18 @@ impl Worker {
             "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\n\
              ## 作業スコープ一覧\n{}\n\n\
              ## メッセージ\n{}\n\n\
-             該当するスコープの番号を1つだけ答えてください。どれにも該当しない場合は 0 と答えてください。\n\
-             番号のみ出力してください。",
+             該当するスコープの番号を scope フィールドに返してください。どれにも該当しない場合は 0 にしてください。",
             scopes.join("\n"),
             item.message_text
         );
+
+        let schema = r#"{"type":"object","properties":{"scope":{"type":"integer"}},"required":["scope"]}"#;
 
         let log_dir = self.log_dir();
         let result = crate::claude::ClaudeRunner::new("route", &prompt)
             .max_turns(1)
             .allowed_tools("")
+            .json_schema(schema)
             .log_dir(&log_dir)
             .with_context(&self.runner_ctx)
             .run()
@@ -691,12 +715,10 @@ impl Worker {
         let answer = result.stdout.trim();
         tracing::info!("route_ops: Claude answer='{}' for item {}", answer, item.id);
 
-        let num: usize = answer
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
+        let num: usize = serde_json::from_str::<serde_json::Value>(answer)
+            .ok()
+            .and_then(|v| v.get("scope")?.as_u64())
+            .unwrap_or(0) as usize;
 
         if num == 0 || num > ops_entries.len() {
             tracing::info!("route_ops: no match (answer='{}', parsed={})", answer, num);
@@ -1262,6 +1284,65 @@ impl Worker {
         Ok(())
     }
 
+    /// Slack 起点の新規タスクを conversing ステータスに遷移させ、ユーザーに確認を求める
+    async fn start_conversing_task(&self, task: CodingTask) -> Result<()> {
+        let channel = task
+            .slack_channel
+            .as_deref()
+            .unwrap_or(&self.default_slack_channel);
+        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+
+        // Block Kit: 実行開始 / 指示追加 / スキップ の3ボタン
+        let blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!(
+                        ":speech_balloon: タスクを受信しました\n*{}*\n\n要件を確認してください。実行してよければ「実行開始」を押してください。",
+                        task.asana_task_name
+                    )
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "実行開始" },
+                        "style": "primary",
+                        "action_id": "task_execute",
+                        "value": task.id.to_string()
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "指示追加" },
+                        "action_id": "task_converse",
+                        "value": task.id.to_string()
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "スキップ" },
+                        "action_id": "task_skip",
+                        "value": task.id.to_string()
+                    }
+                ]
+            }
+        ]);
+
+        if let Err(e) = self
+            .slack
+            .post_blocks(channel, thread_ts, &blocks, "タスク確認")
+            .await
+        {
+            tracing::warn!("Failed to post conversing blocks for task {}: {}", task.id, e);
+            // Slack 送信失敗でも conversing のままにしておく
+        }
+
+        tracing::info!("Task {} is now conversing, waiting for user confirmation", task.id);
+        Ok(())
+    }
+
     /// ci_pending タスクの CI 結果を確認し、完了 or リトライする
     async fn check_ci_and_handle(&self, task: CodingTask) -> Result<()> {
         let channel = task
@@ -1669,6 +1750,23 @@ fn ensure_repo_agent_rules(repo_path: &Path) {
 
 pub(crate) fn truncate_for_slack(text: &str, max_len: usize) -> &str {
     crate::claude::truncate_str(text, max_len)
+}
+
+/// from → to 間の営業日数をカウント（土日を除外、JST ベース）
+fn count_business_days(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    let jst_offset = chrono::Duration::hours(9);
+    let start = (from + jst_offset).date_naive();
+    let end = (to + jst_offset).date_naive();
+    let mut count = 0i64;
+    let mut d = start.succ_opt().unwrap_or(start); // 翌日からカウント開始
+    while d <= end {
+        let wd = d.weekday();
+        if !matches!(wd, chrono::Weekday::Sat | chrono::Weekday::Sun) {
+            count += 1;
+        }
+        d = d.succ_opt().unwrap_or(d);
+    }
+    count
 }
 
 const ERROR_LOG_HINT: &str = "\n_詳細ログ: `journalctl --user -u sdtab-ambient-task-agent -n 50`_";

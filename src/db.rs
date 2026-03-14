@@ -46,6 +46,10 @@ pub struct CodingTask {
     pub current_subtask_index: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
+    /// タスク入口識別: 'asana' | 'slack' | 'manual'
+    pub source: String,
+    /// conversing フェーズの会話スレッド TS（ops_contexts のキーに使う）
+    pub converse_thread_ts: Option<String>,
 }
 
 /// サブタスク定義（旧 decomposer で使用、DB の subtasks_json に保存済みデータの読み取り用に保持）
@@ -116,7 +120,7 @@ pub struct ScheduledJob {
     pub next_run_at: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, claude_session_id, current_subtask_index, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, claude_session_id, current_subtask_index, created_at, updated_at, source, converse_thread_ts";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
     Ok(CodingTask {
@@ -150,6 +154,8 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
         current_subtask_index: row.get(27)?,
         created_at: row.get(28)?,
         updated_at: row.get(29)?,
+        source: row.get(30).unwrap_or_else(|_| "asana".to_string()),
+        converse_thread_ts: row.get(31).unwrap_or(None),
     })
 }
 
@@ -284,6 +290,8 @@ impl Db {
             ("complexity", "TEXT"),         // v9
             ("claude_session_id", "TEXT"),  // v10: セッション継続用
             ("current_subtask_index", "INTEGER"), // v10: サブタスクループ進捗
+            ("source", "TEXT NOT NULL DEFAULT 'asana'"), // v11: タスク入口識別 (asana/slack/manual)
+            ("converse_thread_ts", "TEXT"),              // v11: conversing フェーズのスレッド TS
         ])?;
 
         // ops_queue: 追加カラム
@@ -310,6 +318,23 @@ impl Db {
                 ",
             )?;
             tracing::info!("Migrated {} legacy status values", legacy_count);
+        }
+
+        // v12: 旧ステータスモデルから新ステータスモデルへのマイグレーション
+        // proposed/analyzing → conversing、approved/auto_approved → executing
+        let v12_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coding_tasks WHERE status IN ('proposed','analyzing','approved','auto_approved')",
+            [],
+            |r| r.get(0),
+        )?;
+        if v12_count > 0 {
+            conn.execute_batch(
+                "
+                UPDATE coding_tasks SET status = 'conversing' WHERE status IN ('proposed', 'analyzing');
+                UPDATE coding_tasks SET status = 'executing' WHERE status IN ('approved', 'auto_approved');
+                ",
+            )?;
+            tracing::info!("v12: Migrated {} tasks to new status model", v12_count);
         }
 
         Ok(())
@@ -348,6 +373,26 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Slack 起点のタスクを登録する（source='slack'、ダミー GID を自動生成）
+    #[allow(dead_code)]
+    pub fn insert_task_from_slack(
+        &self,
+        task_name: &str,
+        description: Option<&str>,
+        repo_key: Option<&str>,
+        slack_channel: Option<&str>,
+        slack_thread_ts: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let dummy_gid = format!("slack_task_{}", chrono::Utc::now().timestamp_millis());
+        conn.execute(
+            "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, description, repo_key, slack_channel, slack_thread_ts, status, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'new', 'slack')",
+            params![dummy_gid, task_name, description, repo_key, slack_channel, slack_thread_ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     fn get_task_by_status(&self, status: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
@@ -370,11 +415,38 @@ impl Db {
         self.get_task_by_status("auto_approved")
     }
 
+    /// conversing 状態のタスクを1件取得（会話フェーズ処理用）
+    #[allow(dead_code)]
+    pub fn get_conversing_task(&self) -> Result<Option<CodingTask>> {
+        self.get_task_by_status("conversing")
+    }
+
+    /// executing 状態のタスクを1件取得（実行フェーズ処理用）
+    #[allow(dead_code)]
+    pub fn get_executing_task(&self) -> Result<Option<CodingTask>> {
+        self.get_task_by_status("executing")
+    }
+
+    /// manual 状態のタスクを1件取得（手動承認待ち）
+    #[allow(dead_code)]
+    pub fn get_manual_task(&self) -> Result<Option<CodingTask>> {
+        self.get_task_by_status("manual")
+    }
+
     pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE coding_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_description(&self, id: i64, description: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![description, id],
         )?;
         Ok(())
     }
@@ -941,6 +1013,7 @@ impl Db {
     }
 
     /// ops スレッドの会話履歴を削除（Inception リビジョン時にターン1からやり直す）
+    #[allow(dead_code)]
     pub fn clear_ops_context(&self, channel: &str, thread_ts: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1191,6 +1264,68 @@ impl Db {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// ops アイテムから coding_task を指定ステータスで作成（Inception 承認後に executing で直接登録するために使用）
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn create_task_from_ops_with_status(
+        &self,
+        ops_id: i64,
+        task_name: &str,
+        description: &str,
+        repo_key: &str,
+        channel: &str,
+        thread_ts: &str,
+        status: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, description, repo_key, \
+             status, slack_channel, slack_thread_ts, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'slack')",
+            params![
+                format!("ops_{}", ops_id),
+                task_name,
+                description,
+                repo_key,
+                status,
+                channel,
+                thread_ts,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// conversing フェーズの会話スレッド TS を更新
+    #[allow(dead_code)]
+    pub fn update_converse_thread_ts(&self, id: i64, converse_thread_ts: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET converse_thread_ts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![converse_thread_ts, id],
+        )?;
+        Ok(())
+    }
+
+    /// conversing 状態のタスクのうち、指定スレッドに対応するものを取得
+    #[allow(dead_code)]
+    pub fn find_conversing_task_by_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+    ) -> Result<Option<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks \
+             WHERE status = 'conversing' \
+             AND slack_channel = ?1 \
+             AND (slack_thread_ts = ?2 OR converse_thread_ts = ?2) \
+             ORDER BY id DESC LIMIT 1",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let task = stmt.query_row(params![channel, thread_ts], row_to_task).ok();
+        Ok(task)
     }
 
     /// キューアイテムをスキップ（対応不要と分類）

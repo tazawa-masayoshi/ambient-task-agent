@@ -472,12 +472,14 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
     hook_registry.register(execution::LoopDetectionHook::new(registry.clone()));
     let hooks = std::sync::Arc::new(hook_registry);
 
-    let resolved_env: Vec<(String, String)> = repos_config
+    let mut resolved_env: Vec<(String, String)> = repos_config
         .defaults
         .claude_allowed_env
         .iter()
         .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
         .collect();
+    // headless モード: sisyphus 等のプラグインが承認ゲートをスキップする
+    resolved_env.push(("CLAUDE_NON_INTERACTIVE".into(), "1".into()));
 
     let runner_ctx = execution::RunnerContext {
         defaults: repos_config.defaults.clone(),

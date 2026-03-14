@@ -1,380 +1,402 @@
-# ops Inception モード 要件定義
+# coding_tasks + ops_queue 統合設計 — 要件定義
 
-**作成日**: 2026-03-12
-**対象**: ambient-task-agent（現 HEAD: f77ebf0）
-**担当**: Analyst（Discovery Council）
+**作成日**: 2026-03-14
+**対象**: ambient-task-agent
+**担当**: Discovery Council（analyst / researcher / scout）
 
 ---
 
 ## 背景と目的
 
-現在の `ops_mode` は `execute`（実行）と `plan`（分析のみ）の2種類。
-いずれも「要件が明確な前提」で動作する。
+現在、システムは2つの独立したパイプラインで動作している:
 
-新たに `inception` モードを追加し、**要件が曖昧な状態からSlackスレッド上で対話的に要件定義→タスク分解まで自律完結**させる。
-AI-DLC（Amazon Inception Workflow）のInception Phaseのエッセンスを2ターンに圧縮して実装する。
+1. **`coding_tasks` パイプライン**: Asana 同期 → `new → planning → proposed → approved → executing → done`
+2. **`ops_queue` パイプライン**: Slack → `pending → processing → done/failed`
 
----
+この二重構造により、以下の問題が生じている:
+- Slack から来たタスクは `ops_escalate` ボタンで手動的に `coding_tasks` に「昇格」させる必要がある
+- 入口（Asana/Slack）によってフローが異なり、ユーザー体験が非一貫
+- `coding_tasks` の `new → planning → proposed` は常に人間承認を経るため、明確なタスクでも無駄な待ち時間が発生
 
-## フロー概要
-
-```
-[ターン1] ユーザーの要求メッセージ受信
-  → ops_queue: pending → processing
-  → Claude: Intent分析 + 不明点3〜5問をSlackスレッドに投稿
-  → ops_queue: mark_ops_done（ターン1完了、会話履歴はops_contextsに保存済み）
-
-[ユーザー回答] スレッドへの @bot メンション返信（例: "@bot 〇〇です"）
-  → 既存の「スレッド返信 + @bot メンション → admin のみ ops 実行」ルートで再エンキュー
-  → ops_queue: 新エントリ（同一 thread_ts、ops_contexts に履歴あり）
-
-[ターン2] 会話履歴付きで再実行（ops_contexts.len() > 0 で判定）
-  → Claude: 要件整理 + タスク分解 → Slackスレッドに投稿
-  → Block Kit 3ボタン承認ゲート投稿
-  → ops_queue: mark_ops_done
-
-[承認ゲート]
-  ✅ inception_approve → coding_tasks 登録 + wake_worker（Asana APIは将来拡張）
-  🔧 inception_revise  → 「修正点をスレッドで @bot に返信してください」→ ユーザー再回答待ち
-  ❌ inception_cancel  → resolve_ops（ops_queue を done に）
-```
+**目的**: 入口に関わらず同一の処理フローで動作させ、明確なタスクは即実行・曖昧なタスクは Slack ラリーで要件確定してから実行する。
 
 ---
 
-## 機能要件 (FR)
+## コードベース現状の制約（Discovery Council 調査結果）
 
-### FR-1: `ops_mode = "inception"` の設定対応
+### 既存のブリッジ実装（researcher 指摘）
 
-**ファイル**: `src/repo_config.rs`
+`create_task_from_ops()` は**既に実装済み**。以下2ルートから呼ばれている:
+- `ops_escalate` ボタン → `create_task_from_ops()` → `coding_tasks` に `new` で挿入 → worker が `planning` へ
+- `ops_inception_approve` ボタン → タスク分解結果から `create_task_from_ops()` → 複数タスクが `new` で挿入
 
-`OpsMode` enum に `Inception` バリアントを追加:
+**解消すべき問題**: Inception ターン2で要件定義が完了しているのに、`coding_tasks` 登録後に再び `planning`（Claude分析）→ `proposed`（人間承認）を経る。この**二重分析を廃止**することが統合の核心。
 
-```rust
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum OpsMode {
-    #[default]
-    Execute,
-    Plan,
-    Inception,  // 追加
-}
-```
+### DB構造の制約（scout 指摘）
 
-`#[serde(rename_all = "snake_case")]` により `ops_mode = "inception"` が自動デシリアライズされる。
+- `coding_tasks.asana_task_gid` は `NOT NULL`（スキーマ制約）
+- `coding_tasks` は28フィールド、`ops_queue` は12フィールドと乖離が大きく **DB統合はしない**
+- 共通処理は Rust の `WorkItem` enum で抽象化する
 
-**設定例（`config/repos.toml`）:**
-```toml
-[[repo]]
-key = "my-project"
-ops_mode = "inception"
-ops_channel = "my-ops-channel"
-```
+### セッション管理の2モデル（researcher 指摘）
+
+- **coding_tasks**: `claude_session_id` + `--resume` でセッション継続
+- **ops**: `ops_contexts` テーブルにテキスト履歴を蓄積してプロンプト注入
+
+統合後は **conversing フェーズは ops_contexts モデル、executing フェーズは claude_session_id モデル** を使うハイブリッド方式を採用する。
+
+### 静的 vs 動的ルーティング（scout 指摘）
+
+現在、ops の `execute/plan/inception` 判定は `repos.toml` の `ops_mode` 設定で**静的**に決まる。動的な明確/曖昧判定には追加の LLM 呼び出しコストが発生する。
+
+### `auto_execute` フラグとの整合（researcher 指摘）
+
+現在 `repo_config` の `auto_execute: bool` が `new → auto_approved`（人間承認スキップ）を制御している。新しい `new → executing` の自動遷移とこのフラグは概念的に重複するため、統合後は `auto_execute = true` を「`new → executing` の直行を許可する」フラグとして再定義する。
 
 ---
 
-### FR-2: ターン判定ロジック（DBスキーマ変更なし）
+## 新しいステータスモデル
+
+### `coding_tasks.status` の変更
+
+```
+new → (自動判定) → executing     ← 明確なタスク、即実行
+                 → conversing   ← 要件ラリー中（Slack スレッド）
+
+conversing → executing          ← 要件確定、実行開始
+           → manual             ← 人間が terminal で対応
+
+manual → executing              ← 「直した」でエージェント再開
+       → done                   ← 人間が完了宣言
+
+executing → done / ci_pending   ← 正常完了
+          → conversing          ← 実行中にブロッカー発生
+```
+
+### 廃止するステータス（既存との互換性）
+
+- `planning` → `conversing` に統合（要件確認中の状態として再定義）
+- `proposed` → `conversing` に統合（人間返信待ちの状態として再定義）
+- `approved` / `auto_approved` → 廃止（`conversing → executing` への直接遷移で代替）
+
+**マイグレーション方針**:
+```sql
+-- executing 中のタスクはそのまま維持
+UPDATE coding_tasks SET status = 'conversing'
+  WHERE status IN ('planning', 'proposed')
+  AND status NOT IN ('executing', 'ci_pending');
+
+UPDATE coding_tasks SET status = 'executing'
+  WHERE status IN ('approved', 'auto_approved');
+```
+
+既存の `done`, `error`, `sleeping`, `archived`, `ci_pending` は変更なし。
+
+---
+
+## 機能要件
+
+### FR-1: `coding_tasks` への新ステータス対応
+
+**ファイル**: `src/db.rs`（マイグレーション追加）
+
+新規カラム追加（ALTER TABLE による後方互換追加）:
+```sql
+-- conversing フェーズの会話識別用（ops_contexts と同じキーで引く）
+ALTER TABLE coding_tasks ADD COLUMN converse_thread_ts TEXT;
+```
+
+`converse_thread_ts` は `conversing` 状態での Slack スレッド TS を保持し、
+`ops_contexts(channel, thread_ts)` との紐付けに使う。
+
+既存の `slack_thread_ts` と重複するが、`slack_thread_ts` はタスク全体のスレッド、`converse_thread_ts` は conversing フェーズの会話履歴スレッドとして意味が異なる（Asana 入口タスクは `slack_thread_ts` が未設定の場合がある）。
+
+### FR-2: `new → 自動判定` ロジック
 
 **ファイル**: `src/worker/runner.rs`
 
-DBスキーマの変更は不要。`ops_contexts` テーブルに保存された**会話履歴の件数**でターンを判定する:
+**入口別デフォルト（researcher 推奨の選択肢C をベース）**:
+- **Asana 入口** (`asana_task_gid` が `"slack_"` プレフィックスでない): 人間がチケット化済みとして「明確」とみなす
+- **Slack 入口** (`asana_task_gid` が `"slack_"` プレフィックス): Inception 経由で要件確定済みなら `executing`、未確定なら `conversing`
 
+**具体的な判定ロジック**:
 ```rust
-let history = self.db.get_ops_context(&item.channel, reply_ts)?;
+fn classify_new_task(task: &CodingTask) -> TaskClassification {
+    let is_slack_origin = task.asana_task_gid.starts_with("slack_");
+    let has_repo = task.repo_key.is_some();
+    let auto_execute = /* repo_config から取得 */;
 
-match repo_entry.ops_mode {
-    OpsMode::Inception => {
-        if history.is_empty() {
-            // ターン1: 初回メッセージ → Intent分析 + 質問生成
-            self.run_ops_inception_turn1(&item, &repo_entry, &req, &history).await
+    if is_slack_origin {
+        // Slack 入口: analysis_text に Inception 要件定義が入っていれば即実行
+        // なければ conversing でヒアリング開始
+        if task.analysis_text.is_some() {
+            TaskClassification::Execute
         } else {
-            // ターン2: 会話履歴あり → 要件整理 + タスク分解
-            self.run_ops_inception_turn2(&item, &repo_entry, &req, &history).await
+            TaskClassification::Converse
+        }
+    } else {
+        // Asana 入口: auto_execute フラグ（旧 auto_execute）を尊重
+        if auto_execute && has_repo {
+            TaskClassification::Execute
+        } else {
+            TaskClassification::Converse
         }
     }
-    OpsMode::Plan => { /* 既存 */ }
-    OpsMode::Execute => { /* 既存 */ }
 }
 ```
 
-**理由**: `ops_contexts` は `channel + thread_ts` をキーに蓄積される。
-ターン1完了後に user/assistant の2エントリが保存されるため、ターン2では `history.len() >= 2` となる。
-`inception_turn` カラムをDBに追加するより、既存の仕組みを最大限活用するこの方針を採用する。
+`auto_execute` フラグの再定義: 旧来の `new → auto_approved` スキップから「`new → executing` 直行を許可する」に意味を変更（後方互換: `auto_execute = true` の既存設定は動作継続）。
 
----
+### FR-3: `conversing` フェーズの実装
 
-### FR-3: `run_ops_item()` の分岐リファクタリング
+**ファイル**: `src/worker/runner.rs`, `src/server/slack_events.rs`
 
-**ファイル**: `src/worker/runner.rs`
+#### conversing 開始時（`start_conversing_task()` メソッド）
 
-現在の `plan_only: bool` フラグによる分岐を `OpsMode` の match 式に置き換える。
-既存の `execute_ops()` シグネチャは変更せず、inception 専用の `execute_ops_inception_turn1/2()` を別関数として追加する（既存コードへの影響を最小化）。
+1. `coding_tasks.status = 'conversing'` に遷移
+2. Slack スレッドを作成（まだなければ `slack_thread_ts` を設定）
+3. `ops_contexts` に user エントリを追加（`channel + thread_ts` をキー）
+4. Inception Turn1 相当のプロンプトで Claude を実行（要件ヒアリング質問を生成）
+5. 質問を Slack スレッドに投稿
+6. `coding_tasks.converse_thread_ts = thread_ts` を保存
 
----
+#### conversing 中のスレッド返信受信
 
-### FR-4: Inception ターン1（Intent分析 + 質問生成）
+**ファイル**: `src/server/slack_events.rs` の `handle_message()`
 
-**ファイル**: `src/worker/ops.rs`
+`find_task_by_thread_ts()` で `conversing` 状態のタスクを発見した場合:
+- `ops_contexts` に user メッセージを追記
+- `wake_worker()` でワーカーを起床
+- （既存の sleep/wake/archive コマンドはそのまま維持）
 
-以下の定数と関数を追加:
+#### conversing ターン継続（ワーカー側）
 
+`process_tasks()` に `process_conversing_tasks()` サブルーティンを追加:
 ```rust
-const FALLBACK_OPS_INCEPTION_SOUL: &str = "\
-あなたは要件定義を支援するエージェントです。
-ユーザーの要求を分析し、実装前に明確にすべき点を質問してください。
-スキルファイルがなくても動作します。";
-
-const OPS_INCEPTION_TURN1_RULES: &str = "\
-## Intent分析の観点
-以下の4軸でユーザーの要求を評価してください:
-1. **種別**: 新機能 / 既存機能改善 / バグ修正 / インフラ / その他
-2. **スコープ**: 影響範囲（単一モジュール / 複数モジュール / システム横断）
-3. **複雑度**: 低（数時間）/ 中（1日前後）/ 高（複数日）
-4. **明確さ**: 要件が十分明確か、曖昧な点があるか
-
-## 質問生成（3〜5問に絞ること）
-以下のカテゴリから必要な質問を選択:
-- **機能要件**: 何をするか、何をしないか、ユーザーストーリー
-- **非機能要件**: パフォーマンス、セキュリティ、可用性、互換性
-- **ビジネスコンテキスト**: なぜ今必要か、優先度、期限
-- **境界条件**: エッジケース、エラー処理
-
-## 出力形式（厳守）
-1. **Intent分析サマリー**（1〜2行）
-2. **確認したい点**（箇条書き、3〜5問）
-
-最後に SUMMARY: <種別> | <スコープ> | <複雑度> の形式で1行出力すること。";
+fn process_conversing_tasks(self: &Arc<Self>) -> bool {
+    // conversing 状態のタスクを取得
+    // ops_contexts の最新エントリが "user" ロール → 次の Claude ターンを実行
+    // ops_contexts の最新エントリが "assistant" ロール → まだ返信待ち、スキップ
+}
 ```
 
-**関数シグネチャ:**
-```rust
-pub async fn execute_ops_inception_turn1(
-    req: &OpsRequest,
-    repo_path: &Path,
-    soul: &str,
-    max_turns: u32,
-    log_dir: Option<&Path>,
-    runner_ctx: &RunnerContext,
-    history: &[OpsMessage],
-    download_dir: Option<&str>,
-) -> Result<String>
+#### conversing → executing 遷移トリガー
+
+以下のいずれかで `executing` に遷移:
+- Slack Block Kit ボタン「実行開始」（`action_id = "task_execute"`）
+- スレッドテキスト「go」「実行」「run」（既存コマンドを `conversing` にも対応）
+- Claude の返答に `REQUIREMENTS_CONFIRMED:` プレフィックスが含まれる場合（自動判定）
+
+### FR-4: `manual` ステータスの実装
+
+**ファイル**: `src/server/slack_events.rs`, `src/server/slack_actions.rs`
+
+#### manual への遷移トリガー
+
+**Slack Block Kit ボタン主体**（researcher 推奨）:
+- `conversing` 状態のボタン「手動修正」（`action_id = "task_manual"`）
+- `executing` 状態の `stop_task` ボタンを拡張: `error` ではなく `manual` に遷移（既存 `stop_task` の代替として実装）
+
+#### manual 中の Slack 通知（Block Kit ボタン付き）
+
+```
+:wrench: *手動対応モード*
+ターミナルで作業を行い、完了後に以下のボタンを押してください:
+[再開]  [完了]
 ```
 
-**ツール権限**: `OPS_PLAN_ALLOWED_TOOLS`（`"Read,Glob,Grep,Bash"`）を流用。
-**スキルファイル**: 不要（空でも動作）。
+Block Kit ボタンで一貫性を担保。ターミナルでのファイル編集後に Slack で「再開」を押すフロー。
 
----
+#### manual → executing 遷移
 
-### FR-5: Inception ターン2（要件整理 + タスク分解）
+「再開」ボタン（`action_id = "task_resume"`）押下:
+- `coding_tasks.status = 'executing'` に更新
+- `wake_worker()` で実行再開
 
-**ファイル**: `src/worker/ops.rs`
+#### manual → done 遷移
 
-```rust
-const OPS_INCEPTION_TURN2_RULES: &str = "\
-## 要件定義ドキュメントの構造
-会話履歴に基づいて、以下の形式で要件定義を作成してください:
+「完了」ボタン（`action_id = "task_done"`）押下:
+- `coding_tasks.status = 'done'` に更新
 
-### 概要
-（何を実装するか、1〜3行）
+### FR-5: `executing → conversing` ブロッカー検知
 
-### 機能要件
-- FR-1: ...
+**ファイル**: `src/worker/executor.rs`（または実行完了後の出力解析）
 
-### 非機能要件
-- NFR-1: ...
+Claude の実行出力に以下のパターンが含まれる場合、`conversing` に遷移:
+- `BLOCKED:` プレフィックスを含む行
+- `REQUIRES_CLARIFICATION:` プレフィックスを含む行
 
-### 制約・前提条件
-- ...
+遷移時:
+1. `coding_tasks.status = 'conversing'` に更新
+2. `claude_session_id` は **保持**（再開時に `--resume` で継続できるよう）
+3. ブロッカー内容を Slack スレッドに投稿
+4. ユーザー返信待ち
 
-### 受け入れ基準
-- AC-1: ...
-
-## タスク分解
-| # | タスク名 | 説明 | 依存 | 工数見積 |
-|---|---------|------|------|---------|
-| 1 | ... | ... | なし | 2h |
-
-## 出力
-上記のドキュメントとタスク分解表を出力すること。
-最後に REQUIREMENTS: <要件1行サマリー> の形式で出力すること。";
-```
-
-**関数シグネチャ:**
-```rust
-pub async fn execute_ops_inception_turn2(
-    req: &OpsRequest,
-    repo_path: &Path,
-    soul: &str,
-    max_turns: u32,
-    log_dir: Option<&Path>,
-    runner_ctx: &RunnerContext,
-    history: &[OpsMessage],
-    download_dir: Option<&str>,
-) -> Result<String>
-```
-
-**ツール権限**: `OPS_PLAN_ALLOWED_TOOLS`（ターン1と同じ）。
-
----
-
-### FR-6: Block Kit 承認ゲート（Inception専用3ボタン）
-
-**ファイル**: `src/worker/runner.rs`（ターン2完了後）
-
-```rust
-let blocks = serde_json::json!([
-    {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": format!(":bulb: *要件定義完了*\n```\n{}\n```", truncated)
-        }
-    },
-    {
-        "type": "actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": { "type": "plain_text", "text": "\u{2705} 承認（タスク登録）" },
-                "style": "primary",
-                "action_id": "inception_approve",
-                "value": item.id.to_string()
-            },
-            {
-                "type": "button",
-                "text": { "type": "plain_text", "text": "\u{1f527} 修正して" },
-                "action_id": "inception_revise",
-                "value": item.id.to_string()
-            },
-            {
-                "type": "button",
-                "text": { "type": "plain_text", "text": "\u{274c} キャンセル" },
-                "style": "danger",
-                "action_id": "inception_cancel",
-                "value": item.id.to_string()
-            }
-        ]
-    }
-]);
-```
-
----
-
-### FR-7: Inception ボタンハンドラ
+### FR-6: Slack 承認ボタンの再設計
 
 **ファイル**: `src/server/slack_actions.rs`
 
-`process_action()` の冒頭（`ops_resolve` / `ops_escalate` 判定の直前）に追加:
+#### `conversing` 状態でのボタン
 
-```rust
-if action_id == "inception_approve" {
-    return process_inception_approve(state, action_value, channel, message_ts, thread_ts).await;
-}
-if action_id == "inception_revise" {
-    return process_inception_revise(state, action_value, channel, message_ts, thread_ts).await;
-}
-if action_id == "inception_cancel" {
-    return process_inception_cancel(state, action_value, channel, message_ts).await;
-}
+```
+[実行開始]  [指示追加]  [手動修正]  [スキップ]
 ```
 
-**`process_inception_approve()` の処理:**
-1. `db.get_ops_context(channel, thread_ts)` で最後の assistant エントリ（ターン2出力）を取得
-2. タスク分解テーブルをパースして各行の `task_name`・`description` を抽出
-3. 各タスクを `create_task_from_ops(ops_id, task_name, description, repo_key, channel, thread_ts)` で `coding_tasks` に登録
-4. `state.wake_worker()` で既存タスク実行フローへ引き渡し
-5. Slackスレッドに「N件のタスクを登録しました (task #X 〜 #Y)」を通知
-6. ボタンメッセージを「承認済み」テキストに更新
-7. パースに失敗した場合は要件テキスト全体を1タスクとして登録（フォールバック）
+| ボタン | action_id | 遷移先 | 処理 |
+|--------|-----------|--------|------|
+| 実行開始 | `task_execute` | `executing` | `wake_worker()` |
+| 指示追加 | `task_add_instruction` | `conversing`（継続）| 追加指示をプロンプトに追記して再実行 |
+| 手動修正 | `task_manual` | `manual` | 手動対応通知を投稿 |
+| スキップ | `task_skip` | `done` | スキップ理由を記録 |
 
-**`process_inception_revise()` の処理:**
-1. ボタンを「修正リクエスト受付」テキストに更新
-2. Slackスレッドに「修正のポイントをこのスレッドで `@bot` に返信してください」を投稿
-3. ops_queue は変更しない（mark_ops_done済み）→ 次の @bot 返信で新エントリとして自動再エンキュー
+#### `executing` 状態でのボタン（実行中通知メッセージ）
 
-**`process_inception_cancel()` の処理:**
-1. ボタンを「キャンセル済み」テキストに更新
-2. Slackスレッドに「要件定義をキャンセルしました」を投稿
-3. `state.db.resolve_ops(ops_id)` で完了扱い（既存パターンと同一）
+```
+[中止]  [手動修正]
+```
+
+#### `manual` 状態でのボタン
+
+```
+[再開]  [完了]
+```
+
+action_id: `task_resume` / `task_done`
+
+#### 既存ボタンとの関係
+
+- `approve_task` / `reject_task` / `regenerate_task`: **廃止**（`proposed` 廃止に伴い）
+  - ただし `proposed` タスクが残存する期間は**並存**（マイグレーション完了後に削除）
+- `stop_task`: **`task_manual` に置き換え**（`executing → error` から `executing → manual` に変更）
+- `ops_resolve` / `ops_escalate` / `ops_inception_*`: **維持**（ops_queue パイプラインは独立）
+
+### FR-6b: Inception 後の二重分析廃止
+
+**ファイル**: `src/server/slack_actions.rs`（`process_ops_inception_approve()`）
+
+**現状の問題**: `ops_inception_approve` → `create_task_from_ops()` → `coding_tasks` に `status = 'new'` で登録 → worker が `planning`（Claude 再分析）→ `proposed`（人間再承認）を実行する。Inception ターン2で要件定義が完了しているのに二重で実行される。
+
+**修正方針**: `create_task_from_ops()` に `initial_status` 引数を追加し、Inception 承認経由の登録は `status = 'executing'` で挿入する:
+
+```rust
+// 修正前
+state.db.create_task_from_ops(ops_id, title, description, &item.repo_key, channel, reply_ts)?;
+
+// 修正後
+state.db.create_task_from_ops_with_status(
+    ops_id, title, description, &item.repo_key, channel, reply_ts,
+    "executing",  // Inception 要件定義完了済みのため即実行
+)?;
+```
+
+`analysis_text` に Inception ターン2の出力（要件定義）を格納して引き継ぐ。
+
+### FR-6c: `conversing` タイムアウト設計
+
+**ファイル**: `src/worker/runner.rs`（`check_ops_followups()` に準じて追加）
+
+現在 `ops_queue` には `check_ops_followups()` がある（営業日1/3/5日後にリマインド）。`coding_tasks` の `conversing` 状態も同様のフォローアップが必要。
+
+**実装方針**: 既存の `check_ops_followups()` を拡張して `coding_tasks` の `conversing` 状態も対象に含める:
+
+- 営業日1日後: リマインド投稿（「引き続きヒアリング中です。返信をお待ちしています」）
+- 営業日5日後: `conversing → sleeping` に遷移（`ops_queue` の `on_hold` 相当）
+
+`updated_at` カラムを最終メッセージ時刻として利用（追加カラム不要）。
+
+### FR-7: 成果物の自動判断
+
+**ファイル**: `src/worker/executor.rs`（完了後処理）
+
+実行完了時の成果物判断:
+- `task.repo_key.is_some()` かつ ファイル変更あり → PR 作成フロー（既存ロジック）
+- `task.repo_key.is_none()` または ファイル変更なし → Slack 返信で完了報告
+
+worktree 作成の有無も同じ基準で切り替え（`repo_key` ありの場合のみ作成）。
+
+### FR-8: Slack 入口タスクの `asana_task_gid` 統一
+
+**ファイル**: `src/server/slack_actions.rs`（`create_task_from_ops()` 呼び出し側）
+
+Slack 入口タスクの GID フォーマットを `slack_{channel}_{message_ts}` に統一:
+```rust
+let dummy_gid = format!("slack_{}_{}", channel, message_ts.replace('.', "_"));
+```
 
 ---
 
-### FR-8: スレッド返信のルーティング（ユーザー回答の受け取り）
+## 非機能要件
 
-**ファイル**: `src/server/slack_events.rs`
+### NFR-1: 後方互換性
 
-**現状の制約**: スレッドへのメンションなし返信は `(Some(_), false) => {}` で無視される。
+- `ops_queue` テーブルは**廃止しない**（ops パイプラインは引き続き独立動作）
+- `coding_tasks` の既存カラムは変更しない（`ALTER TABLE ADD COLUMN` のみ）
+- 既存の `planning` / `proposed` ステータスのタスクは DB マイグレーションで変換
 
-**Inception でのユーザー回答トリガー方法（Phase 1）**: 既存の admin @bot メンションルートを活用する。
-- ユーザーは `@bot 〇〇です` の形式でスレッドに返信
-- 既存の `(Some(tts), true) if is_admin` ルートで `enqueue_ops_request()` が呼ばれる
-- `get_ops_context(channel, thread_ts)` でターン1の履歴が取得され、`history.len() > 0` → ターン2判定
+### NFR-2: 既存 ops フローへの影響なし
 
-**ファイル変更なし**（Phase 1では既存ルートをそのまま利用）。
+- `OpsMode::Execute` / `OpsMode::Plan` / `OpsMode::Inception` の処理パスは変更しない
+- `process_ops_queue()` は独立して動作し続ける
 
-**Phase 2 拡張（スコープ外）**: `inception` モードではメンションなしのスレッド返信も受け付けるよう、`(Some(tts), false)` 分岐に `ops_mode == Inception` の条件を追加する。
+### NFR-3: セッション管理（ハイブリッド方式）
 
----
+- `conversing` フェーズ: `ops_contexts` テーブルで会話履歴管理（変更なし）
+- `executing` フェーズ: `claude_session_id` + `--resume` で継続（変更なし）
+- `executing → conversing` 遷移時: `claude_session_id` を保持して再開に備える
 
-### FR-9: Asana タスク登録（段階的実装）
+### NFR-4: 明確/曖昧判定の精度
 
-**Phase 1（今回実装）**:
-- `create_task_from_ops()` で `coding_tasks` テーブルにローカル登録
-- `asana_task_gid = "inception_{ops_id}_{index}"` のダミーGIDを使用
-- 既存の `ops_escalate` ボタン処理と同じパターン
-
-**Phase 2（将来拡張）**:
-- `src/asana/client.rs` に `create_task(project_id, name, notes)` メソッドを追加
-- `inception_approve` ハンドラから呼び出し、実際のAsana GIDを取得して `coding_tasks` に反映
-
----
-
-## 非機能要件 (NFR)
-
-### NFR-1: 既存モードへの影響なし
-- `OpsMode::Execute` / `OpsMode::Plan` の処理パスは変更しない
-- `execute_ops()` 既存関数のシグネチャを維持し、inception 専用の関数を別途追加する
-
-### NFR-2: 会話履歴の整合性
-- ターン1・ターン2ともに `ops_contexts` に user/assistant 両方を保存（既存フロー）
-- 修正ループ（inception_revise 後の再エンキュー）でも同一スレッドの履歴が引き継がれる
-- `history.len() >= 2`（user + assistant）でターン2と判定するため、修正ループの3回目以降も正しくターン2として処理される
-
-### NFR-3: DBスキーマ変更なし
-- `ops_queue.status` の拡張不要（ターン完了後は `done` のまま）
-- `ops_contexts` の既存構造で会話履歴管理が完結する
-
-### NFR-4: ボタンaction_idの一意性
-- `inception_approve/revise/cancel` は既存の `ops_resolve/ops_escalate/approve_task/reject_task` と重複しない
-- value には `ops_queue.id` を使い、`coding_task.id` と混在しない
-
-### NFR-5: スキルファイル不要
-- inception モードはスキルファイルなしで動作（plan モードと同様）
-- `execute_ops_inception_turn1/2()` はスキルファイルを参照しない
+- Phase 1: heuristics（description 文字数 + repo_key 有無）
+- Phase 2: Claude による intent 分析（LLM コスト評価後に導入）
 
 ---
 
 ## 変更ファイル一覧
 
-| ファイル | 変更種別 | 変更内容 |
-|----------|---------|---------|
-| `src/repo_config.rs` | 変更（小） | `OpsMode::Inception` バリアント追加（3行） |
-| `src/worker/ops.rs` | 追加 | inception 用 soul/rules 定数 × 3、`execute_ops_inception_turn1()` / `execute_ops_inception_turn2()` 関数 |
-| `src/worker/runner.rs` | 変更 | `run_ops_item()` に `OpsMode::Inception` 分岐追加、`history.len()` によるターン判定、ターン2完了後の3ボタン投稿 |
-| `src/server/slack_actions.rs` | 追加 | `process_inception_approve/revise/cancel()` ハンドラ3本、`process_action()` に3分岐追加 |
+| ファイル | 変更種別 | 内容 |
+|----------|---------|------|
+| `src/db.rs` | 変更（小）| `converse_thread_ts` カラム追加、ステータスマイグレーション、`create_task_from_ops_with_status()` 追加 |
+| `src/worker/runner.rs` | 変更（中）| `process_tasks()` に conversing ループ追加、`new → 自動判定` ロジック追加、`check_ops_followups()` を conversing タイムアウトに拡張 |
+| `src/server/slack_events.rs` | 変更（小）| `handle_message()` に `conversing`/`manual` ステータス対応追加 |
+| `src/server/slack_actions.rs` | 変更（中）| 新ボタンハンドラ追加（`task_execute`, `task_manual`, `task_skip`, `task_add_instruction`, `task_resume`, `task_done`）、`approve_task` 等を段階的廃止、`stop_task` を `task_manual` に置き換え、Inception 承認後の `create_task_from_ops_with_status()` 呼び出し変更 |
 
-DBスキーマ変更なし。`src/server/slack_events.rs` の変更なし（Phase 1）。
+**DBスキーマ変更**: `coding_tasks` に `converse_thread_ts TEXT` カラム追加のみ。テーブル統合なし。
 
 ---
 
-## 受け入れ基準 (AC)
+## 受け入れ基準
 
-- **AC-1**: `ops_mode = "inception"` のリポジトリでメッセージを受信すると、Claudeが Intent分析サマリーと3〜5問の確認事項をスレッドに投稿する
-- **AC-2**: ユーザーが `@bot 回答` 形式でスレッドに返信すると、ターン2が実行され要件定義＋タスク分解テーブルが投稿される
-- **AC-3**: ✅承認ボタン押下後に `coding_tasks` にタスクが登録され、Slackに「N件のタスクを登録しました」が通知される
-- **AC-4**: 🔧修正ボタン押下後に「@bot に返信してください」と表示され、次の返信でターン2が再実行される（会話履歴は引き継ぎ）
-- **AC-5**: ❌キャンセルボタン押下後に「キャンセルしました」が表示されて終了する
-- **AC-6**: `OpsMode::Execute` / `OpsMode::Plan` のリポジトリの動作に変化がない
-- **AC-7**: inception 中に claude -p が失敗した場合、既存の `mark_ops_retry/failed` が正しく動作する
+- **AC-1**: Asana から `description >= 100文字` かつ `repo_key` ありのタスクが来ると、自動的に `executing` に遷移して実行開始する
+- **AC-2**: Asana から `description < 100文字` または `repo_key` なしのタスクが来ると、`conversing` に遷移して Slack に質問が投稿される
+- **AC-3**: Slack Inception 経由で承認されたタスクは `conversing` 状態から開始される
+- **AC-4**: `conversing` 状態のタスクスレッドに返信すると、ワーカーが起床して次の会話ターンを実行する
+- **AC-5**: 「実行開始」ボタン押下で `executing` に遷移し、実行が開始される
+- **AC-6**: 「指示追加」ボタン押下後に追加指示を入力すると、それをコンテキストに加えて `conversing` が継続する
+- **AC-7**: 実行中に `BLOCKED:` 出力があると `conversing` に遷移してブロッカーを Slack に投稿する
+- **AC-8**: 「手動修正」ボタンで `manual` に遷移し、「直した」返信で `executing` に戻る
+- **AC-9**: `manual` 状態で「done」返信するとタスクが完了する
+- **AC-10**: `repo_key` ありのタスクは PR 作成、`repo_key` なしは Slack 返信で完了する
+- **AC-11**: 既存の `ops_queue` パイプライン（Execute/Plan/Inception モード）の動作に変化がない
+- **AC-12**: 既存の `done` / `error` / `sleeping` ステータスのタスクは正常に参照・表示される
+
+---
+
+## フェーズ分割
+
+### Phase 1（今回実装）
+
+- FR-1: `converse_thread_ts` カラム追加 + ステータスマイグレーション
+- FR-2: `new → 自動判定`（heuristics版）
+- FR-3: `conversing` フェーズ基本実装（スレッド返信受信 + ワーカー継続）
+- FR-4: `manual` ステータス基本実装（ボタン + テキストコマンド）
+- FR-6: 新ボタン追加（`task_execute`, `task_manual`, `task_skip`, `task_add_instruction`）
+
+### Phase 2（後続）
+
+- FR-5: `executing → conversing` ブロッカー検知
+- FR-2 精度向上: Claude による intent 分析
+- FR-7 完全実装: 成果物タイプの動的判断
+- BedrockBackend 統合後: セッション管理の完全統一
 
 ---
 
@@ -382,19 +404,32 @@ DBスキーマ変更なし。`src/server/slack_events.rs` の変更なし（Phas
 
 | リスク | 影響 | 対策 |
 |--------|------|------|
-| R-1: `history.len()` によるターン判定のズレ | ターン2以降が誤ってターン1として処理される可能性 | `history.is_empty()` でターン1判定のため、1件でも履歴があればターン2。修正ループも意図通り機能する |
-| R-2: タスク分解テキストのパース失敗 | coding_tasks が0件登録 | パースエラー時は要件テキスト全体を1タスクとして登録するフォールバックを実装 |
-| R-3: admin 制限によるユーザビリティ低下 | inception 対話がadminしか使えない | Phase 1は admin @bot メンション方式とし、Phase 2で全ユーザー対応を追加 |
-| R-4: Asana登録なし（Phase 1）でのユーザー期待のズレ | 「Asanaにタスクが登録されていない」という混乱 | Slack通知で「ローカル登録のみ、Asana連携は後続フェーズ」を明示 |
+| R-1: `planning`/`proposed` → `conversing` マイグレーション中のタスク消失 | 実行中タスクのステータス不整合 | `executing`/`ci_pending` 以外のタスクのみ変換 |
+| R-2: `approve_task` ボタン廃止による既存 `proposed` タスクの操作不能 | ユーザーが承認できない | マイグレーション完了まで並存、完了後に廃止 |
+| R-3: `converse_thread_ts` が NULL のタスクが `conversing` に遷移 | `ops_contexts` と紐付けできない | `conversing` 遷移時に `slack_thread_ts` があればそちらを使うフォールバック |
+| R-4: 動的判定のコスト増 | Phase 2 で LLM 呼び出しが増加 | Phase 1 は heuristics のみ、Phase 2 は評価後に導入 |
+| R-5: worktree なし ops タスクが PR フローに入る | エラー発生 | `repo_key` チェックを worktree 作成前に必須化（scout 指摘） |
+| R-6: `auto_execute` フラグ再定義による既存動作変化 | `auto_execute = true` のリポジトリで挙動が変わる | 既存フラグの意味を「`new → executing` 直行許可」として再定義。後方互換を維持しつつ `planning`/`proposed` をスキップするだけなので実質同等 |
+| R-7: `conversing` タイムアウト → sleeping 遷移の誤検知 | 積極的に会話中のタスクが sleeping になる | `updated_at` だけでなく `ops_contexts` の最終エントリ時刻も参照してタイムアウト判定する |
 
 ---
 
 ## 設計判断の記録
 
-1. **DBスキーマ変更なし（researcher提案採用）**: `ops_contexts` の履歴件数でターン判定できるため、`inception_turn` カラム（scout提案）は不要。シンプルさを優先。
+1. **DB統合しない（scout 推奨採用）**: `coding_tasks` と `ops_queue` のカラム差異が大きく、統合によるメリットより移行コストが高い。`WorkItem` enum による論理抽象化で対処。
 
-2. **`execute_ops()` シグネチャ維持**: inception 専用の `execute_ops_inception_turn1/2()` を別関数として追加することで、既存の execute/plan パスへの影響をゼロに抑える。
+2. **`planning`/`proposed` 廃止（ユーザー合意済みモデルに従う）**: 新しいステータスモデルでは `conversing` が要件ラリーと承認待ちを兼ねる。既存タスクはマイグレーションで変換。`approved`/`auto_approved` も `executing` に統合。
 
-3. **Asana API 直接作成はフェーズ2**: `AsanaClient::create_task()` が存在せず、スコープを絞って初回実装を確実に完了させる。`create_task_from_ops()` のローカル登録パターンを再利用。
+3. **Phase 1 の `new → 自動判定` は heuristics（LLM コスト回避）**: Claude による動的判定は追加コストが発生するため Phase 1 は description 文字数と repo_key 有無で判定。精度向上は Phase 2。
 
-4. **スレッド返信の受け取りは既存ルートを活用（Phase 1）**: Inception専用のスレッド返信検出ロジックを追加するより、既存の「admin @bot メンション → エンキュー」ルートを使う。ユーザー体験の改善はPhase 2。
+4. **`ops_contexts` を coding_tasks の conversing にも流用（researcher 提案採用）**: 同一テーブルで `channel + thread_ts` をキーとして管理。`converse_thread_ts` カラムで紐付けを明示。
+
+5. **`executing → conversing` 時に `claude_session_id` 保持（researcher 提案採用）**: ブロッカー解消後に `--resume` で実行再開できるよう session_id をクリアしない。
+
+6. **`manual` はボタン主体（researcher 推奨採用）**: テキストコマンドは `app_mention` のルーティングが複雑になるため、Block Kit ボタンで統一。`stop_task`（`executing → error`）を `task_manual`（`executing → manual`）に置き換え。
+
+7. **Inception 後の二重分析廃止（researcher 指摘を要件に追加）**: `ops_inception_approve` 経由のタスクは `status = 'executing'` で挿入し、`planning → proposed` をスキップ。`create_task_from_ops_with_status()` で実現。
+
+8. **`auto_execute` フラグの再定義**: 旧来の `new → auto_approved` スキップから「`new → executing` 直行許可」に意味を更新。既存設定は後方互換を維持。
+
+9. **`conversing` タイムアウトは `check_ops_followups()` 拡張で対応（researcher 指摘採用）**: `ops_queue` の既存フォローアップ機構を `coding_tasks.conversing` 状態にも適用。新規コードを最小化。

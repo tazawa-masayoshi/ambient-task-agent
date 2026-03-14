@@ -99,6 +99,8 @@ mod tests {
             current_subtask_index: None,
             created_at: "2026-01-01T00:00:00.000Z".into(),
             updated_at: updated_at.into(),
+            source: "asana".into(),
+            converse_thread_ts: None,
         }
     }
 

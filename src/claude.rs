@@ -27,6 +27,8 @@ pub struct AgentRequest {
     pub max_output_bytes: Option<usize>,
     /// セッション継続用: 前回の session_id を指定すると --resume で再開
     pub resume_session_id: Option<String>,
+    /// JSON Schema を指定すると構造化出力モード（result ではなく structured_output に入る）
+    pub json_schema: Option<String>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -68,6 +70,9 @@ impl TokenUsage {
 struct ClaudeJsonResponse {
     #[serde(default)]
     result: Option<String>,
+    /// --json-schema 使用時は result ではなくこちらに構造化出力が入る
+    #[serde(default)]
+    structured_output: Option<serde_json::Value>,
     #[serde(default)]
     is_error: bool,
     #[serde(default)]
@@ -151,7 +156,12 @@ impl ClaudeCliBackend {
         match serde_json::from_str::<ClaudeJsonResponse>(raw) {
             Ok(parsed) => {
                 let is_error = parsed.is_error;
-                let mut stdout = parsed.result.unwrap_or_default();
+                // --json-schema 使用時は structured_output を優先
+                let mut stdout = if let Some(ref so) = parsed.structured_output {
+                    serde_json::to_string(so).unwrap_or_default()
+                } else {
+                    parsed.result.unwrap_or_default()
+                };
 
                 let usage = parsed.usage.map(|u| TokenUsage {
                     input_tokens: u.input_tokens,
@@ -237,12 +247,16 @@ impl AgentBackend for ClaudeCliBackend {
         }
 
         if let Some(ref sp) = request.system_prompt {
-            args.extend(["--system-prompt", sp]);
+            args.extend(["--append-system-prompt", sp]);
         }
         args.extend(["--max-turns", &turns_str]);
 
         if let Some(ref tools) = request.allowed_tools {
             args.extend(["--allowedTools", tools]);
+        }
+
+        if let Some(ref schema) = request.json_schema {
+            args.extend(["--json-schema", schema]);
         }
 
         let mut cmd = Command::new("claude");
@@ -374,6 +388,8 @@ pub struct ClaudeRunner {
     backend: Option<Arc<dyn AgentBackend>>,
     /// セッション継続用: 前回の session_id
     resume_session_id: Option<String>,
+    /// JSON Schema（構造化出力モード）
+    json_schema: Option<String>,
 }
 
 impl ClaudeRunner {
@@ -395,7 +411,14 @@ impl ClaudeRunner {
             hooks: None,
             backend: None,
             resume_session_id: None,
+            json_schema: None,
         }
+    }
+
+    /// JSON Schema を指定して構造化出力モードを有効化
+    pub fn json_schema(mut self, schema: impl Into<String>) -> Self {
+        self.json_schema = Some(schema.into());
+        self
     }
 
     /// セッション継続: 前回の session_id を指定して --resume で再開
@@ -574,6 +597,7 @@ impl ClaudeRunner {
             timeout_secs: self.timeout_secs,
             max_output_bytes: self.max_output_bytes,
             resume_session_id: self.resume_session_id.clone(),
+            json_schema: self.json_schema.clone(),
         };
 
         let backend = self.backend.as_ref()

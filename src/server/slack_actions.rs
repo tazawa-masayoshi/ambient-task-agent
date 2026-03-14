@@ -391,6 +391,57 @@ async fn process_action(
             }
         }
 
+        "task_execute" => {
+            // conversing/proposed → approved（worker ループが executing に遷移して実行）
+            if task.status == "conversing" || task.status == "proposed" || task.status == "manual" {
+                state.db.update_status(task.id, "approved")?;
+                slack
+                    .reply_thread(channel, reply_ts, ":white_check_mark: 実行を開始します...")
+                    .await?;
+                tracing::info!("Task {} approved via task_execute button", task.id);
+                state.wake_worker();
+            }
+        }
+
+        "task_converse" => {
+            // ステータス変更なし（次のスレッド返信を待つ）
+            slack
+                .reply_thread(
+                    channel,
+                    reply_ts,
+                    ":speech_balloon: スレッドに追加の指示を入力してください",
+                )
+                .await?;
+        }
+
+        "task_manual" => {
+            state.db.update_status(task.id, "manual")?;
+            let branch_info = task
+                .branch_name
+                .as_deref()
+                .map(|b| format!("\nブランチ: `{}`", b))
+                .unwrap_or_default();
+            slack
+                .reply_thread(
+                    channel,
+                    reply_ts,
+                    &format!(
+                        ":hammer: 手動修正モードに入りました{}\n完了したら `直した` と返信してください",
+                        branch_info
+                    ),
+                )
+                .await?;
+            tracing::info!("Task {} set to manual mode via task_manual button", task.id);
+        }
+
+        "task_skip" => {
+            state.db.update_status(task.id, "done")?;
+            slack
+                .reply_thread(channel, reply_ts, ":fast_forward: タスクをスキップしました")
+                .await?;
+            tracing::info!("Task {} skipped via task_skip button", task.id);
+        }
+
         _ => {
             tracing::debug!("Unknown action_id: {}", action_id);
         }
