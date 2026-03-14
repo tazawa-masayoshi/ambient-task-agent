@@ -1,29 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, Utc};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Deserialize)]
-struct ServiceAccountKey {
-    client_email: String,
-    private_key: String,
-    token_uri: String,
-}
-
-#[derive(Debug, Serialize)]
-struct JwtClaims {
-    iss: String,
-    scope: String,
-    aud: String,
-    iat: i64,
-    exp: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    expires_in: u64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalendarEvent {
@@ -59,42 +36,32 @@ pub struct EntryPoint {
 }
 
 #[derive(Debug, Deserialize)]
-struct EventsListResponse {
+struct GwsEventsResponse {
     items: Option<Vec<CalendarEvent>>,
 }
 
 pub struct GoogleCalendarClient {
-    client: reqwest::Client,
-    service_account_key: ServiceAccountKey,
+    gws_path: String,
     calendar_id: String,
-    cached_token: Option<(String, DateTime<Utc>)>,
 }
 
 impl GoogleCalendarClient {
-    pub fn new(key_path: &str, calendar_id: &str) -> Result<Self> {
-        let key_json = std::fs::read_to_string(key_path)
-            .with_context(|| format!("Failed to read service account key: {}", key_path))?;
-        let key: ServiceAccountKey = serde_json::from_str(&key_json)
-            .context("Failed to parse service account key JSON")?;
-
-        // token_uri を oauth2.googleapis.com に制限（SSRF 防止）
+    pub fn new(gws_path: &str, calendar_id: &str) -> Result<Self> {
+        // gws バイナリの存在確認
+        let path = std::path::Path::new(gws_path);
         anyhow::ensure!(
-            key.token_uri.starts_with("https://oauth2.googleapis.com/"),
-            "token_uri must be https://oauth2.googleapis.com/*, got: {}",
-            key.token_uri
+            path.exists(),
+            "gws binary not found at: {}",
+            gws_path
         );
 
         Ok(Self {
-            client: reqwest::Client::new(),
-            service_account_key: key,
+            gws_path: gws_path.to_string(),
             calendar_id: calendar_id.to_string(),
-            cached_token: None,
         })
     }
 
     pub async fn fetch_today_events(&mut self) -> Result<Vec<CalendarEvent>> {
-        let token = self.get_access_token().await?;
-
         let now = Local::now();
         let today_start = now
             .date_naive()
@@ -107,33 +74,21 @@ impl GoogleCalendarClient {
         let time_min = today_start.to_rfc3339();
         let time_max = today_end.to_rfc3339();
 
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-            urlencoded(&self.calendar_id)
-        );
+        let params = serde_json::json!({
+            "calendarId": self.calendar_id,
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": true,
+            "orderBy": "startTime",
+            "maxResults": 50,
+        });
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
-            .query(&[
-                ("timeMin", time_min.as_str()),
-                ("timeMax", time_max.as_str()),
-                ("singleEvents", "true"),
-                ("orderBy", "startTime"),
-                ("maxResults", "50"),
-            ])
-            .send()
-            .await
-            .context("Failed to call Google Calendar API")?;
+        let output = self
+            .run_gws(&["calendar", "events", "list", "--params", &params.to_string()])
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Google Calendar API error ({}): {}", status, body);
-        }
-
-        let data: EventsListResponse = resp.json().await.context("Failed to parse events response")?;
+        let data: GwsEventsResponse =
+            serde_json::from_str(&output).context("Failed to parse gws events response")?;
 
         let events = data
             .items
@@ -153,13 +108,6 @@ impl GoogleCalendarClient {
         end: DateTime<Utc>,
         description: Option<&str>,
     ) -> Result<String> {
-        let token = self.get_access_token().await?;
-
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-            urlencoded(&self.calendar_id)
-        );
-
         let mut body = serde_json::json!({
             "summary": summary,
             "start": { "dateTime": start.to_rfc3339() },
@@ -170,22 +118,24 @@ impl GoogleCalendarClient {
             body["description"] = serde_json::Value::String(desc.to_string());
         }
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to create calendar event")?;
+        let params = serde_json::json!({
+            "calendarId": self.calendar_id,
+        });
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Google Calendar create event error ({}): {}", status, body);
-        }
+        let output = self
+            .run_gws(&[
+                "calendar",
+                "events",
+                "insert",
+                "--params",
+                &params.to_string(),
+                "--json",
+                &body.to_string(),
+            ])
+            .await?;
 
-        let event: CalendarEvent = resp.json().await.context("Failed to parse created event")?;
+        let event: CalendarEvent =
+            serde_json::from_str(&output).context("Failed to parse created event")?;
         Ok(event.id)
     }
 
@@ -209,80 +159,43 @@ impl GoogleCalendarClient {
     }
 
     async fn delete_event(&mut self, event_id: &str) -> Result<()> {
-        let token = self.get_access_token().await?;
+        let params = serde_json::json!({
+            "calendarId": self.calendar_id,
+            "eventId": event_id,
+        });
 
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}",
-            urlencoded(&self.calendar_id),
-            urlencoded(event_id),
-        );
-
-        let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .context("Failed to delete calendar event")?;
-
-        if !resp.status().is_success() && resp.status().as_u16() != 410 {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Google Calendar delete event error ({}): {}", status, body);
-        }
+        self.run_gws(&[
+            "calendar",
+            "events",
+            "delete",
+            "--params",
+            &params.to_string(),
+        ])
+        .await?;
 
         Ok(())
     }
 
-    async fn get_access_token(&mut self) -> Result<String> {
-        if let Some((ref token, ref expires_at)) = self.cached_token {
-            if Utc::now() < *expires_at - Duration::minutes(5) {
-                return Ok(token.clone());
-            }
-        }
-
-        let jwt = self.create_jwt()?;
-
-        let resp = self
-            .client
-            .post(&self.service_account_key.token_uri)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", &jwt),
-            ])
-            .send()
+    /// gws CLI をサブプロセスとして実行
+    async fn run_gws(&self, args: &[&str]) -> Result<String> {
+        let output = tokio::process::Command::new(&self.gws_path)
+            .args(args)
+            .output()
             .await
-            .context("Failed to request access token")?;
+            .with_context(|| format!("Failed to execute gws: {}", self.gws_path))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Token request failed ({}): {}", status, body);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "gws command failed (exit {}): {}{}",
+                output.status.code().unwrap_or(-1),
+                stderr,
+                stdout
+            );
         }
 
-        let token_resp: TokenResponse = resp.json().await.context("Failed to parse token response")?;
-
-        let expires_at = Utc::now() + Duration::seconds(token_resp.expires_in as i64);
-        self.cached_token = Some((token_resp.access_token.clone(), expires_at));
-
-        Ok(token_resp.access_token)
-    }
-
-    fn create_jwt(&self) -> Result<String> {
-        let now = Utc::now().timestamp();
-        let claims = JwtClaims {
-            iss: self.service_account_key.client_email.clone(),
-            scope: "https://www.googleapis.com/auth/calendar.events".to_string(),
-            aud: self.service_account_key.token_uri.clone(),
-            iat: now,
-            exp: now + 3600,
-        };
-
-        let header = Header::new(Algorithm::RS256);
-        let key = EncodingKey::from_rsa_pem(self.service_account_key.private_key.as_bytes())
-            .context("Failed to parse RSA private key")?;
-
-        encode(&header, &claims, &key).context("Failed to create JWT")
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
 
@@ -316,8 +229,4 @@ impl CalendarEvent {
             .find(|ep| ep.entry_point_type.as_deref() == Some("video"))
             .and_then(|ep| ep.uri.as_deref())
     }
-}
-
-fn urlencoded(s: &str) -> String {
-    s.replace('@', "%40").replace('#', "%23")
 }

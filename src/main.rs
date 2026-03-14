@@ -508,7 +508,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         bot_user_id: bot_user_id.clone(),
     };
 
-    // Google Calendar クライアント初期化
+    // Google Calendar クライアント初期化（gws CLI 経由 OAuth）
     let gcal_client = load_google_calendar_config().and_then(|gcal_config| {
         let calendar_id = repos_config
             .defaults
@@ -516,11 +516,11 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
             .as_deref()
             .unwrap_or(&gcal_config.calendar_id);
         match google::calendar::GoogleCalendarClient::new(
-            &gcal_config.service_account_key_path,
+            &gcal_config.gws_path,
             calendar_id,
         ) {
             Ok(c) => {
-                tracing::info!("Google Calendar client initialized (calendar: {})", calendar_id);
+                tracing::info!("Google Calendar client initialized via gws CLI (calendar: {})", calendar_id);
                 Some(c)
             }
             Err(e) => {

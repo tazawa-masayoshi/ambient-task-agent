@@ -116,31 +116,38 @@ pub fn load_asana_config() -> Result<AsanaConfig> {
 
 #[derive(Debug, Clone)]
 pub struct GoogleCalendarConfig {
-    pub service_account_key_path: String,
+    pub gws_path: String,
     pub calendar_id: String,
 }
 
 pub fn load_google_calendar_config() -> Option<GoogleCalendarConfig> {
     let env = load_credentials_env();
 
-    let key_path = env
-        .get("GOOGLE_SERVICE_ACCOUNT_KEY")
-        .cloned()
-        .unwrap_or_else(|| {
-            home_dir()
-                .join(".credentials/Masayoshi.json")
-                .to_string_lossy()
-                .to_string()
-        });
-
-    if !std::path::Path::new(&key_path).exists() {
-        return None;
-    }
-
     let calendar_id = env.get("GOOGLE_CALENDAR_ID").cloned()?;
 
+    // gws バイナリのパスを検索
+    let gws_path = env.get("GWS_PATH").cloned().unwrap_or_else(|| {
+        // mise shims → which → フォールバック
+        let candidates = [
+            home_dir()
+                .join(".local/share/mise/shims/gws")
+                .to_string_lossy()
+                .to_string(),
+            home_dir()
+                .join(".local/share/mise/installs/node/22.14.0/bin/gws")
+                .to_string_lossy()
+                .to_string(),
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return c.clone();
+            }
+        }
+        "gws".to_string()
+    });
+
     Some(GoogleCalendarConfig {
-        service_account_key_path: key_path,
+        gws_path,
         calendar_id,
     })
 }
