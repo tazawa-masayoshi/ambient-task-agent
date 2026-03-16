@@ -50,6 +50,13 @@ ops_mode = "plan"
 ops_description = "新規取材タイプの追加・企画チーム自動化支援の分析"
 ops_skills = [".claude/skills/add-interview/SKILL.md"]
 
+# ── 自己改善（self-improvement）──────────────
+[[repo]]
+key = "self"
+github = "tazawa-masayoshi/ambient-task-agent"
+default_branch = "main"
+auto_execute = true
+
 # ── スケジュールジョブ ──────────────────────
 # cron 式: "sec min hour day_of_month month day_of_week year"
 
@@ -81,4 +88,10 @@ prompt = ""
 key = "weekly_pm_review"
 cron = "0 0 17 * * Fri *"           # 毎週金曜 17:00
 job_type = "weekly_pm_review"
+prompt = ""
+
+[[schedule]]
+key = "self_improvement"
+cron = "0 0 10 * * Mon *"           # 毎週月曜 10:00
+job_type = "self_improvement"
 prompt = ""

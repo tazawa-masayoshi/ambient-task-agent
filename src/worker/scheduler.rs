@@ -124,6 +124,7 @@ async fn execute_job(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<(
         "meeting_reminder" => run_meeting_reminder(job, ctx).await,
         "stagnation_check" => run_stagnation_check(job, ctx).await,
         "weekly_pm_review" => run_weekly_pm_review(job, ctx).await,
+        "self_improvement" => run_self_improvement(job, ctx).await,
         other => {
             tracing::warn!("Unknown job type: {}", other);
             Ok(())
@@ -1392,6 +1393,147 @@ fn build_evening_message(cache: &TasksCache, today: &str) -> String {
     ));
 
     msg
+}
+
+// ============================================================================
+// Self-Improvement（自己改善）
+// ============================================================================
+
+async fn run_self_improvement(
+    _job: &ScheduledJob,
+    ctx: &mut SchedulerContext,
+) -> Result<()> {
+    // 1. 分類履歴を分析
+    let classification_history = ctx.db.get_recent_classification_history(20).unwrap_or_default();
+    let total = classification_history.len();
+    let incorrect: Vec<_> = classification_history.iter()
+        .filter(|r| r.outcome != "correct")
+        .collect();
+
+    // 2. 直近のエラータスクを取得
+    let error_tasks = ctx.db.get_tasks_by_status("error").unwrap_or_default();
+
+    // 3. memory.md を読む
+    let memory = context::read_memory(&ctx.repos_base_dir);
+
+    // 分析材料がなければスキップ
+    if total == 0 && error_tasks.is_empty() && memory.is_empty() {
+        tracing::debug!("self_improvement: no data to analyze, skipping");
+        return Ok(());
+    }
+
+    // 4. 分析プロンプト構築
+    let mut analysis_parts = vec![
+        "あなたは ambient-task-agent の自己改善アナリストです。\n\
+         以下のデータを分析し、改善提案をタスクとして出力してください。".to_string(),
+    ];
+
+    if total > 0 {
+        let accuracy = if total > 0 {
+            ((total - incorrect.len()) as f64 / total as f64 * 100.0) as u32
+        } else { 100 };
+        let mut section = format!("## 分類精度\n正解率: {}% ({}/{}件)\n", accuracy, total - incorrect.len(), total);
+        if !incorrect.is_empty() {
+            section.push_str("\n誤分類:\n");
+            for r in &incorrect {
+                section.push_str(&format!("- 「{}」→ {} だったが {} が必要だった\n",
+                    r.task_name, r.classification, r.outcome));
+            }
+        }
+        analysis_parts.push(section);
+    }
+
+    if !error_tasks.is_empty() {
+        let mut section = format!("## エラータスク ({}件)\n", error_tasks.len());
+        for t in error_tasks.iter().take(5) {
+            let err = t.error_message.as_deref().unwrap_or("不明");
+            section.push_str(&format!("- #{} {} — {}\n", t.id, t.asana_task_name,
+                crate::claude::truncate_str(err, 100)));
+        }
+        analysis_parts.push(section);
+    }
+
+    if !memory.is_empty() {
+        analysis_parts.push(format!("## 学習メモ\n{}", crate::claude::truncate_str(&memory, 500)));
+    }
+
+    analysis_parts.push(
+        "## 出力フォーマット\n\
+         改善提案を以下の JSON 形式で出力してください:\n\
+         ```json\n\
+         {\"proposals\": [{\"title\": \"改善タイトル\", \"description\": \"具体的な改善内容\", \"priority\": \"high/medium/low\"}]}\n\
+         ```\n\
+         提案がなければ空配列 `{\"proposals\": []}` を返してください。\n\
+         最大3件まで。最も効果的な改善のみ提案してください。".to_string()
+    );
+
+    let prompt = analysis_parts.join("\n\n");
+    let schema = r#"{"type":"object","properties":{"proposals":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["title","description","priority"]}}},"required":["proposals"]}"#;
+
+    let result = ClaudeRunner::new("self_improvement", &prompt)
+        .system_prompt("あなたは ambient-task-agent の改善を分析するエージェントです。コードの品質、分類精度、エラーパターンを分析して具体的な改善提案をしてください。")
+        .max_turns(1)
+        .allowed_tools("")
+        .json_schema(schema)
+        .log_dir(&ctx.log_dir)
+        .with_context(&ctx.runner_ctx)
+        .run()
+        .await?;
+
+    if !result.success {
+        tracing::warn!("self_improvement: Claude analysis failed: {}", result.stderr);
+        return Ok(());
+    }
+
+    // 5. 提案をパースしてタスクとして登録
+    let proposals: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&result.stdout)
+        .ok()
+        .and_then(|v| v.get("proposals")?.as_array().cloned())
+        .unwrap_or_default();
+
+    if proposals.is_empty() {
+        tracing::info!("self_improvement: no proposals this week");
+        return Ok(());
+    }
+
+    let slack_channel = &ctx.db.get_default_slack_channel().unwrap_or_default();
+    let channel = if slack_channel.is_empty() {
+        // フォールバック: repos_base_dir から設定を読む
+        return Ok(());
+    } else {
+        slack_channel.as_str()
+    };
+
+    let mut registered = Vec::new();
+    for p in &proposals {
+        let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("自己改善タスク");
+        let desc = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let priority = p.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
+
+        let task_name = format!("[self-improvement][{}] {}", priority, title);
+        let task_id = ctx.db.insert_task(
+            &format!("self_{}", chrono::Utc::now().timestamp_millis()),
+            &task_name,
+            Some(desc),
+            Some("self"),
+            None,
+        )?;
+        registered.push((task_id, task_name.clone()));
+        tracing::info!("self_improvement: registered task #{} '{}'", task_id, task_name);
+    }
+
+    // 6. Slack に通知
+    let task_list: Vec<String> = registered.iter()
+        .map(|(id, name)| format!("• #{} {}", id, name))
+        .collect();
+    let msg = format!(
+        ":bulb: *自己改善提案* ({}件)\n{}\n\n_conversing フローで確認後、承認すると PR が作成されます_",
+        registered.len(),
+        task_list.join("\n")
+    );
+    ctx.slack.post_message(channel, &msg).await.ok();
+
+    Ok(())
 }
 
 #[cfg(test)]

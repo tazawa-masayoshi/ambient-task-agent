@@ -419,6 +419,30 @@ impl Db {
         Ok(stmt.query_row(params![status], row_to_task).ok())
     }
 
+    /// 指定ステータスのタスクを全件取得
+    pub fn get_tasks_by_status(&self, status: &str) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks WHERE status = ?1 ORDER BY id DESC LIMIT 20",
+            TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let tasks = stmt.query_map(params![status], row_to_task)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// デフォルトの Slack チャンネルを取得（最新タスクの slack_channel から推定）
+    pub fn get_default_slack_channel(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let channel: String = conn.query_row(
+            "SELECT slack_channel FROM coding_tasks WHERE slack_channel IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(channel)
+    }
+
     pub fn get_new_task(&self) -> Result<Option<CodingTask>> {
         self.get_task_by_status("new")
     }
