@@ -1,11 +1,22 @@
 # ambient-task-agent
 
-Asanaをバックエンドとしたアンビエントタスクエージェント。
-Claude Codeのhook/skillをトリガーにタスク状態を自動管理し、
-wez-sidebarなどのUIからタスク一覧を参照できるようにする。
+Rust 製の自律タスクエージェント。Asana/Slack からタスクを受け取り、Claude Code で自動実行する。
+
+## ステータスモデル
+
+```
+new → executing（明確）/ conversing（曖昧）
+conversing → executing / manual / done
+manual → executing / done
+executing → done / ci_pending / conversing（ブロッカー検知）
+```
+
+旧ステータス（planning/proposed/approved/auto_approved）は廃止済み。
 
 ## Development Guidelines
 
-- Follow the user's instructions precisely
-- Asana MCP (`asana@claude-plugins-official`) は認証済み
-- 詳細は `spec/context.md` を参照
+- `cargo clippy -- -D warnings` がクリーンであること
+- テスト: `cargo test`（現在36件）
+- 設計判断は `docs/adr/` に記録
+- 破壊的変更は `CHANGELOG.md` に記録
+- 詳細な設計: `plan/design.md`, `plan/requirements.md`
