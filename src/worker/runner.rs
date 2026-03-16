@@ -185,33 +185,17 @@ impl Worker {
         // 2. conversing タスクの継続処理（ユーザー返信があれば次の Claude ターンを実行）
         had_error |= self.process_conversing_tasks();
 
-        // 2.5 (並存期間) approved / auto_approved → executing
-        // v12 マイグレーション完了後に削除
-        match self.db.get_approved_task() {
-            Ok(Some(task)) => {
-                tracing::info!("Executing approved task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if self.db.update_status(task.id, "executing").is_ok() {
-                    let task_id = task.id;
-                    self.spawn_task(task_id, |w| async move { w.execute_approved_task(task).await });
-                }
+        // 2.5 executing タスクを拾って実行（classify_and_dispatch で executing に設定済み）
+        match self.db.get_task_by_status("executing") {
+            Ok(Some(task)) if task.started_at_task.is_none() => {
+                // started_at が未設定 = まだ実行開始していない
+                tracing::info!("Executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
+                let task_id = task.id;
+                self.spawn_task(task_id, |w| async move { w.execute_task(task).await });
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => {
-                tracing::error!("Failed to fetch approved task: {}", e);
-                had_error = true;
-            }
-        }
-        match self.db.get_auto_approved_task() {
-            Ok(Some(task)) => {
-                tracing::info!("Auto-executing task: {} ({})", task.asana_task_name, task.asana_task_gid);
-                if self.db.update_status(task.id, "executing").is_ok() {
-                    let task_id = task.id;
-                    self.spawn_task(task_id, |w| async move { w.execute_approved_task(task).await });
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("Failed to fetch auto_approved task: {}", e);
+                tracing::error!("Failed to fetch executing task: {}", e);
                 had_error = true;
             }
         }
@@ -788,7 +772,7 @@ impl Worker {
     ///
     /// session_id があれば --resume で Plan セッションを継続、なければフルプロンプトで実行。
     /// repo_entry があれば worktree 隔離実行、なければ直接実行。
-    async fn execute_approved_task(&self, task: CodingTask) -> Result<()> {
+    async fn execute_task(&self, task: CodingTask) -> Result<()> {
         let repo_entry = task
             .repo_key
             .as_deref()
@@ -1244,7 +1228,7 @@ impl Worker {
                 if task.status != "executing" {
                     self.db.update_status(task.id, "executing")?;
                 }
-                self.execute_approved_task(task).await
+                self.execute_task(task).await
             }
             TaskClassification::Converse => {
                 // heuristics で executing にしていた場合は conversing に修正

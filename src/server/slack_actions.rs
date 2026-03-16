@@ -238,113 +238,9 @@ async fn process_action(
         .unwrap_or("");
 
     match action_id {
-        "approve_task" => {
-            if task.status != "proposed" {
-                tracing::debug!(
-                    "Task {} is not in proposed status ({}), ignoring approve",
-                    task.id,
-                    task.status
-                );
-                return Ok(());
-            }
-            state.db.update_status(task.id, "approved")?;
-
-            // ボタンを無効化（メッセージ更新）
-            if let Some(msg_ts) = message_ts {
-                let updated_blocks = serde_json::json!([
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": ":white_check_mark: *承認されました*"
-                        }
-                    }
-                ]);
-                slack
-                    .update_blocks(channel, msg_ts, &updated_blocks, "承認されました")
-                    .await
-                    .ok();
-            }
-
-            slack
-                .reply_thread(
-                    channel,
-                    reply_ts,
-                    ":white_check_mark: 要件定義が承認されました！タスクを分解します...",
-                )
-                .await?;
-            tracing::info!("Task {} approved via Block Kit button", task.id);
-            state.wake_worker();
-        }
-
-        "reject_task" => {
-            if task.status != "proposed" {
-                return Ok(());
-            }
-            state.db.update_status(task.id, "rejected")?;
-
-            if let Some(msg_ts) = message_ts {
-                let updated_blocks = serde_json::json!([
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": ":x: *却下されました*"
-                        }
-                    }
-                ]);
-                slack
-                    .update_blocks(channel, msg_ts, &updated_blocks, "却下されました")
-                    .await
-                    .ok();
-            }
-
-            slack
-                .reply_thread(
-                    channel,
-                    reply_ts,
-                    ":x: 要件定義が却下されました。スレッドでフィードバックを送信してください。",
-                )
-                .await?;
-            tracing::info!("Task {} rejected via Block Kit button", task.id);
-        }
-
-        "regenerate_task" => {
-            if task.status != "proposed" {
-                return Ok(());
-            }
-            state.db.reset_for_regeneration(task.id)?;
-
-            if let Some(msg_ts) = message_ts {
-                let updated_blocks = serde_json::json!([
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": ":arrows_counterclockwise: *再生成中...*"
-                        }
-                    }
-                ]);
-                slack
-                    .update_blocks(channel, msg_ts, &updated_blocks, "再生成中...")
-                    .await
-                    .ok();
-            }
-
-            slack
-                .reply_thread(
-                    channel,
-                    reply_ts,
-                    ":arrows_counterclockwise: 要件定義を再生成します...",
-                )
-                .await?;
-            tracing::info!("Task {} queued for regeneration via Block Kit button", task.id);
-            state.wake_worker();
-        }
-
         "stop_task" => {
             match task.status.as_str() {
-                "executing" | "ci_pending" | "planning" => {
+                "executing" | "ci_pending" | "conversing" => {
                     let prev_status = task.status.clone();
                     state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
 
@@ -393,7 +289,7 @@ async fn process_action(
 
         "task_execute" => {
             // conversing/manual → executing（直接実行開始）
-            if matches!(task.status.as_str(), "conversing" | "proposed" | "manual") {
+            if matches!(task.status.as_str(), "conversing" | "manual") {
                 state.db.update_status(task.id, "executing")?;
                 slack
                     .reply_thread(channel, reply_ts, ":rocket: 実行を開始します...")

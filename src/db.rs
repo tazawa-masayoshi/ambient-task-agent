@@ -421,7 +421,7 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    fn get_task_by_status(&self, status: &str) -> Result<Option<CodingTask>> {
+    pub fn get_task_by_status(&self, status: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT {} FROM coding_tasks WHERE status = ?1 ORDER BY id ASC LIMIT 1",
@@ -457,14 +457,6 @@ impl Db {
 
     pub fn get_new_task(&self) -> Result<Option<CodingTask>> {
         self.get_task_by_status("new")
-    }
-
-    pub fn get_approved_task(&self) -> Result<Option<CodingTask>> {
-        self.get_task_by_status("approved")
-    }
-
-    pub fn get_auto_approved_task(&self) -> Result<Option<CodingTask>> {
-        self.get_task_by_status("auto_approved")
     }
 
     pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
@@ -524,16 +516,6 @@ impl Db {
         Ok(task)
     }
 
-    /// 再生成用: status=new, analysis_text=NULL にリセット
-    pub fn reset_for_regeneration(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET status = 'new', analysis_text = NULL, plan_text = NULL, subtasks_json = NULL, slack_plan_ts = NULL, error_message = NULL, claude_session_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     /// slack_thread_ts でタスクを検索（スレッド内メッセージ用）
     pub fn find_task_by_thread_ts(&self, channel: &str, thread_ts: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
@@ -563,7 +545,7 @@ impl Db {
     pub fn find_task_by_gid(&self, asana_task_gid: &str) -> Result<Option<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'archived', 'done') ORDER BY id DESC LIMIT 1",
+            "SELECT {} FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('done', 'error', 'archived') ORDER BY id DESC LIMIT 1",
             TASK_COLUMNS
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -574,7 +556,7 @@ impl Db {
     pub fn task_exists_for_gid(&self, asana_task_gid: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('completed', 'failed', 'done')",
+            "SELECT COUNT(*) FROM coding_tasks WHERE asana_task_gid = ?1 AND status NOT IN ('done', 'error', 'archived')",
             params![asana_task_gid],
             |row| row.get(0),
         )?;

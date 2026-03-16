@@ -62,34 +62,6 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
     );
 
     match event.reaction.as_str() {
-        // 🤖 自動実行（proposed → auto_approved）
-        "robot_face" => {
-            let task = match state.db.find_task_by_slack_ts(channel, message_ts)? {
-                Some(t) => t,
-                None => return Ok(()),
-            };
-            if task.status != "proposed" {
-                tracing::debug!(
-                    "Task {} is not in proposed status ({}), ignoring 🤖",
-                    task.id,
-                    task.status
-                );
-                return Ok(());
-            }
-            state.db.update_status(task.id, "auto_approved")?;
-            let slack = state.slack_client();
-            let thread_ts = task.slack_thread_ts.as_deref().unwrap_or(message_ts);
-            slack
-                .reply_thread(
-                    channel,
-                    thread_ts,
-                    ":robot_face: 自動実行モードで承認されました！実行を開始します...",
-                )
-                .await?;
-            tracing::info!("Task {} auto_approved via 🤖 reaction", task.id);
-            state.wake_worker();
-        }
-
         // ⚡ ops 手動実行（ops チャンネルのメッセージに対して）→ キューに追加
         "zap" => {
             if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
@@ -526,83 +498,40 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             tracing::info!("Task {} archived via thread message", task.id);
         }
 
-        // 承認系コマンド（Block Kit ボタンと同等）
-        "ok" | "承認" | "approve" => {
-            if task.status != "proposed" {
+        // 承認/実行開始（conversing → executing）
+        "ok" | "承認" | "approve" | "go" | "実行" | "run" => {
+            if task.status == "conversing" {
+                state.db.update_status(task.id, "executing")?;
+                slack
+                    .reply_thread(channel, thread_ts, ":rocket: 実行を開始します...")
+                    .await?;
+                tracing::info!("Task {} → executing via thread reply", task.id);
+                state.wake_worker();
+            } else {
                 slack
                     .reply_thread(
                         channel,
                         thread_ts,
-                        &format!(":no_entry: 現在のステータスは `{}` のため承認できません（proposed のみ）", task.status),
+                        &format!(":no_entry: 現在のステータスは `{}` のため実行できません（conversing のみ）", task.status),
                     )
                     .await?;
-                return Ok(());
             }
-            state.db.update_status(task.id, "approved")?;
-            slack
-                .reply_thread(channel, thread_ts, ":white_check_mark: 承認しました！実行を開始します...")
-                .await?;
-            tracing::info!("Task {} approved via thread reply", task.id);
-            state.wake_worker();
         }
 
         "ng" | "却下" | "reject" => {
-            if task.status != "proposed" {
-                return Ok(());
-            }
-            state.db.update_status(task.id, "rejected")?;
-            slack
-                .reply_thread(channel, thread_ts, ":x: 却下しました")
-                .await?;
-            tracing::info!("Task {} rejected via thread reply", task.id);
-        }
-
-        "再生成" | "regenerate" | "retry" => {
-            if task.status != "proposed" {
-                return Ok(());
-            }
-            state.db.reset_for_regeneration(task.id)?;
-            slack
-                .reply_thread(channel, thread_ts, ":arrows_counterclockwise: 要件定義を再生成します...")
-                .await?;
-            tracing::info!("Task {} regeneration requested via thread reply", task.id);
-            state.wake_worker();
-        }
-
-        "go" | "実行" | "run" => {
-            match task.status.as_str() {
-                "conversing" => {
-                    state.db.update_status(task.id, "executing")?;
-                    slack
-                        .reply_thread(channel, thread_ts, ":rocket: 実行を開始します...")
-                        .await?;
-                    tracing::info!("Task {} → executing via thread reply", task.id);
-                    state.wake_worker();
-                }
-                "proposed" => {
-                    state.db.update_status(task.id, "auto_approved")?;
-                    slack
-                        .reply_thread(channel, thread_ts, ":robot_face: 即実行モードで承認しました！実行を開始します...")
-                        .await?;
-                    tracing::info!("Task {} auto_approved via thread reply", task.id);
-                    state.wake_worker();
-                }
-                _ => {
-                    slack
-                        .reply_thread(
-                            channel,
-                            thread_ts,
-                            &format!(":no_entry: 現在のステータスは `{}` のため実行できません", task.status),
-                        )
-                        .await?;
-                }
+            if task.status == "conversing" {
+                state.db.update_status(task.id, "done")?;
+                slack
+                    .reply_thread(channel, thread_ts, ":x: タスクを却下しました")
+                    .await?;
+                tracing::info!("Task {} rejected via thread reply", task.id);
             }
         }
 
         // 実行中タスクの停止
         "stop" | "cancel" | "中止" | "停止" => {
             match task.status.as_str() {
-                "executing" | "ci_pending" | "planning" => {
+                "executing" | "ci_pending" | "conversing" => {
                     let prev_status = task.status.clone();
                     state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
                     slack
@@ -631,10 +560,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         cmd if cmd == "status" || cmd == "状態" || cmd.starts_with("進捗") => {
             let status_emoji = match task.status.as_str() {
                 "new" => ":inbox_tray:",
-                "analyzing" | "planning" => ":brain:",
-                "proposed" => ":clipboard:",
                 "conversing" => ":speech_balloon:",
-                "approved" | "auto_approved" => ":white_check_mark:",
                 "executing" => ":rocket:",
                 "manual" => ":hammer:",
                 "ci_pending" => ":hourglass:",
