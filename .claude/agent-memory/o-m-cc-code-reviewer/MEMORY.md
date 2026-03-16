@@ -47,6 +47,12 @@
 - `extract_complexity` の部分一致バグ修正済み: `section.contains(keyword)` → `section.split_whitespace().any(|w| w == *keyword)`
 - decomposer.rs 削除後、`Subtask` / `get_actionable_subtasks` は `db.rs` に移動（旧 DB データ後方互換として保持）
 
+### ステータス名の不整合パターン（v12 マイグレーション後）
+- `set_error` が `status = 'failed'` を設定するが、コメント・Slack メッセージは `'error'` を想定 → 毎回要確認
+- `scheduler.rs` の停滞チェック・`db.get_stagnant_tasks` が `'ready'/'in_progress'` を参照 → v12 後は `'executing'/'conversing'` が正しい（機能していない停滞チェック）
+- `create_task_from_ops` が `source` を設定しないため `'asana'` デフォルトになる → `create_task_from_ops_with_status` は `'slack'` を設定するが非対称
+- `task_exists_for_gid` と `find_task_by_gid` の除外ステータスリスト不一致（`'archived'` の扱いが異なる）
+
 ## Calibration
 - `#[allow(dead_code)]` 付きフィールドは移行期の意図的残留と誤用の区別が必要 → Context を読んで判断
 - `unsafe impl Send/Sync` の誤用は見逃しリスクが高い → 今後も重点確認する
@@ -55,3 +61,5 @@
 - `compute_free_slots` のような区間演算は、一見バグに見えるコードが実は正しいことがある → テスト確認を先に行うこと（過剰検知防止）
 - `CalendarEvent::end_time()` の欠如は繰り返し指摘パターン → 新規コードが追加されるたびに再発する構造的問題。早期に追加を促す
 - `if result.is_empty() { result } else { result }` パターン（両分岐が同値）はコンパイラが通すが、意図不明瞭として必ず指摘する
+- `contains("KEYWORD:")` による LLM 出力キーワード検出は先頭一致にすべき（`lines().any(|l| l.trim().starts_with("KEYWORD:"))）` → プロンプトインジェクション耐性
+- ステータスマイグレーション後、旧ステータスを参照するコードが `scheduler.rs` 等に残留しやすい → マイグレーション変更時は全 status 参照を grep で確認すること

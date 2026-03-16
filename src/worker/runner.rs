@@ -1359,8 +1359,8 @@ impl Worker {
         // assistant 出力を保存
         self.db.append_ops_context(channel, thread_ts, repo_key, "assistant", &output)?;
 
-        // REQUIREMENTS_CONFIRMED: 検出 → 自動的に executing に遷移
-        if output.contains("REQUIREMENTS_CONFIRMED:") {
+        // REQUIREMENTS_CONFIRMED: 検出 → 自動的に executing に遷移（行頭マッチで誤検知防止）
+        if output.lines().any(|l| l.trim().starts_with("REQUIREMENTS_CONFIRMED:")) {
             self.db.update_status(task.id, "executing")?;
             self.db.update_analysis(task.id, &output)?;
             self.slack.reply_thread(channel, thread_ts,
@@ -1955,13 +1955,14 @@ async fn capture_quality_metrics(worktree_path: &Path) -> Result<(u32, u32)> {
         .map_err(|e| anyhow::anyhow!("cargo test failed to start: {}", e))?;
 
     let test_stdout = String::from_utf8_lossy(&test_output.stdout);
-    // "test result: ok. 36 passed" をパース
+    // "test result: ok. 36 passed; 0 failed" → "passed" の直前の数字を取得
     let test_count = test_stdout.lines()
         .find(|l| l.contains("test result:"))
         .and_then(|l| {
-            l.split_whitespace()
-                .find(|w| w.parse::<u32>().is_ok())
-                .and_then(|w| w.parse::<u32>().ok())
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.windows(2)
+                .find(|w| w[1] == "passed" || w[1] == "passed;")
+                .and_then(|w| w[0].parse::<u32>().ok())
         })
         .unwrap_or(0);
 

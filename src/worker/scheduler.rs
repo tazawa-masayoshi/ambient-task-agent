@@ -196,7 +196,7 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
     let stagnant_lines: Vec<String> = active_tasks
         .iter()
         .filter(|t| {
-            matches!(t.status.as_str(), "ready" | "in_progress") && t.updated_at < stagnant_cutoff
+            matches!(t.status.as_str(), "new" | "conversing" | "executing" | "manual") && t.updated_at < stagnant_cutoff
         })
         .map(|t| format!("- #{} {} (status: {}, 最終更新: {})", t.id, t.asana_task_name, t.status, t.updated_at))
         .collect();

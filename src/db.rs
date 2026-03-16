@@ -497,7 +497,7 @@ impl Db {
     pub fn set_error(&self, id: i64, error: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE coding_tasks SET status = 'failed', error_message = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            "UPDATE coding_tasks SET status = 'error', error_message = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![error, id],
         )?;
         Ok(())
@@ -834,7 +834,7 @@ impl Db {
     pub fn get_active_tasks(&self) -> Result<Vec<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT {} FROM coding_tasks WHERE status NOT IN ('done', 'failed', 'archived') ORDER BY updated_at DESC",
+            "SELECT {} FROM coding_tasks WHERE status NOT IN ('done', 'error', 'archived', 'sleeping') ORDER BY updated_at DESC",
             TASK_COLUMNS
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1212,8 +1212,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO coding_tasks (asana_task_gid, asana_task_name, description, repo_key, \
-             status, slack_channel, slack_thread_ts) \
-             VALUES (?1, ?2, ?3, ?4, 'new', ?5, ?6)",
+             status, slack_channel, slack_thread_ts, source) \
+             VALUES (?1, ?2, ?3, ?4, 'new', ?5, ?6, 'slack')",
             params![
                 format!("ops_{}", ops_id),
                 task_name,
@@ -1227,7 +1227,7 @@ impl Db {
     }
 
     /// ops アイテムから coding_task を指定ステータスで作成（Inception 承認後に executing で直接登録するために使用）
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task_from_ops_with_status(
         &self,
         ops_id: i64,
