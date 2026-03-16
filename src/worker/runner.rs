@@ -498,7 +498,9 @@ impl Worker {
                 } else {
                     "ops 完了"
                 };
-                let truncated = crate::claude::truncate_str(&output, 2800);
+                // 作業結果まとめセクションがあればそこだけ抽出
+                let slack_output = extract_slack_summary(&output);
+                let truncated = crate::claude::truncate_str(slack_output, 2800);
                 // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
                 if is_no_action {
                     let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);
@@ -1891,6 +1893,19 @@ async fn classify_new_task_llm(
 // ============================================================================
 // Block Kit ヘルパー（conversing / manual）
 // ============================================================================
+
+/// ops 出力から Slack 向けサマリを抽出
+/// 「作業結果まとめ」「結果」セクションがあればそこだけ返す。なければ全文。
+fn extract_slack_summary(output: &str) -> &str {
+    // 「作業結果まとめ」「**作業結果」「## 結果」など
+    let markers = ["作業結果まとめ", "作業結果:", "**作業結果", "## 結果", "## まとめ"];
+    for marker in markers {
+        if let Some(pos) = output.find(marker) {
+            return output[pos..].trim();
+        }
+    }
+    output
+}
 
 /// conversing 状態のボタンレイアウト: [実行開始] [指示追加] [手動修正] [スキップ]
 fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {

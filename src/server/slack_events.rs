@@ -677,37 +677,181 @@ async fn handle_dm_message(state: &Arc<AppState>, event: &serde_json::Value) -> 
     let text = event.get("text").and_then(|t| t.as_str()).unwrap_or_default();
     let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
     let message_ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or_default();
-
-    // スレッド内の返信: thread_ts を使う。トップレベル: ts を使う
     let reply_ts = thread_ts.unwrap_or(message_ts);
 
-    let slack = state.slack_client();
-
     // ローディング表示
+    set_assistant_status(state, channel, reply_ts, "考え中...").await;
+
+    let text_lower = text.to_lowercase();
+
+    // パターンマッチ: 定型クエリはプログラムでデータ取得 → LLM 1ターン整形
+    let result = if text_lower.contains("タスク") && (text_lower.contains("一覧") || text_lower.contains("今日")) {
+        handle_dm_tasks(state, text).await
+    } else if text_lower.contains("進捗") || text_lower.contains("ステータス") {
+        handle_dm_progress(state, text).await
+    } else if text_lower.contains("ブリーフィング") || text_lower.contains("まとめ") {
+        handle_dm_briefing(state, text).await
+    } else {
+        // パターン外 → Inception モードに委譲
+        let repo_entry = state.repos_config.repo.iter()
+            .find(|r| r.ops_mode == crate::repo_config::OpsMode::Inception)
+            .or_else(|| state.repos_config.find_repo_by_ops_channel(&state.slack_channel));
+
+        if let Some(repo_entry) = repo_entry {
+            set_assistant_status(state, channel, reply_ts, "作業中...").await;
+            enqueue_ops_request(state, event, channel, message_ts, thread_ts, text, repo_entry, "ready")?;
+            // ops キューに委譲したので、ここでは返信しない
+            return Ok(());
+        }
+        Ok(":wave: メッセージを受け取りましたが、処理方法が見つかりませんでした。".to_string())
+    };
+
+    // ステータスクリア + 返信
+    set_assistant_status(state, channel, reply_ts, "").await;
+    let slack = state.slack_client();
+    match result {
+        Ok(response) => { slack.reply_thread(channel, reply_ts, &response).await?; }
+        Err(e) => {
+            tracing::error!("DM handler error: {}", e);
+            slack.reply_thread(channel, reply_ts, &format!(":warning: エラーが発生しました: {}", e)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// assistant.threads.setStatus を呼ぶ
+async fn set_assistant_status(state: &Arc<AppState>, channel: &str, thread_ts: &str, status: &str) {
     let _ = reqwest::Client::new()
         .post("https://slack.com/api/assistant.threads.setStatus")
         .header("Authorization", format!("Bearer {}", state.slack_bot_token))
         .json(&serde_json::json!({
             "channel_id": channel,
-            "thread_ts": reply_ts,
-            "status": "考え中...",
+            "thread_ts": thread_ts,
+            "status": status,
         }))
         .send()
         .await;
+}
 
-    // DM → Inception モード（ambient-task-agent）で処理
-    // ops_mode=inception のリポを探す
-    let repo_entry = state.repos_config.repo.iter()
-        .find(|r| r.ops_mode == crate::repo_config::OpsMode::Inception)
-        .or_else(|| state.repos_config.find_repo_by_ops_channel(&state.slack_channel));
+/// DM: タスク一覧
+async fn handle_dm_tasks(state: &Arc<AppState>, user_text: &str) -> Result<String> {
+    // DB のアクティブタスク
+    let db_tasks = state.db.get_active_tasks()?;
+    // Asana キャッシュ（未完了のみ）
+    let asana_tasks = crate::sync::load_cache()
+        .map(|c| c.tasks.into_iter().filter(|t| !t.completed).collect::<Vec<_>>())
+        .unwrap_or_default();
 
-    if let Some(repo_entry) = repo_entry {
-        enqueue_ops_request(state, event, channel, message_ts, thread_ts, text, repo_entry, "ready")?;
-    } else {
-        slack.reply_thread(channel, reply_ts, ":wave: メッセージを受け取りました。現在 DM からの直接処理は設定されていません。").await?;
+    if db_tasks.is_empty() && asana_tasks.is_empty() {
+        return Ok("現在アクティブなタスクはありません。".to_string());
     }
 
-    Ok(())
+    let mut lines = Vec::new();
+
+    if !db_tasks.is_empty() {
+        lines.push("【エージェントタスク】".to_string());
+        for t in &db_tasks {
+            lines.push(format!("- #{} [{}] {} (更新: {})", t.id, t.status, t.asana_task_name, &t.updated_at[..10]));
+        }
+    }
+
+    if !asana_tasks.is_empty() {
+        lines.push("【Asana タスク】".to_string());
+        for t in &asana_tasks {
+            let due = t.due_on.as_deref().unwrap_or("期限なし");
+            lines.push(format!("- [{}] {} (期限: {}, 担当: {})", t.section.as_deref().unwrap_or("?"), t.name, due, t.assignee));
+        }
+    }
+
+    let data = lines.join("\n");
+    format_with_llm(state, user_text, &data, "タスク一覧").await
+}
+
+/// DM: 進捗確認
+async fn handle_dm_progress(state: &Arc<AppState>, user_text: &str) -> Result<String> {
+    let active = state.db.get_active_tasks()?;
+    let executing: Vec<_> = active.iter()
+        .filter(|t| matches!(t.status.as_str(), "executing" | "ci_pending" | "conversing"))
+        .collect();
+
+    if executing.is_empty() {
+        return Ok("現在実行中のタスクはありません。".to_string());
+    }
+
+    let data = executing.iter().map(|t| {
+        let mut line = format!("- #{} [{}] {}", t.id, t.status, t.asana_task_name);
+        if let Some(ref pr) = t.pr_url {
+            line.push_str(&format!(" (PR: {})", pr));
+        }
+        line
+    }).collect::<Vec<_>>().join("\n");
+
+    format_with_llm(state, user_text, &data, "進捗状況").await
+}
+
+/// DM: ブリーフィング
+async fn handle_dm_briefing(state: &Arc<AppState>, user_text: &str) -> Result<String> {
+    let mut sections = Vec::new();
+
+    // Asana タスク
+    if let Ok(cache) = crate::sync::load_cache() {
+        let summary = &cache.summary;
+        sections.push(format!(
+            "Asana: 全{}件 (未完了: {}, 自分担当: {}, 期限超過: {})",
+            summary.total, summary.incomplete, summary.my_tasks, summary.overdue
+        ));
+        let my_tasks: Vec<_> = cache.tasks.iter()
+            .filter(|t| !t.completed && t.assignee.contains("田澤"))
+            .collect();
+        if !my_tasks.is_empty() {
+            let lines: Vec<String> = my_tasks.iter().map(|t| {
+                let due = t.due_on.as_deref().unwrap_or("期限なし");
+                format!("- {} (期限: {})", t.name, due)
+            }).collect();
+            sections.push(format!("自分の担当タスク:\n{}", lines.join("\n")));
+        }
+    }
+
+    // DB のエージェントタスク
+    let db_active = state.db.get_active_tasks()?;
+    if !db_active.is_empty() {
+        let by_status = |s: &str| db_active.iter().filter(|t| t.status == s).count();
+        sections.push(format!(
+            "エージェント: new={}, conversing={}, executing={}, manual={}",
+            by_status("new"), by_status("conversing"), by_status("executing"), by_status("manual")
+        ));
+    }
+
+    if sections.is_empty() {
+        sections.push("タスク情報がありません。`sync` を実行してください。".to_string());
+    }
+
+    let data = sections.join("\n\n");
+    format_with_llm(state, user_text, &data, "ブリーフィング").await
+}
+
+/// プログラムで取得したデータを LLM 1ターンで秘書風に整形
+async fn format_with_llm(state: &Arc<AppState>, user_text: &str, data: &str, context: &str) -> Result<String> {
+    let prompt = format!(
+        "ユーザーの質問: {}\n\n## 取得データ（{}）\n{}\n\n上記のデータを元に、秘書として簡潔に報告してください。Slack mrkdwn 形式で出力してください。",
+        user_text, context, data
+    );
+
+    let result = ClaudeRunner::new("dm_format", &prompt)
+        .system_prompt("あなたは優秀な秘書です。データを分かりやすく整理し、簡潔に報告してください。必要に応じて優先度や注意点を付け加えてください。")
+        .max_turns(1)
+        .allowed_tools("")
+        .with_context(&state.runner_ctx)
+        .run()
+        .await?;
+
+    if result.success && !result.stdout.trim().is_empty() {
+        Ok(result.stdout.trim().to_string())
+    } else {
+        // LLM 失敗時はデータそのまま返す
+        Ok(data.to_string())
+    }
 }
 
 /// Asana URL からタスク GID を抽出

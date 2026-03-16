@@ -85,8 +85,13 @@ pub fn to_wez_tasks_file(tasks: &[CodingTask]) -> WezTasksFile {
 }
 
 /// DB のアクティブタスクを wez-sidebar 形式の JSON に書き出す
+/// DB が空の場合は既存キャッシュ（Asana 同期結果）を上書きしない
 pub fn sync_tasks_cache(db: &Db, cache_path: &str) -> Result<()> {
     let tasks = db.get_active_tasks()?;
+    if tasks.is_empty() {
+        tracing::debug!("Tasks cache: DB empty, skipping write to preserve Asana cache");
+        return Ok(());
+    }
     let file = to_wez_tasks_file(&tasks);
     let json = serde_json::to_string_pretty(&file)?;
 
