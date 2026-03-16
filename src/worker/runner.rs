@@ -1011,6 +1011,19 @@ impl Worker {
                     return Ok(());
                 }
 
+                // git-ratchet: 品質メトリクスが悪化していないか検証
+                if let Err(ratchet_err) = quality_ratchet_check(&ws.worktree_path).await {
+                    tracing::warn!("Task {} ratchet check failed: {}", task.id, ratchet_err);
+                    self.db.set_error(task.id, &format!("Ratchet check failed: {}", ratchet_err))?;
+                    let msg = format!(
+                        ":no_entry: *品質ラチェット不合格* — PR を作成しません\n```\n{}\n```",
+                        ratchet_err
+                    );
+                    self.slack.reply_thread(channel, thread_ts, &msg).await.ok();
+                    workspace::remove(ws).await.ok();
+                    return Ok(());
+                }
+
                 // finalize_worktree が remove まで担当
                 self.finalize_worktree(task, repo_entry, ws).await?;
             }
@@ -1153,6 +1166,8 @@ impl Worker {
                 self.db.update_pr_url(task.id, &pr_url)?;
                 self.db.update_status(task.id, "ci_pending")?;
                 self.db.set_classification_outcome(task.id, "correct").ok();
+                // ラチェットベースラインを更新（PR 作成成功 = 品質チェック通過済み）
+                update_quality_baseline(&ws.worktree_path).await;
                 let msg = format!(":gear: PR を作成しました — CI 結果を監視中...\n{}", pr_url);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
@@ -1893,6 +1908,139 @@ fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
 }
 
 /// manual 状態のボタンレイアウト: [再開] [完了]
+// ============================================================================
+// Git Ratchet（品質ラチェット）
+// ============================================================================
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct QualityBaseline {
+    test_count: u32,
+    clippy_warnings: u32,
+    #[serde(default)]
+    updated_at: String,
+}
+
+/// ベースラインファイルのパス（worktree の親リポジトリの .agent/ に保存）
+fn baseline_path(worktree_path: &Path) -> PathBuf {
+    // worktree_path は .claude/worktrees/xxx/ の下にあるので、
+    // main repo の .agent/ に保存する
+    worktree_path
+        .ancestors()
+        .find(|p| p.join(".agent").is_dir())
+        .unwrap_or(worktree_path)
+        .join(".agent")
+        .join("quality-baseline.json")
+}
+
+/// worktree で cargo test + clippy を実行してメトリクスを取得
+async fn capture_quality_metrics(worktree_path: &Path) -> Result<(u32, u32)> {
+    // cargo test
+    let test_output = tokio::process::Command::new("cargo")
+        .arg("test")
+        .arg("--")
+        .arg("--format=terse")
+        .current_dir(worktree_path)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("cargo test failed to start: {}", e))?;
+
+    let test_stdout = String::from_utf8_lossy(&test_output.stdout);
+    // "test result: ok. 36 passed" をパース
+    let test_count = test_stdout.lines()
+        .find(|l| l.contains("test result:"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find(|w| w.parse::<u32>().is_ok())
+                .and_then(|w| w.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
+
+    // cargo clippy
+    let clippy_output = tokio::process::Command::new("cargo")
+        .args(["clippy", "--message-format=short"])
+        .current_dir(worktree_path)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("cargo clippy failed to start: {}", e))?;
+
+    let clippy_stderr = String::from_utf8_lossy(&clippy_output.stderr);
+    let clippy_warnings = clippy_stderr.lines()
+        .filter(|l| l.contains("warning:") && !l.contains("warning: `"))
+        .count() as u32;
+
+    Ok((test_count, clippy_warnings))
+}
+
+/// ラチェット検証: テスト数が減少 or clippy warnings が増加 → エラー
+async fn quality_ratchet_check(worktree_path: &Path) -> Result<()> {
+    let bp = baseline_path(worktree_path);
+    let baseline = if bp.exists() {
+        let content = std::fs::read_to_string(&bp)
+            .map_err(|e| anyhow::anyhow!("Failed to read baseline: {}", e))?;
+        serde_json::from_str::<QualityBaseline>(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse baseline: {}", e))?
+    } else {
+        tracing::info!("No quality baseline found, skipping ratchet check");
+        return Ok(());
+    };
+
+    let (test_count, clippy_warnings) = capture_quality_metrics(worktree_path).await?;
+
+    tracing::info!(
+        "Ratchet check: tests={}/{} (baseline), clippy_warnings={}/{} (baseline)",
+        test_count, baseline.test_count, clippy_warnings, baseline.clippy_warnings
+    );
+
+    let mut violations = Vec::new();
+    if test_count < baseline.test_count {
+        violations.push(format!(
+            "テスト数が減少: {} → {} ({}件減)",
+            baseline.test_count, test_count, baseline.test_count - test_count
+        ));
+    }
+    if clippy_warnings > baseline.clippy_warnings {
+        violations.push(format!(
+            "clippy warnings が増加: {} → {} ({}件増)",
+            baseline.clippy_warnings, clippy_warnings, clippy_warnings - baseline.clippy_warnings
+        ));
+    }
+
+    if violations.is_empty() {
+        tracing::info!("Ratchet check passed");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", violations.join("\n")))
+    }
+}
+
+/// ベースラインを更新（PR 作成成功後に呼ぶ）
+async fn update_quality_baseline(worktree_path: &Path) {
+    match capture_quality_metrics(worktree_path).await {
+        Ok((test_count, clippy_warnings)) => {
+            let baseline = QualityBaseline {
+                test_count,
+                clippy_warnings,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let bp = baseline_path(worktree_path);
+            if let Some(parent) = bp.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            match serde_json::to_string_pretty(&baseline) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&bp, json) {
+                        tracing::warn!("Failed to write quality baseline: {}", e);
+                    } else {
+                        tracing::info!("Quality baseline updated: tests={}, clippy={}", test_count, clippy_warnings);
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to serialize quality baseline: {}", e),
+            }
+        }
+        Err(e) => tracing::warn!("Failed to capture quality metrics for baseline: {}", e),
+    }
+}
+
 #[allow(dead_code)]
 fn build_manual_blocks(task_id: i64) -> serde_json::Value {
     serde_json::json!([

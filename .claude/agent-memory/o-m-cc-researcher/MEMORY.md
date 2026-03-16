@@ -38,3 +38,14 @@
   "NEVER STOP" directive for unattended loop, TSV logging of all experiments (kept + discarded),
   status=crash for OOM/fundamental errors. No parallelism (single-GPU sequential). ~12 exp/hour.
   Related: Ralph Wiggum loop (single agent in bash loop), Gas Town (30 parallel agents with role hierarchy).
+- **lossless-claw** (https://github.com/Martian-Engineering/lossless-claw): OpenClaw plugin for lossless context management (TS+Go, Voltropy LCM research, Mar 2026).
+  Problem: sliding-window truncation loses old messages. Solution: DAG-based hierarchical summarization.
+  Key patterns: 5-layer architecture (Persist→Summarize→DAG-Compact→Assemble→Retrieve),
+  freshTailCount=32 (protect recent msgs), contextThreshold=0.75 (trigger at 75% window),
+  lcm_grep/lcm_describe/lcm_expand tools (agent self-retrieval), 3-tier expansion routing
+  (direct-answer/shallow-expand/subagent-delegate based on token_risk>70% or broad+multi-hop),
+  expansion-auth (token_cap per grant, TTL, delegated child grants), transcript-repair (tool call/result pair repair),
+  integrity checker (8 invariants on DAG contiguity+lineage+no-orphans).
+  SQLite with FTS5 for full-text search. summaryModel override (use cheaper model for summarization).
+  Applicability to ambient-task-agent: LOW priority now (ops threads are short); revisit if threads reach 100+ turns.
+  Most relevant pattern: agent self-retrieval design (lcm_grep) — currently Rust side always prepares context for LLM.
