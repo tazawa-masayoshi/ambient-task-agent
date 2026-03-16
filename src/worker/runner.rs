@@ -1265,36 +1265,54 @@ impl Worker {
 
         // 3. ops_contexts にタスク情報を追加
         let repo_key = task.repo_key.as_deref().unwrap_or("default");
-        let initial_context = format!(
-            "タスク: {}\n説明: {}",
-            task.asana_task_name,
-            task.description.as_deref().unwrap_or("(なし)")
-        );
+        let desc = task.description.as_deref().unwrap_or("(なし)");
+        let initial_context = format!("タスク: {}\n説明: {}", task.asana_task_name, desc);
         self.db.append_ops_context(channel, &thread_ts, repo_key, "user", &initial_context)?;
 
-        // 4. Inception Turn1 相当のプロンプトで Claude を実行（要件ヒアリング質問生成）
+        // 4. 要件ヒアリング質問を生成（入口に関わらず汎用プロンプト）
+        let log_dir = self.log_dir();
+        let prompt = format!(
+            "以下のタスクを実装するために、不明点や確認事項を洗い出してください。\n\n\
+             ## タスク\n{}\n\n## 説明\n{}\n\n\
+             ## 指示\n\
+             - コードベースを調査して、実装に必要な情報を整理してください\n\
+             - 不明点があれば具体的な質問を箇条書きで出力してください\n\
+             - 要件が十分に明確であれば `REQUIREMENTS_CONFIRMED: 要件の要約` を出力してください\n\
+             - 質問は最大5個まで。最も重要なものから順に",
+            task.asana_task_name, desc
+        );
+
         let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
             std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
         });
-        let history = self.db.get_ops_context(channel, &thread_ts)?;
-        let soul = context::read_soul(&self.repos_config.defaults.repos_base_dir);
-        let log_dir = self.log_dir();
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+        let soul = context::merged_soul(base_dir, Some(&repo_path));
 
-        let req = super::ops::OpsRequest {
-            message_text: initial_context,
-            files: vec![],
-        };
+        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
+            .system_prompt(&soul)
+            .max_turns(3)
+            .cwd(&repo_path)
+            .log_dir(&log_dir)
+            .with_context(&self.runner_ctx)
+            .run()
+            .await?;
 
-        let output = super::ops::execute_ops(
-            &req, &repo_path, &[], &soul,
-            5, Some(&log_dir), &self.runner_ctx, &history, None,
-            super::ops::OpsExecMode::InceptionTurn1,
-        ).await?;
+        let output = result.stdout;
 
         // 5. assistant 出力を保存
         self.db.append_ops_context(channel, &thread_ts, repo_key, "assistant", &output)?;
 
-        // 6. 質問を Slack スレッドに投稿（conversing ボタン付き）
+        // 6. REQUIREMENTS_CONFIRMED: が出たら即 executing に遷移（明確だった場合）
+        if output.lines().any(|l| l.trim().starts_with("REQUIREMENTS_CONFIRMED:")) {
+            self.db.update_status(task.id, "executing")?;
+            self.db.update_analysis(task.id, &output)?;
+            self.slack.reply_thread(channel, &thread_ts,
+                ":white_check_mark: 要件が確認できました。実行を開始します...").await.ok();
+            tracing::info!("Task {} requirements confirmed at first turn, → executing", task.id);
+            return Ok(());
+        }
+
+        // 7. 質問を Slack スレッドに投稿（conversing ボタン付き）
         let truncated = crate::claude::truncate_str(&output, 2800);
         let blocks = build_conversing_blocks(task.id, truncated);
         self.slack.post_blocks(channel, &thread_ts, &blocks,
@@ -1317,28 +1335,39 @@ impl Worker {
         let repo_key = task.repo_key.as_deref().unwrap_or("default");
         let history = self.db.get_ops_context(channel, thread_ts)?;
 
-        let latest_user_msg = history.iter().rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
+        // 会話履歴をプロンプトに組み込む
+        let history_text: String = history.iter()
+            .map(|m| format!("[{}] {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = format!(
+            "以下のタスクについて要件ヒアリングを継続してください。\n\n\
+             ## タスク\n{}\n\n## 会話履歴\n{}\n\n\
+             ## 指示\n\
+             - ユーザーの最新の返信を踏まえて、追加の質問があれば出力してください\n\
+             - 要件が十分に明確になったら `REQUIREMENTS_CONFIRMED: 要件の要約` を出力してください\n\
+             - 質問は具体的に、最大3個まで",
+            task.asana_task_name, history_text
+        );
 
         let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
             std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
         });
-        let soul = context::read_soul(&self.repos_config.defaults.repos_base_dir);
+        let base_dir = &self.repos_config.defaults.repos_base_dir;
+        let soul = context::merged_soul(base_dir, Some(&repo_path));
         let log_dir = self.log_dir();
 
-        let req = super::ops::OpsRequest {
-            message_text: latest_user_msg.to_string(),
-            files: vec![],
-        };
+        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
+            .system_prompt(&soul)
+            .max_turns(3)
+            .cwd(&repo_path)
+            .log_dir(&log_dir)
+            .with_context(&self.runner_ctx)
+            .run()
+            .await?;
 
-        // 常に InceptionTurn2 相当（要件確認の継続）
-        let output = super::ops::execute_ops(
-            &req, &repo_path, &[], &soul,
-            5, Some(&log_dir), &self.runner_ctx, &history, None,
-            super::ops::OpsExecMode::InceptionTurn2,
-        ).await?;
+        let output = result.stdout;
 
         // assistant 出力を保存
         self.db.append_ops_context(channel, thread_ts, repo_key, "assistant", &output)?;
