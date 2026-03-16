@@ -2051,34 +2051,4 @@ async fn update_quality_baseline(worktree_path: &Path) {
     }
 }
 
-#[allow(dead_code)]
-fn build_manual_blocks(task_id: i64) -> serde_json::Value {
-    serde_json::json!([
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": ":wrench: *手動対応モード*\nターミナルで作業を行い、完了後に以下のボタンを押してください:"
-            }
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "再開" },
-                    "style": "primary",
-                    "action_id": "task_resume",
-                    "value": task_id.to_string()
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "完了" },
-                    "action_id": "task_done",
-                    "value": task_id.to_string()
-                }
-            ]
-        }
-    ])
-}
 

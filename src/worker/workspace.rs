@@ -179,16 +179,6 @@ pub async fn remove(workspace: &Workspace) -> Result<()> {
     Ok(())
 }
 
-/// worktree が存在するか確認
-#[allow(dead_code)]
-pub fn exists(repos_base_dir: &str, repo_key: &str, task_id: i64) -> bool {
-    let dir_name = format!("{}-task-{}", repo_key, task_id);
-    PathBuf::from(repos_base_dir)
-        .join(WORKTREES_DIR)
-        .join(dir_name)
-        .exists()
-}
-
 // ── CI ステータス確認 ──
 
 #[derive(Debug)]

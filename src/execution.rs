@@ -48,11 +48,6 @@ impl ExecutionRegistry {
             .count()
     }
 
-    #[allow(dead_code)]
-    pub fn recent_snapshot(&self, n: usize) -> Vec<ExecutionRecord> {
-        let records = self.records.lock().unwrap();
-        records.iter().rev().take(n).cloned().collect()
-    }
 }
 
 // ============================================================================

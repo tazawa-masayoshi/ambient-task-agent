@@ -38,6 +38,7 @@ pub struct ReposConfig {
 pub struct Defaults {
     pub slack_channel: String,
     pub repos_base_dir: String,
+    #[allow(dead_code)]
     #[serde(default = "default_max_plan_turns")]
     pub claude_max_plan_turns: u32,
     #[allow(dead_code)]

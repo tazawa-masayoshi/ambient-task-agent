@@ -467,47 +467,11 @@ impl Db {
         self.get_task_by_status("auto_approved")
     }
 
-    /// conversing 状態のタスクを1件取得（会話フェーズ処理用）
-    #[allow(dead_code)]
-    pub fn get_conversing_task(&self) -> Result<Option<CodingTask>> {
-        self.get_task_by_status("conversing")
-    }
-
-    /// executing 状態のタスクを1件取得（実行フェーズ処理用）
-    #[allow(dead_code)]
-    pub fn get_executing_task(&self) -> Result<Option<CodingTask>> {
-        self.get_task_by_status("executing")
-    }
-
-    /// manual 状態のタスクを1件取得（手動承認待ち）
-    #[allow(dead_code)]
-    pub fn get_manual_task(&self) -> Result<Option<CodingTask>> {
-        self.get_task_by_status("manual")
-    }
-
     pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE coding_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![status, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_description(&self, id: i64, description: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![description, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_complexity(&self, id: i64, complexity: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET complexity = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![complexity, id],
         )?;
         Ok(())
     }
@@ -535,16 +499,6 @@ impl Db {
         conn.execute(
             "UPDATE coding_tasks SET status = 'failed', error_message = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![error, id],
-        )?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn update_summary(&self, id: i64, summary: &str, memory_note: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET summary = ?1, memory_note = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
-            params![summary, memory_note, id],
         )?;
         Ok(())
     }
@@ -1008,16 +962,6 @@ impl Db {
         Ok(count)
     }
 
-    /// claude -p セッション ID を保存
-    pub fn update_session_id(&self, id: i64, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE coding_tasks SET claude_session_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![session_id, id],
-        )?;
-        Ok(())
-    }
-
     // ── ops_contexts ──
 
     /// ops 会話メッセージを保存
@@ -1053,33 +997,6 @@ impl Db {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    /// ops スレッドの会話履歴を削除（Inception リビジョン時にターン1からやり直す）
-    #[allow(dead_code)]
-    pub fn clear_ops_context(&self, channel: &str, thread_ts: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM ops_contexts WHERE channel = ?1 AND thread_ts = ?2",
-            params![channel, thread_ts],
-        )?;
-        Ok(())
-    }
-
-    /// ops スレッドの repo_key を取得
-    #[allow(dead_code)]
-    pub fn get_ops_repo_key(&self, channel: &str, thread_ts: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let result = conn.query_row(
-            "SELECT repo_key FROM ops_contexts WHERE channel = ?1 AND thread_ts = ?2 LIMIT 1",
-            params![channel, thread_ts],
-            |row| row.get(0),
-        );
-        match result {
-            Ok(key) => Ok(Some(key)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     // ========================================================================
@@ -1446,16 +1363,6 @@ impl Db {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?.collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
-    }
-
-    /// スキル候補のステータスを更新
-    pub fn update_skill_candidate_status(&self, id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE skill_candidates SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![status, id],
-        )?;
-        Ok(())
     }
 
     pub fn get_stale_conversing_tasks(&self, cutoff_hours: i64) -> Result<Vec<CodingTask>> {

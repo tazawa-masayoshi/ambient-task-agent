@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::execution::{ExecutionRecord, HookDecision, RunnerContext, ToolResult};
+use crate::execution::{ExecutionRecord, HookDecision, RunnerContext};
 use crate::repo_config::ExecMode;
 
 const MAX_LOG_FILES: usize = 100;
@@ -107,14 +107,6 @@ impl AgentOutput {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn into_tool_result(self) -> ToolResult {
-        if self.success {
-            ToolResult::Success(self.stdout)
-        } else {
-            ToolResult::SoftError(self.error_output().to_string())
-        }
-    }
 }
 
 /// LLM 実行バックエンドの抽象インターフェース
@@ -130,23 +122,6 @@ pub trait AgentBackend: Send + Sync {
 pub struct ClaudeCliBackend;
 
 impl ClaudeCliBackend {
-    /// Claude Code CLI がインストールされているか検出する
-    #[allow(dead_code)]
-    pub fn detect() -> Option<String> {
-        let output = std::process::Command::new("claude")
-            .arg("--version")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-
-        if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            None
-        }
-    }
-
     /// JSON レスポンスをパースして AgentOutput を構築する
     fn parse_json_response(
         raw: &str,
@@ -460,38 +435,7 @@ impl ClaudeRunner {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn timeout(mut self, secs: u64) -> Self {
-        self.timeout_secs = Some(secs);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn max_output_bytes(mut self, bytes: usize) -> Self {
-        self.max_output_bytes = Some(bytes);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn exec_mode(mut self, mode: ExecMode) -> Self {
-        self.exec_mode = mode;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn semaphore(mut self, sem: Arc<Semaphore>) -> Self {
-        self.semaphore = Some(sem);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn allowed_env(mut self, keys: Vec<String>) -> Self {
-        self.resolved_env = Some(resolve_env(&keys));
-        self
-    }
-
     /// interactive 用: semaphore が取得できなければ即エラーにする
-    #[allow(dead_code)]
     pub fn non_blocking(mut self) -> Self {
         self.non_blocking = true;
         self
@@ -670,13 +614,6 @@ impl ClaudeRunner {
 
         Ok(result)
     }
-}
-
-/// 環境変数キーリストを事前解決して (key, value) ペアにする
-fn resolve_env(keys: &[String]) -> Vec<(String, String)> {
-    keys.iter()
-        .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
-        .collect()
 }
 
 pub(crate) fn truncate_str(s: &str, max_len: usize) -> &str {

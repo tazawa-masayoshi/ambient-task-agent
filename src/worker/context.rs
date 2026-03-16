@@ -138,6 +138,7 @@ pub fn merged_memory(repos_base_dir: &str, repo: Option<&Path>) -> String {
 // ============================================================================
 
 /// analyzer / executor に渡す共通コンテキスト
+#[allow(dead_code)]
 pub struct WorkContext {
     pub repo_path: std::path::PathBuf,
     pub max_turns: u32,
