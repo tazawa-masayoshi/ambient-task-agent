@@ -298,6 +298,26 @@ pub fn extract_memory(output: &str) -> Option<String> {
         .map(|line| line.trim_start_matches("MEMORY:").trim().to_string())
 }
 
+/// executor 出力から SKILL_CANDIDATE: 行を抽出（全件）
+/// フォーマット: "SKILL_CANDIDATE: パターン名 | 説明"
+pub fn extract_skill_candidates(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("SKILL_CANDIDATE:"))
+        .filter_map(|line| {
+            let content = line.trim_start_matches("SKILL_CANDIDATE:").trim();
+            let parts: Vec<&str> = content.splitn(2, '|').collect();
+            if parts.len() == 2 {
+                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+            } else if !content.is_empty() {
+                Some((content.to_string(), String::new()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,7 +37,8 @@ const GENERAL_RULES: &str = "\
 const OUTPUT_INSTRUCTIONS: &str = "\
 ## 出力（必須）
 - 最終行の1つ前に `SUMMARY: 作業内容の1行要約` を出力すること
-- 最終行に `MEMORY: この作業で気づいたこと・学んだことの1行メモ` を出力すること（特になければ省略可）";
+- 最終行に `MEMORY: この作業で気づいたこと・学んだことの1行メモ` を出力すること（特になければ省略可）
+- 同じパターンの作業を2回以上行った場合、`SKILL_CANDIDATE: パターン名 | 再利用可能な手順の1行説明` を出力すること（特になければ省略可）";
 
 pub struct ExecutionResult {
     pub success: bool,

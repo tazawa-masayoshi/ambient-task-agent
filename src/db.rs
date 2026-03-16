@@ -283,6 +283,18 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_ops_contexts_thread
                 ON ops_contexts(channel, thread_ts);
+
+            CREATE TABLE IF NOT EXISTS skill_candidates (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                repo_key    TEXT,
+                task_id     INTEGER,
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                status      TEXT NOT NULL DEFAULT 'proposed',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
             ",
         )?;
 
@@ -1384,7 +1396,68 @@ impl Db {
         Ok(tasks)
     }
 
-    /// conversing 状態で updated_at が cutoff_hours 以上前のタスクを取得（タイムアウト対象）
+    // ============================================================================
+    // Skill Candidates（スキル候補）
+    // ============================================================================
+
+    /// スキル候補を upsert（同名なら occurrences をインクリメント）
+    pub fn upsert_skill_candidate(
+        &self,
+        name: &str,
+        description: &str,
+        repo_key: Option<&str>,
+        task_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // 既存チェック（名前で正規化マッチ）
+        let existing: Option<i64> = conn.query_row(
+            "SELECT id FROM skill_candidates WHERE LOWER(name) = LOWER(?1) AND status = 'proposed'",
+            params![name],
+            |row| row.get(0),
+        ).ok();
+
+        if let Some(id) = existing {
+            conn.execute(
+                "UPDATE skill_candidates SET occurrences = occurrences + 1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![id],
+            )?;
+            tracing::debug!("Skill candidate '{}' incremented (id={})", name, id);
+        } else {
+            conn.execute(
+                "INSERT INTO skill_candidates (name, description, repo_key, task_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![name, description, repo_key, task_id],
+            )?;
+            tracing::info!("New skill candidate: '{}'", name);
+        }
+        Ok(())
+    }
+
+    /// occurrences >= threshold のスキル候補を取得（承認待ち）
+    pub fn get_mature_skill_candidates(&self, threshold: i64) -> Result<Vec<(i64, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, occurrences FROM skill_candidates \
+             WHERE status = 'proposed' AND occurrences >= ?1 \
+             ORDER BY occurrences DESC, id ASC"
+        )?;
+        let records = stmt.query_map(params![threshold], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// スキル候補のステータスを更新
+    pub fn update_skill_candidate_status(&self, id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE skill_candidates SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_stale_conversing_tasks(&self, cutoff_hours: i64) -> Result<Vec<CodingTask>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(

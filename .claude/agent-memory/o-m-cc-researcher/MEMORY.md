@@ -38,6 +38,13 @@
   "NEVER STOP" directive for unattended loop, TSV logging of all experiments (kept + discarded),
   status=crash for OOM/fundamental errors. No parallelism (single-GPU sequential). ~12 exp/hour.
   Related: Ralph Wiggum loop (single agent in bash loop), Gas Town (30 parallel agents with role hierarchy).
+- **multi-agent-shogun** (https://github.com/yohey-w/multi-agent-shogun): tmux+YAML-based feudal multi-agent system (1.1k stars, Mar 2026).
+  Key patterns: bottom-up skill discovery (Ashigaru proposes skill_candidate in report YAML → Karo aggregates in dashboard.md → Shogun approves → saved to .claude/commands/),
+  skill_candidate YAML fields: {found, name, description, reason}, trigger: repeated 2+ times or cross-project reuse,
+  Stop hook in .claude/settings.json (bash scripts/stop_hook_inbox.sh, timeout 60s) for inbox check at turn-end,
+  inotifywait-based event-driven mailbox (flock+YAML in queue/inbox/), Bloom taxonomy task routing (L1-L3: Ashigaru, L4-L6: Gunshi),
+  skills stored in .claude/commands/ and invoked via /skill-name.
+  Applicability: skill_candidate pattern directly applicable to ambient-task-agent self_improvement job.
 - **lossless-claw** (https://github.com/Martian-Engineering/lossless-claw): OpenClaw plugin for lossless context management (TS+Go, Voltropy LCM research, Mar 2026).
   Problem: sliding-window truncation loses old messages. Solution: DAG-based hierarchical summarization.
   Key patterns: 5-layer architecture (Persist→Summarize→DAG-Compact→Assemble→Retrieve),

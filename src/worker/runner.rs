@@ -1054,13 +1054,14 @@ impl Worker {
         Ok(())
     }
 
-    /// executor 出力から MEMORY 行を抽出し、global + per-repo memory に永続化
+    /// executor 出力から MEMORY + SKILL_CANDIDATE を抽出して永続化
     fn persist_learnings(
         &self,
         output: &str,
         task: &CodingTask,
         repo_entry: Option<&crate::repo_config::RepoEntry>,
     ) {
+        // MEMORY 永続化
         if let Some(memory) = context::extract_memory(output) {
             let base_dir = &self.repos_config.defaults.repos_base_dir;
             let entry = format!("[{}] {}", task.asana_task_name, memory);
@@ -1075,6 +1076,15 @@ impl Worker {
                 }
             }
             tracing::info!("Persisted learning for task {}: {}", task.id, memory);
+        }
+
+        // SKILL_CANDIDATE 蓄積
+        let candidates = context::extract_skill_candidates(output);
+        for (name, description) in &candidates {
+            let repo_key = repo_entry.map(|r| r.key.as_str());
+            if let Err(e) = self.db.upsert_skill_candidate(name, description, repo_key, Some(task.id)) {
+                tracing::warn!("Failed to upsert skill candidate '{}': {}", name, e);
+            }
         }
     }
 

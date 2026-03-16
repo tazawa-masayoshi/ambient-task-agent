@@ -1422,52 +1422,53 @@ async fn run_self_improvement(
         return Ok(());
     }
 
-    // 4. 分析プロンプト構築
-    let mut analysis_parts = vec![
-        "あなたは ambient-task-agent の自己改善アナリストです。\n\
-         以下のデータを分析し、改善提案をタスクとして出力してください。".to_string(),
-    ];
-
-    if total > 0 {
-        let accuracy = if total > 0 {
-            ((total - incorrect.len()) as f64 / total as f64 * 100.0) as u32
-        } else { 100 };
-        let mut section = format!("## 分類精度\n正解率: {}% ({}/{}件)\n", accuracy, total - incorrect.len(), total);
+    // 4. 分析プロンプト構築（外部テンプレート + データ注入）
+    let classification_section = if total > 0 {
+        let accuracy = ((total - incorrect.len()) as f64 / total as f64 * 100.0) as u32;
+        let mut s = format!("正解率: {}% ({}/{}件)\n", accuracy, total - incorrect.len(), total);
         if !incorrect.is_empty() {
-            section.push_str("\n誤分類:\n");
+            s.push_str("\n誤分類:\n");
             for r in &incorrect {
-                section.push_str(&format!("- 「{}」→ {} だったが {} が必要だった\n",
+                s.push_str(&format!("- 「{}」→ {} だったが {} が必要だった\n",
                     r.task_name, r.classification, r.outcome));
             }
         }
-        analysis_parts.push(section);
-    }
+        s
+    } else {
+        "データなし".to_string()
+    };
 
-    if !error_tasks.is_empty() {
-        let mut section = format!("## エラータスク ({}件)\n", error_tasks.len());
+    let error_section = if !error_tasks.is_empty() {
+        let mut s = format!("直近のエラー ({}件):\n", error_tasks.len());
         for t in error_tasks.iter().take(5) {
             let err = t.error_message.as_deref().unwrap_or("不明");
-            section.push_str(&format!("- #{} {} — {}\n", t.id, t.asana_task_name,
+            s.push_str(&format!("- #{} {} — {}\n", t.id, t.asana_task_name,
                 crate::claude::truncate_str(err, 100)));
         }
-        analysis_parts.push(section);
-    }
+        s
+    } else {
+        "エラーなし".to_string()
+    };
 
-    if !memory.is_empty() {
-        analysis_parts.push(format!("## 学習メモ\n{}", crate::claude::truncate_str(&memory, 500)));
-    }
+    let memory_section = if !memory.is_empty() {
+        crate::claude::truncate_str(&memory, 500).to_string()
+    } else {
+        "メモなし".to_string()
+    };
 
-    analysis_parts.push(
-        "## 出力フォーマット\n\
-         改善提案を以下の JSON 形式で出力してください:\n\
-         ```json\n\
-         {\"proposals\": [{\"title\": \"改善タイトル\", \"description\": \"具体的な改善内容\", \"priority\": \"high/medium/low\"}]}\n\
-         ```\n\
-         提案がなければ空配列 `{\"proposals\": []}` を返してください。\n\
-         最大3件まで。最も効果的な改善のみ提案してください。".to_string()
-    );
+    // テンプレートファイルを読み込み、プレースホルダーを置換
+    let template_path = PathBuf::from(&ctx.repos_base_dir)
+        .join(".agent")
+        .join("self-improvement-template.md");
+    let template = std::fs::read_to_string(&template_path).unwrap_or_else(|_| {
+        // フォールバック: 組み込みテンプレート
+        include_str!("../../config/self-improvement-template.md").to_string()
+    });
 
-    let prompt = analysis_parts.join("\n\n");
+    let prompt = template
+        .replace("{{classification_section}}", &classification_section)
+        .replace("{{error_section}}", &error_section)
+        .replace("{{memory_section}}", &memory_section);
     let schema = r#"{"type":"object","properties":{"proposals":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["title","description","priority"]}}},"required":["proposals"]}"#;
 
     let result = ClaudeRunner::new("self_improvement", &prompt)
@@ -1532,6 +1533,22 @@ async fn run_self_improvement(
         task_list.join("\n")
     );
     ctx.slack.post_message(channel, &msg).await.ok();
+
+    // 7. 成熟したスキル候補を通知（occurrences >= 2）
+    let mature_skills = ctx.db.get_mature_skill_candidates(2).unwrap_or_default();
+    if !mature_skills.is_empty() {
+        let skill_list: Vec<String> = mature_skills.iter()
+            .map(|(id, name, desc, count)| {
+                format!("• `{}` — {} ({}回検出) [id:{}]", name, desc, count, id)
+            })
+            .collect();
+        let skill_msg = format!(
+            ":sparkles: *スキル化候補* ({}件)\n{}\n\n_繰り返し検出されたパターンです。スキル化を検討してください。_",
+            mature_skills.len(),
+            skill_list.join("\n")
+        );
+        ctx.slack.post_message(channel, &skill_msg).await.ok();
+    }
 
     Ok(())
 }
