@@ -45,6 +45,8 @@ pub struct ExecutionResult {
     /// claude -p セッションID（セッション継続に使用）
     #[allow(dead_code)]
     pub session_id: Option<String>,
+    /// ブロッカー検知: BLOCKED: / REQUIRES_CLARIFICATION: の内容
+    pub blocker: Option<String>,
 }
 
 fn build_system_prompt(soul: &str, skill: &str, is_coding: bool) -> String {
@@ -128,11 +130,14 @@ pub async fn execute_task_with_session(
 
     let result = runner.run().await?;
 
+    let blocker = detect_blocker(&result.stdout);
+
     if result.success {
         Ok(ExecutionResult {
             success: true,
             output: result.stdout,
             session_id: result.session_id,
+            blocker,
         })
     } else {
         Ok(ExecutionResult {
@@ -143,6 +148,21 @@ pub async fn execute_task_with_session(
                 format!("{}\n\nSTDERR:\n{}", result.stdout, result.stderr)
             },
             session_id: result.session_id,
+            blocker,
         })
     }
+}
+
+/// executor 出力から BLOCKED: / REQUIRES_CLARIFICATION: を検知
+fn detect_blocker(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("BLOCKED:") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = trimmed.strip_prefix("REQUIRES_CLARIFICATION:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }

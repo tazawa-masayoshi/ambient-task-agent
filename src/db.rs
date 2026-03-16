@@ -50,6 +50,18 @@ pub struct CodingTask {
     pub source: String,
     /// conversing フェーズの会話スレッド TS（ops_contexts のキーに使う）
     pub converse_thread_ts: Option<String>,
+    /// 初回分類結果: "execute" | "converse"
+    pub initial_classification: Option<String>,
+    /// 分類の実際の結果: "correct" | "needed_converse" | "needed_manual"
+    pub classification_outcome: Option<String>,
+}
+
+/// 分類履歴レコード（few-shot 学習用）
+pub struct ClassificationRecord {
+    pub task_name: String,
+    pub description: String,
+    pub classification: String,
+    pub outcome: String,
 }
 
 /// サブタスク定義（旧 decomposer で使用、DB の subtasks_json に保存済みデータの読み取り用に保持）
@@ -120,7 +132,7 @@ pub struct ScheduledJob {
     pub next_run_at: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, claude_session_id, current_subtask_index, created_at, updated_at, source, converse_thread_ts";
+const TASK_COLUMNS: &str = "id, asana_task_gid, asana_task_name, description, repo_key, branch_name, status, plan_text, analysis_text, subtasks_json, slack_channel, slack_thread_ts, slack_plan_ts, pr_url, error_message, retry_count, summary, memory_note, priority_score, progress_percent, started_at, completed_at, estimated_minutes, actual_minutes, retrospective_note, complexity, claude_session_id, current_subtask_index, created_at, updated_at, source, converse_thread_ts, initial_classification, classification_outcome";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
     Ok(CodingTask {
@@ -156,6 +168,8 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<CodingTask> {
         updated_at: row.get(29)?,
         source: row.get(30).unwrap_or_else(|_| "asana".to_string()),
         converse_thread_ts: row.get(31).unwrap_or(None),
+        initial_classification: row.get(32).unwrap_or(None),
+        classification_outcome: row.get(33).unwrap_or(None),
     })
 }
 
@@ -292,6 +306,8 @@ impl Db {
             ("current_subtask_index", "INTEGER"), // v10: サブタスクループ進捗
             ("source", "TEXT NOT NULL DEFAULT 'asana'"), // v11: タスク入口識別 (asana/slack/manual)
             ("converse_thread_ts", "TEXT"),              // v11: conversing フェーズのスレッド TS
+            ("initial_classification", "TEXT"),          // v13: 初回分類結果 (execute/converse)
+            ("classification_outcome", "TEXT"),          // v13: 分類の実際の結果 (correct/needed_converse/needed_manual)
         ])?;
 
         // ops_queue: 追加カラム
@@ -1342,6 +1358,62 @@ impl Db {
         let tasks = stmt.query_map([], row_to_task)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(tasks)
+    }
+
+    /// conversing 状態で updated_at が cutoff_hours 以上前のタスクを取得（タイムアウト対象）
+    pub fn get_stale_conversing_tasks(&self, cutoff_hours: i64) -> Result<Vec<CodingTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM coding_tasks \
+             WHERE status = 'conversing' \
+               AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{} hours') \
+             ORDER BY id ASC",
+            TASK_COLUMNS, cutoff_hours
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let tasks = stmt.query_map([], row_to_task)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// 初回分類結果を記録
+    pub fn set_initial_classification(&self, id: i64, classification: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET initial_classification = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![classification, id],
+        )?;
+        Ok(())
+    }
+
+    /// 分類結果の実際の outcome を記録
+    pub fn set_classification_outcome(&self, id: i64, outcome: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coding_tasks SET classification_outcome = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![outcome, id],
+        )?;
+        Ok(())
+    }
+
+    /// 直近の分類履歴を取得（few-shot 学習用）
+    pub fn get_recent_classification_history(&self, limit: usize) -> Result<Vec<ClassificationRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT asana_task_name, description, initial_classification, classification_outcome \
+             FROM coding_tasks \
+             WHERE initial_classification IS NOT NULL AND classification_outcome IS NOT NULL \
+             ORDER BY id DESC LIMIT ?1"
+        )?;
+        let records = stmt.query_map(params![limit as i64], |row| {
+            Ok(ClassificationRecord {
+                task_name: row.get(0)?,
+                description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                classification: row.get::<_, String>(2)?,
+                outcome: row.get::<_, String>(3)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
     }
 
     /// キューアイテムをスキップ（対応不要と分類）

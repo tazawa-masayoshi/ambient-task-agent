@@ -101,6 +101,8 @@ mod tests {
             updated_at: updated_at.into(),
             source: "asana".into(),
             converse_thread_ts: None,
+            initial_classification: None,
+            classification_outcome: None,
         }
     }
 

@@ -122,6 +122,7 @@ impl Worker {
                     .unwrap_or(true);
             if should_check_followup {
                 worker.check_ops_followups().await;
+                worker.timeout_stale_conversing_tasks().await;
                 last_followup_check = Some(now);
             }
 
@@ -157,31 +158,21 @@ impl Worker {
     fn process_tasks(self: &Arc<Self>) -> bool {
         let mut had_error = false;
 
-        // 1. new → classify → executing / conversing
+        // 1. new → classify (LLM + heuristics fallback) → executing / conversing
         match self.db.get_new_task() {
             Ok(Some(task)) => {
-                let classification = classify_new_task(&task, &self.repos_config);
-                match classification {
-                    TaskClassification::Execute => {
-                        tracing::info!("Auto-executing task: {} ({})",
-                            task.asana_task_name, task.asana_task_gid);
-                        if self.db.update_status(task.id, "executing").is_ok() {
-                            let task_id = task.id;
-                            self.spawn_task(task_id, |w| async move {
-                                w.execute_approved_task(task).await
-                            });
-                        }
-                    }
-                    TaskClassification::Converse => {
-                        tracing::info!("Starting conversation for task: {} ({})",
-                            task.asana_task_name, task.asana_task_gid);
-                        if self.db.update_status(task.id, "conversing").is_ok() {
-                            let task_id = task.id;
-                            self.spawn_task(task_id, |w| async move {
-                                w.start_conversing_task(task).await
-                            });
-                        }
-                    }
+                tracing::info!("Classifying new task: {} ({})", task.asana_task_name, task.asana_task_gid);
+                // heuristics で即判定してステータスを claim（二重 pickup 防止）
+                let heuristic = classify_new_task_heuristic(&task, &self.repos_config);
+                let initial_status = match heuristic {
+                    TaskClassification::Execute => "executing",
+                    TaskClassification::Converse => "conversing",
+                };
+                if self.db.update_status(task.id, initial_status).is_ok() {
+                    let task_id = task.id;
+                    self.spawn_task(task_id, |w| async move {
+                        w.classify_and_dispatch(task).await
+                    });
                 }
             }
             Ok(None) => {}
@@ -652,6 +643,30 @@ impl Worker {
     ///
     /// 全opsスコープの説明を提示し、Claude に最適なスコープを選ばせる。
     /// 該当なしの場合は None を返す。
+    /// conversing 状態で営業日5日以上返信がないタスクを sleeping に遷移
+    async fn timeout_stale_conversing_tasks(self: &Arc<Self>) {
+        // 営業日5日 ≈ 暦日7日（+バッファ）として120時間で検索
+        let stale_tasks = match self.db.get_stale_conversing_tasks(120) {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!("Failed to get stale conversing tasks: {}", e);
+                return;
+            }
+        };
+
+        for task in stale_tasks {
+            let channel = task.slack_channel.as_deref()
+                .unwrap_or(&self.default_slack_channel);
+            let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
+
+            self.db.update_status(task.id, "sleeping").ok();
+            self.slack.reply_thread(channel, thread_ts,
+                ":zzz: 5営業日以上返信がないため、タスクをスリープに移行しました。`wake` で再開できます。",
+            ).await.ok();
+            tracing::info!("Task {} conversing timeout → sleeping", task.id);
+        }
+    }
+
     async fn route_ops(&self, item: &OpsQueueItem) -> Result<Option<usize>> {
         if item.message_text.trim().len() < 5 {
             tracing::debug!("route_ops: message too short, skipping");
@@ -835,6 +850,16 @@ impl Worker {
         // MEMORY 永続化
         self.persist_learnings(&result.output, &task, None);
 
+        // ブロッカー検知: executing → conversing に遷移
+        if let Some(ref blocker) = result.blocker {
+            tracing::info!("Task {} blocker detected, reverting to conversing", task.id);
+            self.db.update_status(task.id, "conversing")?;
+            let blocks = build_conversing_blocks(task.id, &format!(":warning: *ブロッカーが検出されました*\n{}", blocker));
+            self.slack.post_blocks(channel, thread_ts, &blocks,
+                &format!("ブロッカー: {}", blocker)).await.ok();
+            return Ok(());
+        }
+
         if result.success {
             self.db.update_status(task.id, "done")?;
             context::append_completed_task(base_dir, &task, None, Some(&result.output));
@@ -972,6 +997,20 @@ impl Worker {
             Ok(exec_result) if exec_result.success => {
                 // MEMORY 永続化（worktree 削除前に main repo に保存）
                 self.persist_learnings(&exec_result.output, task, Some(repo_entry));
+
+                // ブロッカー検知: executing → conversing に遷移
+                if let Some(ref blocker) = exec_result.blocker {
+                    tracing::info!("Task {} blocker detected, reverting to conversing", task.id);
+                    self.db.update_status(task.id, "conversing")?;
+                    self.db.set_classification_outcome(task.id, "needed_converse").ok();
+                    // claude_session_id は保持（--resume で再開可能）
+                    let blocks = build_conversing_blocks(task.id, &format!(":warning: *ブロッカーが検出されました*\n{}", blocker));
+                    self.slack.post_blocks(channel, thread_ts, &blocks,
+                        &format!("ブロッカー: {}", blocker)).await.ok();
+                    workspace::remove(ws).await.ok();
+                    return Ok(());
+                }
+
                 // finalize_worktree が remove まで担当
                 self.finalize_worktree(task, repo_entry, ws).await?;
             }
@@ -1113,6 +1152,7 @@ impl Worker {
             Ok(pr_url) => {
                 self.db.update_pr_url(task.id, &pr_url)?;
                 self.db.update_status(task.id, "ci_pending")?;
+                self.db.set_classification_outcome(task.id, "correct").ok();
                 let msg = format!(":gear: PR を作成しました — CI 結果を監視中...\n{}", pr_url);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
@@ -1153,6 +1193,40 @@ impl Worker {
             Err(e) => {
                 tracing::error!("Failed to fetch conversing tasks: {}", e);
                 true
+            }
+        }
+    }
+
+    /// LLM で分類し、結果に基づいて executing or conversing にディスパッチ
+    ///
+    /// heuristics で暫定ステータスが設定済み。LLM 結果で変更が必要なら更新する。
+    async fn classify_and_dispatch(&self, task: CodingTask) -> Result<()> {
+        let log_dir = self.log_dir();
+        let classification = classify_new_task_llm(
+            &task, &self.repos_config, &self.db, &self.runner_ctx, &log_dir,
+        ).await;
+
+        // 分類結果を記録
+        let class_str = match classification {
+            TaskClassification::Execute => "execute",
+            TaskClassification::Converse => "converse",
+        };
+        self.db.set_initial_classification(task.id, class_str).ok();
+
+        match classification {
+            TaskClassification::Execute => {
+                // heuristics で conversing にしていた場合は executing に修正
+                if task.status != "executing" {
+                    self.db.update_status(task.id, "executing")?;
+                }
+                self.execute_approved_task(task).await
+            }
+            TaskClassification::Converse => {
+                // heuristics で executing にしていた場合は conversing に修正
+                if task.status != "conversing" {
+                    self.db.update_status(task.id, "conversing")?;
+                }
+                self.start_conversing_task(task).await
             }
         }
     }
@@ -1666,8 +1740,8 @@ enum TaskClassification {
     Converse,
 }
 
-/// new タスクを executing（即実行）か conversing（要件ヒアリング）に分類
-fn classify_new_task(task: &CodingTask, repos_config: &ReposConfig) -> TaskClassification {
+/// new タスクを executing（即実行）か conversing（要件ヒアリング）に分類（heuristics 版）
+fn classify_new_task_heuristic(task: &CodingTask, repos_config: &ReposConfig) -> TaskClassification {
     let is_slack_origin = task.asana_task_gid.starts_with("slack_")
         || task.asana_task_gid.starts_with("ops_");
 
@@ -1691,6 +1765,81 @@ fn classify_new_task(task: &CodingTask, repos_config: &ReposConfig) -> TaskClass
             TaskClassification::Execute
         } else {
             TaskClassification::Converse
+        }
+    }
+}
+
+/// new タスクを LLM で分類（past examples を few-shot で渡す）
+/// LLM 呼び出しに失敗した場合は heuristics にフォールバック
+async fn classify_new_task_llm(
+    task: &CodingTask,
+    repos_config: &ReposConfig,
+    db: &crate::db::Db,
+    runner_ctx: &crate::execution::RunnerContext,
+    log_dir: &Path,
+) -> TaskClassification {
+    // 過去の分類履歴を取得（few-shot 用）
+    let history = db.get_recent_classification_history(10).unwrap_or_default();
+    let examples = if history.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = history.iter().map(|r| {
+            format!("- 「{}」({}文字) → {} → 結果: {}", r.task_name, r.description.len(), r.classification, r.outcome)
+        }).collect();
+        format!("## 過去の分類履歴\n{}\n\n", lines.join("\n"))
+    };
+
+    let desc = task.description.as_deref().unwrap_or("(なし)");
+    let prompt = format!(
+        "タスクを execute（即実行可能）か converse（要件確認が必要）に分類してください。\n\n\
+         {}## 新しいタスク\n名前: {}\n説明: {}\nリポジトリ: {}\n入口: {}\n\n\
+         判断基準:\n- 要件が明確で実装可能 → execute\n- 曖昧・不足・確認事項あり → converse",
+        examples,
+        task.asana_task_name,
+        crate::claude::truncate_str(desc, 500),
+        task.repo_key.as_deref().unwrap_or("なし"),
+        task.source,
+    );
+
+    let schema = r#"{"type":"object","properties":{"classification":{"type":"string","enum":["execute","converse"]},"reason":{"type":"string"}},"required":["classification"]}"#;
+
+    let result = crate::claude::ClaudeRunner::new("classify", &prompt)
+        .max_turns(1)
+        .allowed_tools("")
+        .json_schema(schema)
+        .log_dir(log_dir)
+        .with_context(runner_ctx)
+        .run()
+        .await;
+
+    match result {
+        Ok(r) if r.success => {
+            let answer: Option<String> = serde_json::from_str::<serde_json::Value>(&r.stdout)
+                .ok()
+                .and_then(|v| v.get("classification")?.as_str().map(|s| s.to_string()));
+
+            match answer.as_deref() {
+                Some("execute") => {
+                    tracing::info!("LLM classify task {}: execute", task.id);
+                    TaskClassification::Execute
+                }
+                Some("converse") => {
+                    tracing::info!("LLM classify task {}: converse", task.id);
+                    TaskClassification::Converse
+                }
+                _ => {
+                    tracing::warn!("LLM classify: unexpected answer '{}', falling back to heuristics", r.stdout);
+                    classify_new_task_heuristic(task, repos_config)
+                }
+            }
+        }
+        Ok(r) => {
+            tracing::warn!("LLM classify failed (non-success): {}, falling back", r.stderr);
+            classify_new_task_heuristic(task, repos_config)
+        }
+        Err(e) => {
+            tracing::warn!("LLM classify error: {}, falling back to heuristics", e);
+            classify_new_task_heuristic(task, repos_config)
         }
     }
 }
