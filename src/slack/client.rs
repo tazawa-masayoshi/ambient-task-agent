@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::config::SlackConfig;
+use super::mrkdwn::markdown_to_mrkdwn;
 
 #[derive(Debug, Clone)]
 pub struct SlackClient {
@@ -52,11 +53,13 @@ impl SlackClient {
         blocks: &serde_json::Value,
         text: &str,
     ) -> Result<String> {
+        let converted_text = markdown_to_mrkdwn(text);
+        let converted_blocks = convert_blocks_text(blocks);
         let body = serde_json::json!({
             "channel": channel,
             "thread_ts": thread_ts,
-            "blocks": blocks,
-            "text": text,
+            "blocks": converted_blocks,
+            "text": converted_text,
         });
 
         let resp = self
@@ -91,11 +94,13 @@ impl SlackClient {
         blocks: &serde_json::Value,
         text: &str,
     ) -> Result<()> {
+        let converted_text = markdown_to_mrkdwn(text);
+        let converted_blocks = convert_blocks_text(blocks);
         let body = serde_json::json!({
             "channel": channel,
             "ts": ts,
-            "blocks": blocks,
-            "text": text,
+            "blocks": converted_blocks,
+            "text": converted_text,
         });
 
         let resp = self
@@ -287,9 +292,10 @@ impl SlackClient {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<String> {
+        let converted = markdown_to_mrkdwn(text);
         let body = PostMessageRequest {
             channel,
-            text,
+            text: &converted,
             thread_ts,
         };
 
@@ -316,4 +322,57 @@ impl SlackClient {
 
         Ok(data.ts.unwrap_or_default())
     }
+}
+
+/// Block Kit JSON 内の section/header ブロックの text フィールドを mrkdwn 変換
+fn convert_blocks_text(blocks: &serde_json::Value) -> serde_json::Value {
+    match blocks {
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(convert_block_element).collect())
+        }
+        _ => blocks.clone(),
+    }
+}
+
+fn convert_block_element(block: &serde_json::Value) -> serde_json::Value {
+    let mut b = block.clone();
+    if let Some(obj) = b.as_object_mut() {
+        // section / header の text.text を変換 (type=mrkdwn のもの)
+        if let Some(text_obj) = obj.get_mut("text") {
+            if let Some(inner) = text_obj.as_object_mut() {
+                let is_mrkdwn = inner
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|t| t == "mrkdwn");
+                if is_mrkdwn {
+                    if let Some(serde_json::Value::String(s)) = inner.get("text") {
+                        inner.insert(
+                            "text".to_string(),
+                            serde_json::Value::String(markdown_to_mrkdwn(s)),
+                        );
+                    }
+                }
+            }
+        }
+        // fields 配列内のテキストも変換
+        if let Some(serde_json::Value::Array(fields)) = obj.get_mut("fields") {
+            for field in fields.iter_mut() {
+                if let Some(inner) = field.as_object_mut() {
+                    let is_mrkdwn = inner
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .is_none_or(|t| t == "mrkdwn");
+                    if is_mrkdwn {
+                        if let Some(serde_json::Value::String(s)) = inner.get("text") {
+                            inner.insert(
+                                "text".to_string(),
+                                serde_json::Value::String(markdown_to_mrkdwn(s)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    b
 }

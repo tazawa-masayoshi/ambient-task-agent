@@ -35,6 +35,11 @@ pub async fn dispatch_event(state: &Arc<AppState>, event: &serde_json::Value) ->
         }
         "app_mention" => handle_app_mention(state, event).await,
         "message" => handle_message(state, event).await,
+        "assistant_thread_started" => handle_assistant_thread_started(state, event).await,
+        "assistant_thread_context_changed" => {
+            tracing::debug!("assistant_thread_context_changed (ignored)");
+            Ok(())
+        }
         _ => {
             tracing::debug!("Unhandled Slack event type: {}", event_type);
             Ok(())
@@ -357,6 +362,12 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         .get("channel")
         .and_then(|c| c.as_str())
         .unwrap_or_default();
+
+    // DM (im) チャンネル → Agent/Assistant として処理
+    if is_dm_channel(channel) {
+        return handle_dm_message(state, event).await;
+    }
+
     let text = event
         .get("text")
         .and_then(|t| t.as_str())
@@ -598,6 +609,102 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             // manual 中のその他メッセージは作業メモとして無視
             // それ以外の認識できないスレッド返信も無視
         }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Phase 4: Agent/Assistant DM
+// ============================================================================
+
+/// assistant_thread_started: ユーザーが Agent を開いた時
+async fn handle_assistant_thread_started(state: &Arc<AppState>, event: &serde_json::Value) -> Result<()> {
+    let channel = event
+        .get("assistant_thread")
+        .and_then(|t| t.get("channel_id"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    let thread_ts = event
+        .get("assistant_thread")
+        .and_then(|t| t.get("thread_ts"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    if channel.is_empty() || thread_ts.is_empty() {
+        return Ok(());
+    }
+
+    // Suggested Prompts を設定
+    let prompts = serde_json::json!([
+        { "title": "今日のタスク", "message": "今日やるべきタスクの一覧と優先度を教えて" },
+        { "title": "新しいタスクを依頼", "message": "このタスクをお願いしたい：" },
+        { "title": "進捗確認", "message": "現在進行中のタスクのステータスを教えて" },
+        { "title": "今日のブリーフィング", "message": "今日の予定・タスク・注意事項をまとめて" }
+    ]);
+
+    // assistant.threads.setSuggestedPrompts
+    let resp = reqwest::Client::new()
+        .post("https://slack.com/api/assistant.threads.setSuggestedPrompts")
+        .header("Authorization", format!("Bearer {}", state.slack_bot_token))
+        .json(&serde_json::json!({
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+            "prompts": prompts,
+        }))
+        .send()
+        .await;
+
+    if let Ok(r) = resp {
+        let body: serde_json::Value = r.json().await.unwrap_or_default();
+        if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            tracing::warn!("setSuggestedPrompts failed: {:?}", body.get("error"));
+        }
+    }
+
+    tracing::info!("Assistant thread started: channel={}, thread_ts={}", channel, thread_ts);
+    Ok(())
+}
+
+/// DM (im) チャンネルかどうかを判定
+fn is_dm_channel(channel: &str) -> bool {
+    channel.starts_with('D')
+}
+
+/// DM メッセージを Agent として処理
+async fn handle_dm_message(state: &Arc<AppState>, event: &serde_json::Value) -> Result<()> {
+    let channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or_default();
+    let text = event.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
+    let message_ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or_default();
+
+    // スレッド内の返信: thread_ts を使う。トップレベル: ts を使う
+    let reply_ts = thread_ts.unwrap_or(message_ts);
+
+    let slack = state.slack_client();
+
+    // ローディング表示
+    let _ = reqwest::Client::new()
+        .post("https://slack.com/api/assistant.threads.setStatus")
+        .header("Authorization", format!("Bearer {}", state.slack_bot_token))
+        .json(&serde_json::json!({
+            "channel_id": channel,
+            "thread_ts": reply_ts,
+            "status": "考え中...",
+        }))
+        .send()
+        .await;
+
+    // DM → Inception モード（ambient-task-agent）で処理
+    // ops_mode=inception のリポを探す
+    let repo_entry = state.repos_config.repo.iter()
+        .find(|r| r.ops_mode == crate::repo_config::OpsMode::Inception)
+        .or_else(|| state.repos_config.find_repo_by_ops_channel(&state.slack_channel));
+
+    if let Some(repo_entry) = repo_entry {
+        enqueue_ops_request(state, event, channel, message_ts, thread_ts, text, repo_entry, "ready")?;
+    } else {
+        slack.reply_thread(channel, reply_ts, ":wave: メッセージを受け取りました。現在 DM からの直接処理は設定されていません。").await?;
     }
 
     Ok(())

@@ -275,9 +275,15 @@ impl Worker {
     /// - pending: classify → actionable なら実行、そうでなければ skipped
     /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
     async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
-        // チャンネルが ops_channel に紐づいている場合はそのエントリを直接使う（ルーティング不要）
-        // 紐づいていない場合のみコンテンツベースルーティングにフォールバック
-        let repo_entry = if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
+        // 1. repo_key で直接マッチ（DM 等チャンネルに紐づかないケース）
+        // 2. チャンネルが ops_channel に紐づいている場合はそのエントリを使う
+        // 3. いずれも該当しない場合のみコンテンツベースルーティング
+        let repo_entry = if let Some(direct) = self.repos_config.find_repo_by_key(&item.repo_key) {
+            tracing::info!("ops item {} key-matched to scope: {} ({})",
+                item.id, direct.key,
+                direct.ops_description.as_deref().unwrap_or("no description"));
+            direct.clone()
+        } else if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
             tracing::info!("ops item {} channel-matched to scope: {} ({})",
                 item.id, direct.key,
                 direct.ops_description.as_deref().unwrap_or("no description"));
@@ -397,8 +403,8 @@ impl Worker {
         match exec_result {
             Ok(raw_output) => {
                 let output = if raw_output.trim().is_empty() {
-                    tracing::warn!("ops item {}: Claude returned empty output, using fallback", item.id);
-                    "（作業完了 — Claude からのテキスト出力なし。ツール操作のみ実行された可能性があります）".to_string()
+                    tracing::warn!("ops item {}: Claude returned empty output after resume retry", item.id);
+                    ":warning: 作業を実行しましたが、結果の要約を取得できませんでした。ログを確認してください。".to_string()
                 } else {
                     raw_output
                 };

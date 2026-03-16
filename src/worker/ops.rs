@@ -324,5 +324,28 @@ pub async fn execute_ops(
         anyhow::bail!("claude -p ops failed: {}", result.error_output());
     }
 
-    Ok(result.stdout.trim().to_string())
+    let output = result.stdout.trim().to_string();
+
+    // 空出力時: --resume で要約を要求（1ターン、ツールなし）
+    if output.is_empty() {
+        if let Some(ref sid) = result.session_id {
+            tracing::info!("ops: empty output, requesting summary via --resume {}", sid);
+            let summary_result = ClaudeRunner::new("ops_summary",
+                "さっきの作業内容を日本語で3行以内に要約してください。何を試みて、結果どうなったかを含めてください。")
+                .max_turns(1)
+                .allowed_tools("") // ツールなし
+                .cwd(repo_path)
+                .resume(sid)
+                .with_context(runner_ctx)
+                .run()
+                .await;
+            if let Ok(ref sr) = summary_result {
+                if sr.success && !sr.stdout.trim().is_empty() {
+                    return Ok(sr.stdout.trim().to_string());
+                }
+            }
+        }
+    }
+
+    Ok(output)
 }
