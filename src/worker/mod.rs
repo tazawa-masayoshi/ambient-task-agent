@@ -5,6 +5,8 @@ pub mod ops;
 pub mod priority;
 pub mod ratchet;
 pub mod runner;
+mod runner_ci;
+mod runner_conversing;
 mod runner_ops;
 pub mod scheduler;
 pub mod task_file;

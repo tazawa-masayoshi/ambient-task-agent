@@ -70,7 +70,7 @@ impl Worker {
     }
 
     /// リポジトリパスを解決（共通ヘルパー）
-    fn resolve_repo_path(&self, task: &CodingTask) -> Result<std::path::PathBuf> {
+    pub(crate) fn resolve_repo_path(&self, task: &CodingTask) -> Result<std::path::PathBuf> {
         match task.repo_key.as_deref() {
             Some(key) => match self.repos_config.find_repo_by_key(key) {
                 Some(r) => Ok(self.repos_config.repo_local_path(r)),
@@ -276,7 +276,7 @@ impl Worker {
     ///
     /// session_id があれば --resume で Plan セッションを継続、なければフルプロンプトで実行。
     /// repo_entry があれば worktree 隔離実行、なければ直接実行。
-    async fn execute_task(&self, task: CodingTask) -> Result<()> {
+    pub(crate) async fn execute_task(&self, task: CodingTask) -> Result<()> {
         let repo_entry = task
             .repo_key
             .as_deref()
@@ -577,7 +577,7 @@ impl Worker {
     /// タスク処理を spawn し、panic/エラー時に DB を error 状態に復帰させる。
     /// 同一 task_id が既に実行中なら spawn しない（二重実行防止）。
     /// Drop ガードにより panic 時も running_tasks から確実に除去される。
-    fn spawn_task<F, Fut>(self: &Arc<Self>, task_id: i64, f: F)
+    pub(crate) fn spawn_task<F, Fut>(self: &Arc<Self>, task_id: i64, f: F)
     where
         F: FnOnce(Arc<Worker>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send,
@@ -608,7 +608,7 @@ impl Worker {
     }
 
     /// WORKFLOW.md → defaults → complex*2 の順で max_turns を解決
-    fn resolve_execute_turns(&self, worktree_path: &Path, complexity: Option<&str>) -> u32 {
+    pub(crate) fn resolve_execute_turns(&self, worktree_path: &Path, complexity: Option<&str>) -> u32 {
         let wf = workflow::load(worktree_path);
         let base = wf
             .as_ref()
@@ -624,7 +624,7 @@ impl Worker {
     ///
     /// - `has_session=true` の場合: ディレクトリ設定のみ行い context/memory の読み込みをスキップ
     ///   （--resume 時は Plan セッションにコンテキストが既にある）
-    fn build_worktree_context(
+    pub(crate) fn build_worktree_context(
         &self,
         ws: &workspace::Workspace,
         max_turns: u32,
@@ -703,466 +703,6 @@ impl Worker {
         Ok(())
     }
 
-    /// conversing タスクの継続処理。ユーザー返信があれば次の Claude ターンを spawn する。
-    fn process_conversing_tasks(self: &Arc<Self>) -> bool {
-        match self.db.get_conversing_tasks_needing_response() {
-            Ok(tasks) => {
-                for task in tasks {
-                    let task_id = task.id;
-                    self.spawn_task(task_id, |w| async move {
-                        w.continue_conversing_task(task).await
-                    });
-                }
-                false
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch conversing tasks: {}", e);
-                true
-            }
-        }
-    }
-
-    /// LLM で分類し、結果に基づいて executing or conversing にディスパッチ
-    ///
-    /// heuristics で暫定ステータスが設定済み。LLM 結果で変更が必要なら更新する。
-    async fn classify_and_dispatch(&self, task: CodingTask) -> Result<()> {
-        let log_dir = self.log_dir();
-        let classification = super::classify::classify_new_task_llm(
-            &task, &self.repos_config, &self.db, &self.runner_ctx, &log_dir,
-        ).await;
-
-        // 分類結果を記録
-        let class_str = match classification {
-            TaskClassification::Execute => "execute",
-            TaskClassification::Converse => "converse",
-        };
-        self.db.set_initial_classification(task.id, class_str).ok();
-
-        match classification {
-            TaskClassification::Execute => {
-                // heuristics で conversing にしていた場合は executing に修正
-                if task.status != "executing" {
-                    self.db.update_status(task.id, "executing")?;
-                }
-                self.execute_task(task).await
-            }
-            TaskClassification::Converse => {
-                // heuristics で executing にしていた場合は conversing に修正
-                if task.status != "conversing" {
-                    self.db.update_status(task.id, "conversing")?;
-                }
-                self.start_conversing_task(task).await
-            }
-        }
-    }
-
-    /// conversing 開始: Slack スレッド作成 + 要件ヒアリング質問生成
-    async fn start_conversing_task(&self, task: CodingTask) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-
-        // 1. Slack スレッドを作成（まだなければ）
-        let thread_ts = if let Some(ref existing_ts) = task.slack_thread_ts {
-            existing_ts.clone()
-        } else {
-            let msg = format!(
-                ":speech_balloon: *要件ヒアリング開始*\n*{}*",
-                task.asana_task_name
-            );
-            let ts = self.slack.post_message(channel, &msg).await?;
-            self.db.update_slack_thread(task.id, channel, &ts)?;
-            ts
-        };
-
-        // 2. converse_thread_ts を設定
-        self.db.update_converse_thread_ts(task.id, &thread_ts)?;
-
-        // 3. ops_contexts にタスク情報を追加
-        let repo_key = task.repo_key.as_deref().unwrap_or("default");
-        let desc = task.description.as_deref().unwrap_or("(なし)");
-        let initial_context = format!("タスク: {}\n説明: {}", task.asana_task_name, desc);
-        self.db.append_ops_context(channel, &thread_ts, repo_key, "user", &initial_context)?;
-
-        // 4. 要件ヒアリング質問を生成（入口に関わらず汎用プロンプト）
-        let log_dir = self.log_dir();
-        let prompt = format!(
-            "以下のタスクを実装するために、不明点や確認事項を洗い出してください。\n\n\
-             ## タスク\n{}\n\n## 説明\n{}\n\n\
-             ## 指示\n\
-             - コードベースを調査して、実装に必要な情報を整理してください\n\
-             - 不明点があれば具体的な質問を箇条書きで出力してください\n\
-             - 要件が十分に明確であれば `REQUIREMENTS_CONFIRMED: 要件の要約` を出力してください\n\
-             - 質問は最大5個まで。最も重要なものから順に",
-            task.asana_task_name, desc
-        );
-
-        let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
-            std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
-        });
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let soul = context::merged_soul(base_dir, Some(&repo_path));
-
-        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
-            .system_prompt(&soul)
-            .max_turns(3)
-            .cwd(&repo_path)
-            .log_dir(&log_dir)
-            .with_context(&self.runner_ctx)
-            .run()
-            .await?;
-
-        let output = result.stdout;
-
-        // 5. assistant 出力を保存
-        self.db.append_ops_context(channel, &thread_ts, repo_key, "assistant", &output)?;
-
-        // 6. REQUIREMENTS_CONFIRMED: が出たら即 executing に遷移（明確だった場合）
-        if output.lines().any(|l| l.trim().starts_with("REQUIREMENTS_CONFIRMED:")) {
-            self.db.update_status(task.id, "executing")?;
-            self.db.update_analysis(task.id, &output)?;
-            self.slack.reply_thread(channel, &thread_ts,
-                ":white_check_mark: 要件が確認できました。実行を開始します...").await.ok();
-            tracing::info!("Task {} requirements confirmed at first turn, → executing", task.id);
-            return Ok(());
-        }
-
-        // 7. 質問を Slack スレッドに投稿（conversing ボタン付き）
-        let truncated = crate::claude::truncate_str(&output, 2800);
-        let blocks = build_conversing_blocks(task.id, truncated);
-        self.slack.post_blocks(channel, &thread_ts, &blocks,
-            &format!(":speech_balloon: {}", truncated)).await?;
-
-        tracing::info!("Task {} is now conversing, waiting for user reply", task.id);
-        Ok(())
-    }
-
-    /// conversing 継続: ユーザー返信を受けて次の Claude ターンを実行
-    async fn continue_conversing_task(&self, task: CodingTask) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.converse_thread_ts.as_deref()
-            .or(task.slack_thread_ts.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("No converse_thread_ts for task {}", task.id))?;
-
-        let repo_key = task.repo_key.as_deref().unwrap_or("default");
-        let history = self.db.get_ops_context(channel, thread_ts)?;
-
-        // 会話履歴をプロンプトに組み込む
-        let history_text: String = history.iter()
-            .map(|m| format!("[{}] {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        let prompt = format!(
-            "以下のタスクについて要件ヒアリングを継続してください。\n\n\
-             ## タスク\n{}\n\n## 会話履歴\n{}\n\n\
-             ## 指示\n\
-             - ユーザーの最新の返信を踏まえて、追加の質問があれば出力してください\n\
-             - 要件が十分に明確になったら `REQUIREMENTS_CONFIRMED: 要件の要約` を出力してください\n\
-             - 質問は具体的に、最大3個まで",
-            task.asana_task_name, history_text
-        );
-
-        let repo_path = self.resolve_repo_path(&task).unwrap_or_else(|_| {
-            std::path::PathBuf::from(&self.repos_config.defaults.repos_base_dir)
-        });
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let soul = context::merged_soul(base_dir, Some(&repo_path));
-        let log_dir = self.log_dir();
-
-        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
-            .system_prompt(&soul)
-            .max_turns(3)
-            .cwd(&repo_path)
-            .log_dir(&log_dir)
-            .with_context(&self.runner_ctx)
-            .run()
-            .await?;
-
-        let output = result.stdout;
-
-        // assistant 出力を保存
-        self.db.append_ops_context(channel, thread_ts, repo_key, "assistant", &output)?;
-
-        // REQUIREMENTS_CONFIRMED: 検出 → 自動的に executing に遷移（行頭マッチで誤検知防止）
-        if output.lines().any(|l| l.trim().starts_with("REQUIREMENTS_CONFIRMED:")) {
-            self.db.update_status(task.id, "executing")?;
-            self.db.update_analysis(task.id, &output)?;
-            self.slack.reply_thread(channel, thread_ts,
-                ":white_check_mark: 要件が確定しました。実行を開始します...").await.ok();
-            return Ok(());
-        }
-
-        // 通常の会話継続: 応答を Slack に投稿（conversing ボタン付き）
-        let truncated = crate::claude::truncate_str(&output, 2800);
-        let blocks = build_conversing_blocks(task.id, truncated);
-        self.slack.post_blocks(channel, thread_ts, &blocks,
-            &format!(":speech_balloon: {}", truncated)).await?;
-
-        Ok(())
-    }
-
-    /// ci_pending タスクの CI 結果を確認し、完了 or リトライする
-    async fn check_ci_and_handle(&self, task: CodingTask) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-
-        let repo_entry = match task
-            .repo_key
-            .as_deref()
-            .and_then(|key| self.repos_config.find_repo_by_key(key))
-        {
-            Some(r) => r,
-            None => {
-                tracing::warn!("No repo_entry for ci_pending task {}", task.id);
-                return Ok(());
-            }
-        };
-
-        let branch_name = match task.branch_name.as_deref() {
-            Some(b) => b,
-            None => {
-                tracing::warn!("No branch_name for ci_pending task {}", task.id);
-                self.db.update_status(task.id, "done")?;
-                return Ok(());
-            }
-        };
-
-        // CI ステータスを確認
-        let ci_status = workspace::check_ci(
-            base_dir,
-            &repo_entry.key,
-            &repo_entry.github,
-            branch_name,
-        )
-        .await?;
-
-        match ci_status {
-            workspace::CiStatus::Pending => {
-                // まだ実行中 — 次のループで再チェック
-                tracing::trace!("CI still pending for task {}", task.id);
-            }
-            workspace::CiStatus::NotFound => {
-                // CI ワークフローがない — そのまま done に
-                tracing::info!("No CI workflow found for task {}, marking done", task.id);
-                self.db.update_status(task.id, "done")?;
-
-                let repo_path = self.repos_config.repo_local_path(repo_entry);
-                context::append_completed_task(base_dir, &task, Some(&repo_path), None);
-
-                self.slack
-                    .reply_thread(
-                        channel,
-                        thread_ts,
-                        ":white_check_mark: 完了（CI ワークフローなし）",
-                    )
-                    .await
-                    .ok();
-            }
-            workspace::CiStatus::Passed => {
-                // CI 通過 — done
-                self.db.update_status(task.id, "done")?;
-
-                let repo_path = self.repos_config.repo_local_path(repo_entry);
-                context::append_completed_task(base_dir, &task, Some(&repo_path), None);
-
-                let pr_url = task.pr_url.as_deref().unwrap_or("(no URL)");
-                let msg = format!(
-                    ":white_check_mark: CI 通過 — 完了\n{}",
-                    pr_url
-                );
-                self.slack
-                    .reply_thread(channel, thread_ts, &msg)
-                    .await
-                    .ok();
-            }
-            workspace::CiStatus::Failed { summary } => {
-                // CI 失敗 — リトライ可能か判定
-                let new_count = self.db.increment_retry_count(task.id)?;
-                let max_retry = repo_entry.ci_max_retry;
-
-                if (new_count as u32) > max_retry {
-                    // リトライ上限到達
-                    self.db
-                        .set_error(task.id, &format!("CI failed after {} retries: {}", new_count, summary))?;
-
-                    let msg = format!(
-                        ":x: CI 失敗（リトライ上限 {} 回に到達）\n```\n{}\n```{}",
-                        max_retry, summary, ERROR_LOG_HINT
-                    );
-                    self.slack
-                        .reply_thread(channel, thread_ts, &msg)
-                        .await
-                        .ok();
-                } else {
-                    // リトライ実行
-                    tracing::info!(
-                        "CI failed for task {} (retry {}/{}), attempting fix",
-                        task.id, new_count, max_retry
-                    );
-                    if let Err(e) = self
-                        .retry_ci_failed(&task, repo_entry, &summary)
-                        .await
-                    {
-                        tracing::error!("CI retry failed for task {}: {}", task.id, e);
-                        self.db.set_error(task.id, &format!("CI retry error: {}", e))?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// CI 失敗時のリトライ: worktree を再作成 → CI エラーをフィードバック → 再実行 → push
-    async fn retry_ci_failed(
-        &self,
-        task: &CodingTask,
-        repo_entry: &crate::repo_config::RepoEntry,
-        ci_summary: &str,
-    ) -> Result<()> {
-        let channel = task
-            .slack_channel
-            .as_deref()
-            .unwrap_or(&self.default_slack_channel);
-        let thread_ts = task.slack_thread_ts.as_deref().unwrap_or("");
-        let base_dir = &self.repos_config.defaults.repos_base_dir;
-        let branch_name = task.branch_name.as_deref().unwrap_or("");
-        let retry_count = task.retry_count;
-
-        self.slack
-            .reply_thread(
-                channel,
-                thread_ts,
-                &format!(
-                    ":recycle: CI 失敗を検出 — 自動修正中 (リトライ {})...\n```\n{}\n```",
-                    retry_count + 1,
-                    truncate_for_slack(ci_summary, 500)
-                ),
-            )
-            .await
-            .ok();
-
-        // CI の失敗ログを取得（エージェントへのフィードバック用）
-        let ci_log = workspace::get_ci_failure_log(
-            base_dir,
-            &repo_entry.key,
-            &repo_entry.github,
-            branch_name,
-        )
-        .await
-        .unwrap_or_else(|_| ci_summary.to_string());
-
-        // 既存ブランチから worktree を再作成
-        let ws = workspace::create_for_retry(
-            base_dir,
-            &repo_entry.key,
-            task.id,
-            branch_name,
-        )
-        .await?;
-
-        // CI エラーをフィードバックとしてプロンプトに注入
-        let ci_fix_prompt = format!(
-            "CI が失敗しました。以下のエラーログを読んで修正してください。\n\
-             コードを修正し、テストが通ることを確認してから完了してください。\n\
-             リンター設定やテスト設定を変更してはいけません。コードを直してください。\n\n\
-             ## CI エラーログ\n```\n{}\n```",
-            truncate_for_slack(&ci_log, 2500)
-        );
-
-        // executor 実行（CI エラーをプロンプトに含める）
-        let max_turns = self.resolve_execute_turns(&ws.worktree_path, task.complexity.as_deref());
-        let wc = self.build_worktree_context(&ws, max_turns, false);
-
-        let log_dir = self.log_dir();
-        let result = executor::execute_task(
-            &format!("[CI FIX] {}", task.asana_task_name),
-            &ci_fix_prompt,
-            Some(repo_entry),
-            Some(ws.worktree_path.as_path()),
-            &wc,
-            Some(&log_dir),
-            &self.runner_ctx,
-        )
-        .await;
-
-        match result {
-            Ok(exec_result) if exec_result.success => {
-                // 修正を push
-                match workspace::push_retry(&ws).await {
-                    Ok(()) => {
-                        // ci_pending に戻す（次のループで CI を再チェック）
-                        self.db.update_status(task.id, "ci_pending")?;
-
-                        self.slack
-                            .reply_thread(
-                                channel,
-                                thread_ts,
-                                ":gear: CI 修正を push しました — CI 結果を再監視中...",
-                            )
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
-                        // push 失敗（変更なし等）
-                        self.db.update_status(task.id, "ci_pending")?;
-                        tracing::warn!("Push retry failed for task {}: {}", task.id, e);
-
-                        self.slack
-                            .reply_thread(
-                                channel,
-                                thread_ts,
-                                &format!(":warning: CI 修正の push に失敗: {}", e),
-                            )
-                            .await
-                            .ok();
-                    }
-                }
-            }
-            Ok(exec_result) => {
-                // executor は完了したが成功ではない
-                self.db.update_status(task.id, "ci_pending")?;
-
-                let output_summary = truncate_for_slack(&exec_result.output, 500);
-                self.slack
-                    .reply_thread(
-                        channel,
-                        thread_ts,
-                        &format!(":warning: CI 修正の実行結果が不明 — 再監視中\n```\n{}\n```", output_summary),
-                    )
-                    .await
-                    .ok();
-            }
-            Err(e) => {
-                // executor エラー
-                self.db.update_status(task.id, "ci_pending")?;
-                tracing::error!("CI fix executor error for task {}: {}", task.id, e);
-
-                self.slack
-                    .reply_thread(
-                        channel,
-                        thread_ts,
-                        &format!(":x: CI 修正の実行中にエラー: {}{}", e, ERROR_LOG_HINT),
-                    )
-                    .await
-                    .ok();
-            }
-        }
-
-        // worktree cleanup
-        workspace::remove(&ws).await.ok();
-
-        Ok(())
-    }
 }
 
 // 旧 build_proposal_blocks / build_info_blocks は削除（conversing フローに置き換え済み）
@@ -1303,7 +843,7 @@ pub(crate) fn extract_slack_summary(output: &str) -> &str {
 }
 
 /// conversing 状態のボタンレイアウト: [実行開始] [指示追加] [手動修正] [スキップ]
-fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
+pub(crate) fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
     serde_json::json!([
         {
             "type": "section",
