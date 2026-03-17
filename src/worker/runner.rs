@@ -1017,10 +1017,7 @@ impl Worker {
 
         match result {
             Ok(exec_result) if exec_result.success => {
-                // MEMORY 永続化（worktree 削除前に main repo に保存）
-                self.persist_learnings(&exec_result.output, task, Some(repo_entry));
-
-                // ブロッカー検知: executing → conversing に遷移
+                // ブロッカー検知: executing → conversing に遷移（persist_learnings は呼ばない）
                 if let Some(ref blocker) = exec_result.blocker {
                     tracing::info!("Task {} blocker detected, reverting to conversing", task.id);
                     self.db.update_status(task.id, "conversing")?;
@@ -1032,6 +1029,9 @@ impl Worker {
                     workspace::remove(ws).await.ok();
                     return Ok(());
                 }
+
+                // MEMORY 永続化（ブロッカーなし・成功時のみ — 途中出力の汚染防止）
+                self.persist_learnings(&exec_result.output, task, Some(repo_entry));
 
                 // git-ratchet: 品質メトリクスが悪化していないか検証
                 if let Err(ratchet_err) = quality_ratchet_check(&ws.worktree_path).await {
