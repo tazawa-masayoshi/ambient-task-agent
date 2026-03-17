@@ -682,15 +682,19 @@ async fn handle_dm_message(state: &Arc<AppState>, event: &serde_json::Value) -> 
     // ローディング表示
     set_assistant_status(state, channel, reply_ts, "考え中...").await;
 
+    // Slack user ID → Asana 表示名を解決
+    let slack_user_id = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
+    let asana_name = state.repos_config.defaults.slack_user_map.get(slack_user_id).map(|s| s.as_str());
+
     let text_lower = text.to_lowercase();
 
     // パターンマッチ: 定型クエリはプログラムでデータ取得 → LLM 1ターン整形
     let result = if text_lower.contains("タスク") && (text_lower.contains("一覧") || text_lower.contains("今日")) {
-        handle_dm_tasks(state, text).await
+        handle_dm_tasks(state, text, asana_name).await
     } else if text_lower.contains("進捗") || text_lower.contains("ステータス") {
         handle_dm_progress(state, text).await
     } else if text_lower.contains("ブリーフィング") || text_lower.contains("まとめ") {
-        handle_dm_briefing(state, text).await
+        handle_dm_briefing(state, text, asana_name).await
     } else {
         // パターン外 → Inception モードに委譲
         let repo_entry = state.repos_config.repo.iter()
@@ -735,12 +739,19 @@ async fn set_assistant_status(state: &Arc<AppState>, channel: &str, thread_ts: &
 }
 
 /// DM: タスク一覧
-async fn handle_dm_tasks(state: &Arc<AppState>, user_text: &str) -> Result<String> {
+async fn handle_dm_tasks(state: &Arc<AppState>, user_text: &str, asana_name: Option<&str>) -> Result<String> {
     // DB のアクティブタスク
     let db_tasks = state.db.get_active_tasks()?;
-    // Asana キャッシュ（未完了のみ）
+    // Asana キャッシュ（未完了のみ、ユーザーでフィルタ）
     let asana_tasks = crate::sync::load_cache()
-        .map(|c| c.tasks.into_iter().filter(|t| !t.completed).collect::<Vec<_>>())
+        .map(|c| c.tasks.into_iter().filter(|t| {
+            if t.completed { return false; }
+            if let Some(name) = asana_name {
+                t.assignee.contains(name)
+            } else {
+                true
+            }
+        }).collect::<Vec<_>>())
         .unwrap_or_default();
 
     if db_tasks.is_empty() && asana_tasks.is_empty() {
@@ -791,7 +802,7 @@ async fn handle_dm_progress(state: &Arc<AppState>, user_text: &str) -> Result<St
 }
 
 /// DM: ブリーフィング
-async fn handle_dm_briefing(state: &Arc<AppState>, user_text: &str) -> Result<String> {
+async fn handle_dm_briefing(state: &Arc<AppState>, user_text: &str, asana_name: Option<&str>) -> Result<String> {
     let mut sections = Vec::new();
 
     // Asana タスク
@@ -802,14 +813,22 @@ async fn handle_dm_briefing(state: &Arc<AppState>, user_text: &str) -> Result<St
             summary.total, summary.incomplete, summary.my_tasks, summary.overdue
         ));
         let my_tasks: Vec<_> = cache.tasks.iter()
-            .filter(|t| !t.completed && t.assignee.contains("田澤"))
+            .filter(|t| {
+                if t.completed { return false; }
+                if let Some(name) = asana_name {
+                    t.assignee.contains(name)
+                } else {
+                    true
+                }
+            })
             .collect();
         if !my_tasks.is_empty() {
             let lines: Vec<String> = my_tasks.iter().map(|t| {
                 let due = t.due_on.as_deref().unwrap_or("期限なし");
                 format!("- {} (期限: {})", t.name, due)
             }).collect();
-            sections.push(format!("自分の担当タスク:\n{}", lines.join("\n")));
+            let label = asana_name.map(|n| format!("{}の担当タスク", n)).unwrap_or_else(|| "全タスク".to_string());
+            sections.push(format!("{}:\n{}", label, lines.join("\n")));
         }
     }
 

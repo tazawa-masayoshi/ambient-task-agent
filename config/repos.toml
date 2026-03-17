@@ -10,6 +10,12 @@ tasks_cache_file = "/home/ec2-user/.config/wez-sidebar/tasks-cache.json"
 # claude_max_concurrent = 2
 # claude_allowed_env = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL"]
 
+# Slack user ID → Asana 表示名マッピング（DM タスクフィルタ用）
+# 未登録ユーザーの DM では全タスクが表示される
+[defaults.slack_user_map]
+U0700J8MN3W = "田澤雅義"
+W920CSQ04 = "佐々木直人"
+
 # [defaults.module_policy.executor]
 # exec_mode = "normal"
 # timeout_secs = 900

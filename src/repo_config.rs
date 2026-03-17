@@ -65,6 +65,9 @@ pub struct Defaults {
     pub claude_allowed_env: Vec<String>,
     #[serde(default)]
     pub module_policy: HashMap<String, ModulePolicy>,
+    /// Slack user ID → Asana 表示名のマッピング（DM タスクフィルタ用）
+    #[serde(default)]
+    pub slack_user_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
