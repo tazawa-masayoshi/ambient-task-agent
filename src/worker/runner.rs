@@ -29,7 +29,7 @@ pub struct Worker {
     notify: Arc<Notify>,
     runner_ctx: crate::execution::RunnerContext,
     /// spawn 中のタスク ID セット（二重実行防止）
-    running_tasks: std::sync::Mutex<HashSet<i64>>,
+    running_tasks: Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
 impl Worker {
@@ -57,7 +57,7 @@ impl Worker {
             default_slack_channel,
             notify,
             runner_ctx,
-            running_tasks: std::sync::Mutex::new(HashSet::new()),
+            running_tasks: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -1129,7 +1129,7 @@ impl Worker {
         tokio::spawn(async move {
             // Drop ガード: panic 時も running_tasks から task_id を確実に除去
             let _guard = RunningTaskGuard {
-                running_tasks: Arc::clone(&w),
+                set: Arc::clone(&w.running_tasks),
                 task_id,
             };
             match f(Arc::clone(&w)).await {
@@ -2144,13 +2144,13 @@ async fn update_quality_baseline(worktree_path: &Path) {
 /// spawn_task の Drop ガード。panic 時も running_tasks から task_id を確実に除去する。
 /// Mutex が poisoned でも除去を試みる（into_inner で回復）。
 struct RunningTaskGuard {
-    running_tasks: Arc<Worker>,
+    set: Arc<std::sync::Mutex<HashSet<i64>>>,
     task_id: i64,
 }
 
 impl Drop for RunningTaskGuard {
     fn drop(&mut self) {
-        match self.running_tasks.running_tasks.lock() {
+        match self.set.lock() {
             Ok(mut set) => { set.remove(&self.task_id); }
             Err(poisoned) => { poisoned.into_inner().remove(&self.task_id); }
         }
