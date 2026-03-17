@@ -218,20 +218,25 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
     let (timeline_text, allocated_minutes, unallocated_count, allocated_tasks) =
         build_timeboxing_timeline(&events, &free_slots, &mut timebox_tasks);
 
-    // カレンダーにタスクブロックを登録
+    // カレンダーにタスクブロックを登録（create-then-delete で中断安全性を確保）
     if let Some(gcal) = ctx.google_calendar.as_mut() {
         let today_date = Local::now().date_naive();
         let tz = Local::now().timezone();
-
-        // 前回の配置を削除（プレフィックスで識別）
         const TASK_EVENT_PREFIX: &str = "📋 ";
-        match gcal.delete_events_by_summary_prefix(TASK_EVENT_PREFIX).await {
-            Ok(n) if n > 0 => tracing::info!("Deleted {} old task events from calendar", n),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("Failed to cleanup old task events: {}", e),
-        }
 
-        // 配置済みタスクをカレンダーに登録
+        // ① 旧イベントの ID を事前収集（削除は後で行う）
+        let old_event_ids: Vec<String> = match gcal.fetch_today_events().await {
+            Ok(evts) => evts.iter()
+                .filter(|e| e.summary.as_deref().unwrap_or("").starts_with(TASK_EVENT_PREFIX))
+                .map(|e| e.id.clone())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Failed to fetch existing task events: {}", e);
+                Vec::new()
+            }
+        };
+
+        // ② 新しいイベントを作成
         let mut created = 0u32;
         for task in &allocated_tasks {
             let Some(start_dt) = today_date
@@ -265,6 +270,21 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
 
         if created > 0 {
             tracing::info!("Created {} task events on calendar", created);
+        }
+
+        // ③ 新規作成が1件以上成功した場合のみ旧イベントを削除
+        // 失敗しても新しいイベントは残るため、カレンダーが空になることはない
+        if created > 0 && !old_event_ids.is_empty() {
+            let mut deleted = 0usize;
+            for eid in &old_event_ids {
+                match gcal.delete_event(eid).await {
+                    Ok(()) => deleted += 1,
+                    Err(e) => tracing::warn!("Failed to delete old task event {}: {}", eid, e),
+                }
+            }
+            if deleted > 0 {
+                tracing::info!("Deleted {} old task events from calendar", deleted);
+            }
         }
     }
 
@@ -1509,7 +1529,7 @@ async fn run_self_improvement(
 
     let slack_channel = &ctx.db.get_default_slack_channel().unwrap_or_default();
     let channel = if slack_channel.is_empty() {
-        // フォールバック: repos_base_dir から設定を読む
+        tracing::warn!("self_improvement: no default Slack channel configured; {} task(s) registered but notification skipped", proposals.len());
         return Ok(());
     } else {
         slack_channel.as_str()

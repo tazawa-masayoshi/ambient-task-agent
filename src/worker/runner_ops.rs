@@ -21,11 +21,14 @@ impl Worker {
     pub(crate) fn process_ops_queue(self: &Arc<Self>) -> bool {
         const MAX_OPS_RETRIES: i64 = 5;
 
-        // 長時間 processing のままのアイテムをリカバリ
-        match self.db.recover_stale_ops() {
-            Ok(n) if n > 0 => tracing::warn!("Recovered {} stale ops_queue items", n),
-            Err(e) => tracing::warn!("Failed to recover stale ops: {}", e),
-            _ => {}
+        // 長時間 processing のままのアイテムをリカバリ（running_ops 内は除外）
+        {
+            let active = self.running_ops.lock().unwrap();
+            match self.db.recover_stale_ops(&active) {
+                Ok(n) if n > 0 => tracing::warn!("Recovered {} stale ops_queue items", n),
+                Err(e) => tracing::warn!("Failed to recover stale ops: {}", e),
+                _ => {}
+            }
         }
 
         match self.db.dequeue_ops_item() {
@@ -34,14 +37,19 @@ impl Worker {
                     "Processing ops queue item {} (status={}, channel={}, retry={})",
                     item.id, item.status, item.channel, item.retry_count
                 );
-                if self.db.mark_ops_processing(item.id).is_ok() {
-                    let w = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = w.run_ops_item(item, MAX_OPS_RETRIES).await {
-                            tracing::error!("ops queue item failed: {}", e);
-                        }
-                    });
-                }
+                // running_ops に登録（Drop ガードで自動除去）
+                self.running_ops.lock().unwrap().insert(item.id);
+                let w = Arc::clone(self);
+                let ops_id = item.id;
+                tokio::spawn(async move {
+                    let _guard = RunningOpsGuard {
+                        set: Arc::clone(&w.running_ops),
+                        ops_id,
+                    };
+                    if let Err(e) = w.run_ops_item(item, MAX_OPS_RETRIES).await {
+                        tracing::error!("ops queue item failed: {}", e);
+                    }
+                });
                 false
             }
             Ok(None) => false,
@@ -575,5 +583,20 @@ impl Worker {
         );
 
         Ok(Some(ops_entries[num - 1].0))
+    }
+}
+
+/// process_ops_queue の Drop ガード。panic 時も running_ops から ops_id を確実に除去する。
+struct RunningOpsGuard {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    ops_id: i64,
+}
+
+impl Drop for RunningOpsGuard {
+    fn drop(&mut self) {
+        match self.set.lock() {
+            Ok(mut set) => { set.remove(&self.ops_id); }
+            Err(poisoned) => { poisoned.into_inner().remove(&self.ops_id); }
+        }
     }
 }

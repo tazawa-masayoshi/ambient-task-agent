@@ -139,26 +139,7 @@ impl GoogleCalendarClient {
         Ok(event.id)
     }
 
-    /// 指定プレフィックスで始まるイベントを今日分だけ削除
-    pub async fn delete_events_by_summary_prefix(&mut self, prefix: &str) -> Result<usize> {
-        let events = self.fetch_today_events().await?;
-        let mut deleted = 0;
-
-        for event in &events {
-            let summary = event.summary.as_deref().unwrap_or("");
-            if summary.starts_with(prefix) {
-                if let Err(e) = self.delete_event(&event.id).await {
-                    tracing::warn!("Failed to delete calendar event {}: {}", event.id, e);
-                } else {
-                    deleted += 1;
-                }
-            }
-        }
-
-        Ok(deleted)
-    }
-
-    async fn delete_event(&mut self, event_id: &str) -> Result<()> {
+    pub async fn delete_event(&mut self, event_id: &str) -> Result<()> {
         let params = serde_json::json!({
             "calendarId": self.calendar_id,
             "eventId": event_id,

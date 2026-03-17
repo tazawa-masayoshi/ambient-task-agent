@@ -1016,28 +1016,20 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    /// 10分以上 processing のまま放置されたアイテムを ready に戻す
-    pub fn recover_stale_ops(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let count = conn.execute(
-            "UPDATE ops_queue SET status = 'ready', \
-             error_message = 'recovered from stale processing', \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE status = 'processing' \
-             AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')",
-            [],
-        )?;
-        Ok(count as u64)
-    }
-
-    /// 処理対象のキューアイテムを1件取得（pending/ready、同一 repo_key の processing がなければ）
+    /// 処理対象のキューアイテムを1件取得しアトミックに processing に遷移。
+    /// pending/ready かつ同一 repo_key の processing がなければ取得する。
     pub fn dequeue_ops_item(&self) -> Result<Option<OpsQueueItem>> {
         let conn = self.conn.lock().unwrap();
+        // UPDATE ... RETURNING で SELECT + UPDATE をアトミックに実行
         let result = conn.query_row(
-            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count \
-             FROM ops_queue WHERE status IN ('pending', 'ready') \
-             AND repo_key NOT IN (SELECT DISTINCT repo_key FROM ops_queue WHERE status = 'processing') \
-             ORDER BY created_at ASC LIMIT 1",
+            "UPDATE ops_queue SET status = 'processing', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ( \
+               SELECT id FROM ops_queue WHERE status IN ('pending', 'ready') \
+               AND repo_key NOT IN (SELECT DISTINCT repo_key FROM ops_queue WHERE status = 'processing') \
+               ORDER BY created_at ASC LIMIT 1 \
+             ) \
+             RETURNING id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count",
             [],
             |row| {
                 Ok(OpsQueueItem {
@@ -1060,14 +1052,36 @@ impl Db {
         }
     }
 
-    /// キューアイテムのステータスを processing に更新
-    pub fn mark_ops_processing(&self, id: i64) -> Result<()> {
+    /// インメモリで追跡中の ops アイテムを除外して stale recovery を行う。
+    /// `active_ids` は現在 spawn 中のアイテム ID セット。
+    pub fn recover_stale_ops(&self, active_ids: &std::collections::HashSet<i64>) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE ops_queue SET status = 'processing', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-            params![id],
+        // まず stale 候補を取得
+        let mut stmt = conn.prepare(
+            "SELECT id FROM ops_queue WHERE status = 'processing' \
+             AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')"
         )?;
-        Ok(())
+        let stale_ids: Vec<i64> = stmt.query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .filter(|id| !active_ids.contains(id))
+            .collect();
+        drop(stmt);
+
+        if stale_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders: Vec<String> = stale_ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "UPDATE ops_queue SET status = 'ready', \
+             error_message = 'recovered from stale processing', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id IN ({})",
+            placeholders.join(",")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = stale_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let count = conn.execute(&sql, params.as_slice())?;
+        Ok(count as u64)
     }
 
     /// キューアイテムを完了にする

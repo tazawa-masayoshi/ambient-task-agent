@@ -31,6 +31,8 @@ pub struct Worker {
     pub(crate) runner_ctx: crate::execution::RunnerContext,
     /// spawn 中のタスク ID セット（二重実行防止）
     pub(crate) running_tasks: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// spawn 中の ops キューアイテム ID セット（recover_stale_ops との競合防止）
+    pub(crate) running_ops: Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
 impl Worker {
@@ -59,6 +61,7 @@ impl Worker {
             notify,
             runner_ctx,
             running_tasks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            running_ops: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
