@@ -65,14 +65,11 @@ pub async fn classify_new_task_llm(
         return classify_new_task_heuristic(task, repos_config);
     }
 
-    let examples = if history.is_empty() {
-        String::new()
-    } else {
-        let lines: Vec<String> = history.iter().map(|r| {
-            format!("- 「{}」({}文字) → {} → 結果: {}", r.task_name, r.description.len(), r.classification, r.outcome)
-        }).collect();
-        format!("## 過去の分類履歴\n{}\n\n", lines.join("\n"))
-    };
+    // min_fewshot_examples ガード通過後なので history は必ず非空
+    let lines: Vec<String> = history.iter().map(|r| {
+        format!("- 「{}」({}文字) → {} → 結果: {}", r.task_name, r.description.len(), r.classification, r.outcome)
+    }).collect();
+    let examples = format!("## 過去の分類履歴\n{}\n\n", lines.join("\n"));
 
     let desc = task.description.as_deref().unwrap_or("(なし)");
     let prompt = format!(

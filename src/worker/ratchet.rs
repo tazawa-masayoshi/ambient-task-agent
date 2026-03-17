@@ -15,31 +15,45 @@ struct QualityBaseline {
 }
 
 /// ベースラインファイルのパス（worktree の親リポジトリの .agent/ に保存）
+///
+/// `.agent/` ディレクトリが見つからない場合（setup_repo_dirs 未実行時）は
+/// worktree 直下に `.agent/` を作成してそこに保存する。
 fn baseline_path(worktree_path: &Path) -> PathBuf {
     // worktree_path は .claude/worktrees/xxx/ の下にあるので、
-    // main repo の .agent/ に保存する
-    worktree_path
+    // ancestors を辿って main repo の .agent/ を見つける
+    let base = worktree_path
         .ancestors()
         .find(|p| p.join(".agent").is_dir())
-        .unwrap_or(worktree_path)
-        .join(".agent")
-        .join("quality-baseline.json")
+        .unwrap_or(worktree_path);
+    let agent_dir = base.join(".agent");
+    // .agent/ が存在しない場合は作成（フォールバック時）
+    std::fs::create_dir_all(&agent_dir).ok();
+    agent_dir.join("quality-baseline.json")
 }
 
-/// worktree で cargo test + clippy を実行してメトリクスを取得
+/// worktree で cargo test + clippy を並列実行してメトリクスを取得
 async fn capture_quality_metrics(worktree_path: &Path) -> Result<(u32, u32)> {
-    // cargo test
-    let test_output = tokio::process::Command::new("cargo")
+    let test_fut = tokio::process::Command::new("cargo")
         .arg("test")
         .arg("--")
         .arg("--format=terse")
         .current_dir(worktree_path)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("cargo test failed to start: {}", e))?;
+        .output();
 
-    let test_stdout = String::from_utf8_lossy(&test_output.stdout);
+    let clippy_fut = tokio::process::Command::new("cargo")
+        .args(["clippy", "--message-format=short"])
+        .current_dir(worktree_path)
+        .output();
+
+    let (test_output, clippy_output) = tokio::join!(test_fut, clippy_fut);
+
+    let test_output = test_output
+        .map_err(|e| anyhow::anyhow!("cargo test failed to start: {}", e))?;
+    let clippy_output = clippy_output
+        .map_err(|e| anyhow::anyhow!("cargo clippy failed to start: {}", e))?;
+
     // "test result: ok. 36 passed; 0 failed" → "passed" の直前の数字を取得
+    let test_stdout = String::from_utf8_lossy(&test_output.stdout);
     let test_count = test_stdout.lines()
         .find(|l| l.contains("test result:"))
         .and_then(|l| {
@@ -49,14 +63,6 @@ async fn capture_quality_metrics(worktree_path: &Path) -> Result<(u32, u32)> {
                 .and_then(|w| w[0].parse::<u32>().ok())
         })
         .unwrap_or(0);
-
-    // cargo clippy
-    let clippy_output = tokio::process::Command::new("cargo")
-        .args(["clippy", "--message-format=short"])
-        .current_dir(worktree_path)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("cargo clippy failed to start: {}", e))?;
 
     let clippy_stderr = String::from_utf8_lossy(&clippy_output.stderr);
     let clippy_warnings = clippy_stderr.lines()
