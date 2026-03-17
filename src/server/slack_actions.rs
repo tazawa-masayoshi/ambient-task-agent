@@ -267,7 +267,7 @@ async fn process_action(
                             reply_ts,
                             &format!(
                                 ":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
-                                 実行中のプロセスは次のターン終了時に停止します",
+                                 _※ 進行中のプロセスは完走しますが、結果は反映されません_",
                                 prev_status
                             ),
                         )
