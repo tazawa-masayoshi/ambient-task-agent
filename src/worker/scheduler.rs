@@ -214,7 +214,7 @@ async fn run_morning_briefing(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
     let free_slots = compute_free_slots(&events, work_start, work_end);
     let total_free_minutes: u32 = free_slots.iter().map(|s| s.duration_minutes).sum();
     let mtg_minutes = 540u32.saturating_sub(total_free_minutes);
-    let mut timebox_tasks = build_timebox_tasks(&cache, &active_tasks);
+    let mut timebox_tasks = build_timebox_tasks(&cache, &active_tasks, Some(&ctx.asana_user_name));
     let (timeline_text, allocated_minutes, unallocated_count, allocated_tasks) =
         build_timeboxing_timeline(&events, &free_slots, &mut timebox_tasks);
 
@@ -724,9 +724,12 @@ impl TimelineEntry {
 }
 
 /// Asana タスクと DB タスクを統合し、優先度順にソートした配置用リストを作成
+///
+/// `assignee_filter`: Some("田澤雅義") → その担当者のタスクのみ配置、None → 全タスク
 fn build_timebox_tasks(
     cache: &TasksCache,
     db_tasks: &[crate::db::CodingTask],
+    assignee_filter: Option<&str>,
 ) -> Vec<TimeBoxTask> {
     let today = Local::now().format("%Y-%m-%d").to_string();
 
@@ -739,7 +742,14 @@ fn build_timebox_tasks(
     let mut tasks: Vec<TimeBoxTask> = cache
         .tasks
         .iter()
-        .filter(|t| !t.completed)
+        .filter(|t| {
+            if t.completed { return false; }
+            if let Some(name) = assignee_filter {
+                t.assignee.contains(name)
+            } else {
+                true
+            }
+        })
         .map(|t| {
             let is_overdue = t
                 .due_on
