@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +28,8 @@ pub struct Worker {
     default_slack_channel: String,
     notify: Arc<Notify>,
     runner_ctx: crate::execution::RunnerContext,
+    /// spawn 中のタスク ID セット（二重実行防止）
+    running_tasks: std::sync::Mutex<HashSet<i64>>,
 }
 
 impl Worker {
@@ -54,6 +57,7 @@ impl Worker {
             default_slack_channel,
             notify,
             runner_ctx,
+            running_tasks: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -866,9 +870,6 @@ impl Worker {
         )
         .await?;
 
-        // MEMORY 永続化
-        self.persist_learnings(&result.output, &task, None);
-
         // ブロッカー検知: executing → conversing に遷移
         if let Some(ref blocker) = result.blocker {
             tracing::info!("Task {} blocker detected, reverting to conversing", task.id);
@@ -880,6 +881,8 @@ impl Worker {
         }
 
         if result.success {
+            // MEMORY 永続化（成功時のみ — 失敗時は文脈欠落による汚染リスクがあるため除外）
+            self.persist_learnings(&result.output, &task, None);
             self.db.update_status(task.id, "done")?;
             context::append_completed_task(base_dir, &task, None, Some(&result.output));
 
@@ -1047,8 +1050,7 @@ impl Worker {
                 self.finalize_worktree(task, repo_entry, ws).await?;
             }
             Ok(exec_result) => {
-                // 失敗時も学びがあれば保存
-                self.persist_learnings(&exec_result.output, task, Some(repo_entry));
+                // 失敗時は persist_learnings を呼ばない（文脈欠落した MEMORY: による汚染防止）
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
@@ -1107,22 +1109,31 @@ impl Worker {
         }
     }
 
-    /// タスク処理を spawn し、panic/エラー時に DB を error 状態に復帰させる
+    /// タスク処理を spawn し、panic/エラー時に DB を error 状態に復帰させる。
+    /// 同一 task_id が既に実行中なら spawn しない（二重実行防止）。
     fn spawn_task<F, Fut>(self: &Arc<Self>, task_id: i64, f: F)
     where
         F: FnOnce(Arc<Worker>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
+        {
+            let mut running = self.running_tasks.lock().unwrap();
+            if !running.insert(task_id) {
+                tracing::debug!("Task {} already running, skipping spawn", task_id);
+                return;
+            }
+        }
         let w = Arc::clone(self);
         let db = self.db.clone();
         tokio::spawn(async move {
-            match f(w).await {
+            match f(Arc::clone(&w)).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::error!("Task {} failed: {}", task_id, e);
                     db.set_error(task_id, &format!("Task failed: {}", e)).ok();
                 }
             }
+            w.running_tasks.lock().unwrap().remove(&task_id);
         });
     }
 
@@ -1842,8 +1853,13 @@ fn classify_new_task_heuristic(task: &CodingTask, repos_config: &ReposConfig) ->
     }
 }
 
+/// LLM 分類に必要な最小 few-shot 履歴件数。
+/// これ未満の場合、LLM の分類精度が信頼できないため heuristics のみを使用する。
+const MIN_FEWSHOT_EXAMPLES: usize = 5;
+
 /// new タスクを LLM で分類（past examples を few-shot で渡す）
-/// LLM 呼び出しに失敗した場合は heuristics にフォールバック
+/// few-shot 履歴が MIN_FEWSHOT_EXAMPLES 未満の場合は heuristics にフォールバック。
+/// LLM 呼び出しに失敗した場合も heuristics にフォールバック。
 async fn classify_new_task_llm(
     task: &CodingTask,
     repos_config: &ReposConfig,
@@ -1853,6 +1869,16 @@ async fn classify_new_task_llm(
 ) -> TaskClassification {
     // 過去の分類履歴を取得（few-shot 用）
     let history = db.get_recent_classification_history(10).unwrap_or_default();
+
+    // 履歴が不十分な場合は LLM を呼ばず heuristics で判定（誤分類リスク回避）
+    if history.len() < MIN_FEWSHOT_EXAMPLES {
+        tracing::info!(
+            "LLM classify skipped: only {} examples (need {}), using heuristics",
+            history.len(), MIN_FEWSHOT_EXAMPLES
+        );
+        return classify_new_task_heuristic(task, repos_config);
+    }
+
     let examples = if history.is_empty() {
         String::new()
     } else {
