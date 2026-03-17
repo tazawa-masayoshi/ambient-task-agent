@@ -1,34 +1,63 @@
 # ambient-task-agent
 
-Rust 製の自律タスクエージェント。Asana/Slack からタスクを受け取り、Claude Code (`claude -p`) で自動実行する。
+**Slack でコーディング。** Slack に書くだけでコードが書かれ、PR が出る。
+
+Rust 製の自律タスクエージェント。Asana/Slack からタスクを受け取り、[AI-DLC](https://zenn.dev/yumemi_inc/articles/ai-and-development-workflow) を参考にした会話フローで不明点を解消し、Claude Code (`claude -p`) で自動実行する。
 
 ## 世界観
 
 ```
 入口が違うだけで、中の処理は同じ
 
-  Asana タスク ─┐
-                ├→ classify → 明確 → そのまま実行 → PR
-  Slack ops   ─┘            → 曖昧 → Slack ラリー → 明確になったら実行
-                             → 詰まった → manual（人間が terminal で対応）
+  Slack メッセージ ─┐
+                    ├→ classify → 明確 → そのまま実行 → PR
+  Asana タスク    ─┘            → 曖昧 → Slack ラリーで要件確定 → 実行
+                                → 詰まった → manual（人間が terminal で対応）
 ```
 
 ### 3つの入口
 
 | 入口 | テーブル | 処理 |
 |------|---------|------|
-| Asana タスク | `coding_tasks` | `new → classify → executing/conversing → PR → CI` |
 | Slack ops（質問・依頼） | `ops_queue` | 自動回答 or Inception で要件確定 → タスク昇格 |
 | Slack ops（定型作業） | `ops_queue` | スキル実行 → Slack 返信で完了 |
+| Asana タスク | `coding_tasks` | `new → classify → executing/conversing → PR → CI` |
+
+コーディングだけでなく、PM スキル（朝会ブリーフィング、タスク優先度整理、停滞検知、Google Calendar 連携リマインド等）も備える。
 
 ### ステータスモデル
 
 ```
 new → executing（明確）/ conversing（曖昧）
-conversing → executing / manual / done
+conversing → executing / manual / done / sleeping（5営業日タイムアウト）
 manual → executing / done
 executing → done / ci_pending / conversing（ブロッカー検知）
 ```
+
+- **conversing**: 曖昧なタスクを Slack スレッドで要件確定。LLM が few-shot 分類履歴を参照して判定
+- **manual**: ブロッカー検知時に人間が terminal で直接対応
+- **sleeping**: conversing で5営業日返信なし → 自動休止
+
+## 設計思想: Heartbeat + DB ポーリング
+
+他の claw 系エージェント（Devin, SWE-agent, Symphony 等）との最大の違いは、**LLM を常時回すのではなく、Rust プログラムが heartbeat で自前の DB をポーリングし、処理対象があるときだけ `claude -p` を起動する**点にある。
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Worker Heartbeat (15s)                                  │
+│                                                          │
+│  1. SELECT * FROM coding_tasks WHERE status IN (...)     │
+│  2. SELECT * FROM ops_queue WHERE status = 'pending'     │
+│  3. SELECT * FROM scheduled_jobs WHERE next_run_at < NOW │
+│                                                          │
+│  → 対象なし: sleep 15s（LLM コストゼロ）                    │
+│  → 対象あり: classify → tokio::spawn で並列実行             │
+└──────────────────────────────────────────────────────────┘
+```
+
+- **コスト効率**: 待機中は純粋な DB クエリのみ。LLM は実際のタスク処理時だけ呼ぶ
+- **Rust 判定**: ステータス遷移・タイムアウト・優先度ソートはすべてプログラムで決定
+- **LLM 判定**: タスク分類（execute/converse）とタスク実行のみ LLM に委譲
 
 ## アーキテクチャ
 
@@ -43,7 +72,11 @@ executing → done / ci_pending / conversing（ブロッカー検知）
 │   Socket    │     │  conversing  │     │   PR + CI   │
 │   Mode      │     │  executing   │     └─────────────┘
 └─────────────┘     │  manual      │
-                    └──────────────┘
+                    │              │     ┌─────────────┐
+┌─────────────┐     │  scheduler ──┼────▶│  Google     │
+│   Google    │◀────│  (cron)      │     │  Calendar   │
+│   Calendar  │     └──────────────┘     └─────────────┘
+└─────────────┘
 ```
 
 ### 主要コンポーネント
@@ -54,6 +87,9 @@ executing → done / ci_pending / conversing（ブロッカー検知）
 | Executor | `src/worker/executor.rs` | `claude -p --append-system-prompt` でタスク実行 |
 | Ops | `src/worker/ops.rs` | Slack ops メッセージの処理（Execute/Plan/Inception） |
 | Scheduler | `src/worker/scheduler.rs` | cron ジョブ（朝会/夕会/リマインド/自己改善） |
+| Context | `src/worker/context.rs` | タスク完了記録、メモリ蓄積、per-repo context.md |
+| Priority | `src/worker/priority.rs` | タスク優先度スコア計算・ソート |
+| Workspace | `src/worker/workspace.rs` | worktree 作成・cleanup・パス解決 |
 | Slack Events | `src/server/slack_events.rs` | Slack イベント受信、コマンド処理 |
 | Slack Actions | `src/server/slack_actions.rs` | Block Kit ボタンハンドラ |
 | DB | `src/db.rs` | SQLite（coding_tasks + ops_queue + ops_contexts + skill_candidates） |
@@ -71,6 +107,36 @@ self_improvement ジョブ（毎週月曜 10:00）
   ├─ エラーパターン分析 → 改善タスク提案
   ├─ 成熟スキル候補通知（occurrences >= 2）
   └─ git-ratchet で品質保証（テスト数↓ or warnings↑ → PR 拒否）
+```
+
+## スケジュール
+
+`config/repos.toml` の `[[schedule]]` で定義。すべて営業日（土日除外）ベース。
+
+| ジョブ | スケジュール | 内容 |
+|--------|------------|------|
+| `morning_briefing` | 平日 9:00 | 当日タスク一覧 + タイムボクシング提案 |
+| `evening_summary` | 平日 18:00 | 進捗サマリー |
+| `meeting_reminder` | 平日 8-20時/5分 | Google Calendar 連携リマインド |
+| `stagnation_check` | 平日 14:00 | 停滞タスク検知 |
+| `weekly_pm_review` | 毎週金曜 17:00 | PM レビュー |
+| `self_improvement` | 毎週月曜 10:00 | 分類精度・エラー分析 → 改善 PR 提案 |
+
+## CLI コマンド
+
+```
+ambient-task-agent <command>
+
+  sync [--quiet]           Asana → JSON キャッシュ同期（--quiet: cron用、変更時のみ出力）
+  show [--mine] [--json]   キャッシュ済みタスク表示
+  notify -m "msg"          Slack 送信
+  done -t "task"           完了通知
+  status                   キャッシュ状態表示
+  hook <event>             Claude Code hook イベント処理
+  start [query] [--gid]    作業タスクを設定
+  current                  現在の作業タスクを表示
+  serve [--port] [--config-dir]  サーバー起動（heartbeat + Socket Mode）
+  task <id> [--start] [--done]   タスク詳細・ステータス遷移
 ```
 
 ## 設計判断
@@ -91,6 +157,8 @@ self_improvement ジョブ（毎週月曜 10:00）
 
 | プロジェクト | 採用したパターン |
 |-------------|----------------|
+| [AI-DLC](https://zenn.dev/yumemi_inc/articles/ai-and-development-workflow) | 会話フローで不明点を解消してから実行（Inception モード） |
+| [Symphony](https://arxiv.org/abs/2506.01579) | DB ポーリング + プログラム判定 → 必要時のみ LLM 起動 |
 | [autoresearch](https://github.com/karpathy/autoresearch) | git-ratchet、NEVER STOP directive |
 | [multi-agent-shogun](https://github.com/yohey-w/multi-agent-shogun) | Bottom-up Skill Discovery |
 | [lossless-claw](https://github.com/Martian-Engineering/lossless-claw) | agent self-retrieval（将来検討） |
@@ -109,10 +177,10 @@ SLACK_SIGNING_SECRET=...
 ASANA_PAT=...
 ASANA_PROJECT_ID=...
 
-# 起動
-./target/release/ambient-task-agent
+# 起動（サーバーモード）
+./target/release/ambient-task-agent serve
 ```
 
 ## 設定
 
-`config/repos.toml` でリポジトリとスケジュールを設定。詳細は同ファイルのコメント参照。
+`config/repos.toml` でリポジトリ、スケジュール、Slack ユーザーマッピングを設定。詳細は同ファイルのコメント参照。
