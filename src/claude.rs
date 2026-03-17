@@ -124,12 +124,122 @@ pub trait AgentBackend: Send + Sync {
 pub struct ClaudeCliBackend;
 
 impl ClaudeCliBackend {
+    /// verbose JSON配列から assistant テキストを抽出する（#36632 回避策）
+    ///
+    /// --verbose 時は JSON 配列が返る。result フィールドが空の場合、
+    /// assistant メッセージの content から最後のテキストを取得する。
+    fn extract_assistant_text_from_verbose(items: &[serde_json::Value]) -> Option<String> {
+        let mut last_text: Option<String> = None;
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                continue;
+            }
+            if let Some(content) = item
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                last_text = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        last_text
+    }
+
+    /// verbose JSON配列から result オブジェクトを抽出して ClaudeJsonResponse としてパース
+    fn find_result_in_verbose(items: &[serde_json::Value]) -> Option<ClaudeJsonResponse> {
+        items
+            .iter()
+            .rev()
+            .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("result"))
+            .and_then(|item| serde_json::from_value::<ClaudeJsonResponse>(item.clone()).ok())
+    }
+
     /// JSON レスポンスをパースして AgentOutput を構築する
     fn parse_json_response(
         raw: &str,
         duration: std::time::Duration,
         max_output_bytes: Option<usize>,
     ) -> AgentOutput {
+        // --verbose 時は JSON 配列が返る
+        if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+            let parsed = Self::find_result_in_verbose(&items);
+            let is_error = parsed.as_ref().map_or(false, |p| p.is_error);
+
+            // result フィールドを取得、空なら assistant テキストからフォールバック
+            let mut stdout = parsed
+                .as_ref()
+                .and_then(|p| {
+                    if let Some(ref so) = p.structured_output {
+                        return Some(serde_json::to_string(so).unwrap_or_default());
+                    }
+                    p.result.clone().filter(|r| !r.is_empty())
+                })
+                .or_else(|| Self::extract_assistant_text_from_verbose(&items))
+                .unwrap_or_default();
+
+            let usage = parsed.as_ref().and_then(|p| {
+                p.usage.as_ref().map(|u| TokenUsage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
+                })
+            });
+            let cost_usd = parsed.as_ref().and_then(|p| p.total_cost_usd);
+            let session_id = parsed.as_ref().and_then(|p| p.session_id.clone());
+
+            if let Some(sid) = &session_id {
+                let num_turns = parsed.as_ref().and_then(|p| p.num_turns);
+                tracing::debug!("Claude CLI session_id={}, turns={:?}", sid, num_turns);
+            }
+            if let Some(ref u) = usage {
+                tracing::info!(
+                    "Claude CLI usage: in={} out={} cache_create={} cache_read={} total={}",
+                    u.input_tokens, u.output_tokens,
+                    u.cache_creation_input_tokens, u.cache_read_input_tokens,
+                    u.total(),
+                );
+            }
+            if let Some(cost) = cost_usd {
+                tracing::info!("Claude CLI cost: ${:.6}", cost);
+            }
+
+            let truncated = if let Some(max_bytes) = max_output_bytes {
+                if stdout.len() > max_bytes {
+                    let total = stdout.len();
+                    let safe_end = truncate_str(&stdout, max_bytes).len();
+                    stdout.truncate(safe_end);
+                    stdout.push_str(&format!("\n[truncated, {} total bytes]", total));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            return AgentOutput {
+                success: !is_error,
+                stdout,
+                stderr: String::new(),
+                duration,
+                truncated,
+                usage,
+                cost_usd,
+                session_id,
+            };
+        }
+
+        // 非 verbose（単一 JSON オブジェクト）のフォールバック
         match serde_json::from_str::<ClaudeJsonResponse>(raw) {
             Ok(parsed) => {
                 let is_error = parsed.is_error;
@@ -211,9 +321,11 @@ impl AgentBackend for ClaudeCliBackend {
         let turns_str = request.max_turns.to_string();
 
         // OpenFang/PicoClaw 参考: -p + JSON出力 + 権限スキップ + UI無効化
+        // --verbose: Claude Code #36632 回避策（result が空になるバグ対策）
         let mut args = vec![
             "-p",
             "--output-format", "json",
+            "--verbose",
             "--dangerously-skip-permissions",
             "--no-chrome",
         ];

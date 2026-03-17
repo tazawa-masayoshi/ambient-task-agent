@@ -8,6 +8,10 @@
 - `unsafe impl Send/Sync` が本当に必要かコメントが不正確なケースがある (trait bound で自動導出されるケース)
 - 複数フロー分岐（early return など）でサイドエフェクト（ファイル書き出し等）の呼び出しが片方だけ抜けやすい → `write_task_file` で確認済み
 - LLM 出力パーサーの `contains()` 部分一致は単語境界未チェックになりがち → `split_whitespace().any(|w| w == keyword)` が安全
+- `impl` 分散リファクタリング後、ユーティリティ関数（`truncate_for_slack`, `count_business_days` 等）が元のファイル（runner.rs）に残留して分割先から `super::runner::{}` 経由でインポートされる → 凝集度低下。utils モジュールへの移動を推奨
+- `impl` 分散後、同一ロジックの Drop ガード（`RunningTaskGuard` / `RunningOpsGuard`）が2ファイルに生まれやすい → 汎用 `RunningGuard` struct にまとめる
+- doc comment がリファクタリング中に前の struct/fn からずれやすい（`runner.rs:893` の RunningTaskGuard に誤った manual ボタン説明が残る例）→ `cargo doc` でチェック推奨
+- `i32 as u32` の型キャスト: `CodingTask.retry_count(i32)` を `repo_entry.ci_max_retry(u32)` と比較するとき `(new_count as u32) > max_retry` は new_count 負値で爆発 → `increment_retry_count` の戻り型統一が必要
 
 ### プロジェクト固有の OK パターン
 - `ClaudeRunner` のビルダーチェーン末尾 `.with_context(runner_ctx).run()` は各 worker モジュールで統一されており正常
