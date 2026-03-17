@@ -12,6 +12,7 @@ use crate::google::calendar::GoogleCalendarClient;
 use crate::repo_config::ReposConfig;
 use crate::slack::client::SlackClient;
 
+use super::classify::{TaskClassification, classify_new_task_heuristic};
 use super::{context, executor, priority, scheduler, task_file, workflow, workspace};
 
 /// ハートビート間隔の下限
@@ -1034,7 +1035,7 @@ impl Worker {
                 self.persist_learnings(&exec_result.output, task, Some(repo_entry));
 
                 // git-ratchet: 品質メトリクスが悪化していないか検証
-                if let Err(ratchet_err) = quality_ratchet_check(&ws.worktree_path).await {
+                if let Err(ratchet_err) = super::ratchet::quality_ratchet_check(&ws.worktree_path).await {
                     tracing::warn!("Task {} ratchet check failed: {}", task.id, ratchet_err);
                     self.db.set_error(task.id, &format!("Ratchet check failed: {}", ratchet_err))?;
                     let msg = format!(
@@ -1212,7 +1213,7 @@ impl Worker {
                 self.db.update_status(task.id, "ci_pending")?;
                 self.db.set_classification_outcome(task.id, "correct").ok();
                 // ラチェットベースラインを更新（PR 作成成功 = 品質チェック通過済み）
-                update_quality_baseline(&ws.worktree_path).await;
+                super::ratchet::update_quality_baseline(&ws.worktree_path).await;
                 let msg = format!(":gear: PR を作成しました — CI 結果を監視中...\n{}", pr_url);
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
@@ -1262,7 +1263,7 @@ impl Worker {
     /// heuristics で暫定ステータスが設定済み。LLM 結果で変更が必要なら更新する。
     async fn classify_and_dispatch(&self, task: CodingTask) -> Result<()> {
         let log_dir = self.log_dir();
-        let classification = classify_new_task_llm(
+        let classification = super::classify::classify_new_task_llm(
             &task, &self.repos_config, &self.db, &self.runner_ctx, &log_dir,
         ).await;
 
@@ -1821,131 +1822,6 @@ fn count_business_days(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
 const ERROR_LOG_HINT: &str = "\n_詳細ログ: `journalctl --user -u sdtab-ambient-task-agent -n 50`_";
 
 // ============================================================================
-// タスク分類（new → executing / conversing）
-// ============================================================================
-
-enum TaskClassification {
-    Execute,
-    Converse,
-}
-
-/// new タスクを executing（即実行）か conversing（要件ヒアリング）に分類（heuristics 版）
-fn classify_new_task_heuristic(task: &CodingTask, repos_config: &ReposConfig) -> TaskClassification {
-    let is_slack_origin = task.asana_task_gid.starts_with("slack_")
-        || task.asana_task_gid.starts_with("ops_");
-
-    let has_repo = task.repo_key.is_some();
-
-    let auto_execute = task.repo_key.as_deref()
-        .and_then(|key| repos_config.find_repo_by_key(key))
-        .map(|r| r.auto_execute)
-        .unwrap_or(false);
-
-    if is_slack_origin {
-        // Slack/ops 入口: analysis_text に要件定義が入っていれば即実行
-        if task.analysis_text.is_some() {
-            TaskClassification::Execute
-        } else {
-            TaskClassification::Converse
-        }
-    } else {
-        // Asana 入口: auto_execute フラグを尊重
-        if auto_execute && has_repo {
-            TaskClassification::Execute
-        } else {
-            TaskClassification::Converse
-        }
-    }
-}
-
-/// new タスクを LLM で分類（past examples を few-shot で渡す）
-/// few-shot 履歴が `defaults.min_fewshot_examples` 未満の場合は heuristics にフォールバック。
-/// LLM 呼び出しに失敗した場合も heuristics にフォールバック。
-async fn classify_new_task_llm(
-    task: &CodingTask,
-    repos_config: &ReposConfig,
-    db: &crate::db::Db,
-    runner_ctx: &crate::execution::RunnerContext,
-    log_dir: &Path,
-) -> TaskClassification {
-    // 過去の分類履歴を取得（few-shot 用）
-    let history = db.get_recent_classification_history(10).unwrap_or_default();
-
-    // 履歴が不十分な場合は LLM を呼ばず heuristics で判定（誤分類リスク回避）
-    let min_examples = repos_config.defaults.min_fewshot_examples;
-    if history.len() < min_examples {
-        tracing::info!(
-            "LLM classify skipped: only {} examples (need {}), using heuristics",
-            history.len(), min_examples
-        );
-        return classify_new_task_heuristic(task, repos_config);
-    }
-
-    let examples = if history.is_empty() {
-        String::new()
-    } else {
-        let lines: Vec<String> = history.iter().map(|r| {
-            format!("- 「{}」({}文字) → {} → 結果: {}", r.task_name, r.description.len(), r.classification, r.outcome)
-        }).collect();
-        format!("## 過去の分類履歴\n{}\n\n", lines.join("\n"))
-    };
-
-    let desc = task.description.as_deref().unwrap_or("(なし)");
-    let prompt = format!(
-        "タスクを execute（即実行可能）か converse（要件確認が必要）に分類してください。\n\n\
-         {}## 新しいタスク\n名前: {}\n説明: {}\nリポジトリ: {}\n入口: {}\n\n\
-         判断基準:\n- 要件が明確で実装可能 → execute\n- 曖昧・不足・確認事項あり → converse",
-        examples,
-        task.asana_task_name,
-        crate::claude::truncate_str(desc, 500),
-        task.repo_key.as_deref().unwrap_or("なし"),
-        task.source,
-    );
-
-    let schema = r#"{"type":"object","properties":{"classification":{"type":"string","enum":["execute","converse"]},"reason":{"type":"string"}},"required":["classification"]}"#;
-
-    let result = crate::claude::ClaudeRunner::new("classify", &prompt)
-        .max_turns(1)
-        .allowed_tools("")
-        .json_schema(schema)
-        .log_dir(log_dir)
-        .with_context(runner_ctx)
-        .run()
-        .await;
-
-    match result {
-        Ok(r) if r.success => {
-            let answer: Option<String> = serde_json::from_str::<serde_json::Value>(&r.stdout)
-                .ok()
-                .and_then(|v| v.get("classification")?.as_str().map(|s| s.to_string()));
-
-            match answer.as_deref() {
-                Some("execute") => {
-                    tracing::info!("LLM classify task {}: execute", task.id);
-                    TaskClassification::Execute
-                }
-                Some("converse") => {
-                    tracing::info!("LLM classify task {}: converse", task.id);
-                    TaskClassification::Converse
-                }
-                _ => {
-                    tracing::warn!("LLM classify: unexpected answer '{}', falling back to heuristics", r.stdout);
-                    classify_new_task_heuristic(task, repos_config)
-                }
-            }
-        }
-        Ok(r) => {
-            tracing::warn!("LLM classify failed (non-success): {}, falling back", r.stderr);
-            classify_new_task_heuristic(task, repos_config)
-        }
-        Err(e) => {
-            tracing::warn!("LLM classify error: {}, falling back to heuristics", e);
-            classify_new_task_heuristic(task, repos_config)
-        }
-    }
-}
-
-// ============================================================================
 // Block Kit ヘルパー（conversing / manual）
 // ============================================================================
 
@@ -2007,140 +1883,6 @@ fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
 }
 
 /// manual 状態のボタンレイアウト: [再開] [完了]
-// ============================================================================
-// Git Ratchet（品質ラチェット）
-// ============================================================================
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-struct QualityBaseline {
-    test_count: u32,
-    clippy_warnings: u32,
-    #[serde(default)]
-    updated_at: String,
-}
-
-/// ベースラインファイルのパス（worktree の親リポジトリの .agent/ に保存）
-fn baseline_path(worktree_path: &Path) -> PathBuf {
-    // worktree_path は .claude/worktrees/xxx/ の下にあるので、
-    // main repo の .agent/ に保存する
-    worktree_path
-        .ancestors()
-        .find(|p| p.join(".agent").is_dir())
-        .unwrap_or(worktree_path)
-        .join(".agent")
-        .join("quality-baseline.json")
-}
-
-/// worktree で cargo test + clippy を実行してメトリクスを取得
-async fn capture_quality_metrics(worktree_path: &Path) -> Result<(u32, u32)> {
-    // cargo test
-    let test_output = tokio::process::Command::new("cargo")
-        .arg("test")
-        .arg("--")
-        .arg("--format=terse")
-        .current_dir(worktree_path)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("cargo test failed to start: {}", e))?;
-
-    let test_stdout = String::from_utf8_lossy(&test_output.stdout);
-    // "test result: ok. 36 passed; 0 failed" → "passed" の直前の数字を取得
-    let test_count = test_stdout.lines()
-        .find(|l| l.contains("test result:"))
-        .and_then(|l| {
-            let words: Vec<&str> = l.split_whitespace().collect();
-            words.windows(2)
-                .find(|w| w[1] == "passed" || w[1] == "passed;")
-                .and_then(|w| w[0].parse::<u32>().ok())
-        })
-        .unwrap_or(0);
-
-    // cargo clippy
-    let clippy_output = tokio::process::Command::new("cargo")
-        .args(["clippy", "--message-format=short"])
-        .current_dir(worktree_path)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("cargo clippy failed to start: {}", e))?;
-
-    let clippy_stderr = String::from_utf8_lossy(&clippy_output.stderr);
-    let clippy_warnings = clippy_stderr.lines()
-        .filter(|l| l.contains("warning:") && !l.contains("warning: `"))
-        .count() as u32;
-
-    Ok((test_count, clippy_warnings))
-}
-
-/// ラチェット検証: テスト数が減少 or clippy warnings が増加 → エラー
-async fn quality_ratchet_check(worktree_path: &Path) -> Result<()> {
-    let bp = baseline_path(worktree_path);
-    let baseline = if bp.exists() {
-        let content = std::fs::read_to_string(&bp)
-            .map_err(|e| anyhow::anyhow!("Failed to read baseline: {}", e))?;
-        serde_json::from_str::<QualityBaseline>(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse baseline: {}", e))?
-    } else {
-        tracing::info!("No quality baseline found, skipping ratchet check");
-        return Ok(());
-    };
-
-    let (test_count, clippy_warnings) = capture_quality_metrics(worktree_path).await?;
-
-    tracing::info!(
-        "Ratchet check: tests={}/{} (baseline), clippy_warnings={}/{} (baseline)",
-        test_count, baseline.test_count, clippy_warnings, baseline.clippy_warnings
-    );
-
-    let mut violations = Vec::new();
-    if test_count < baseline.test_count {
-        violations.push(format!(
-            "テスト数が減少: {} → {} ({}件減)",
-            baseline.test_count, test_count, baseline.test_count - test_count
-        ));
-    }
-    if clippy_warnings > baseline.clippy_warnings {
-        violations.push(format!(
-            "clippy warnings が増加: {} → {} ({}件増)",
-            baseline.clippy_warnings, clippy_warnings, clippy_warnings - baseline.clippy_warnings
-        ));
-    }
-
-    if violations.is_empty() {
-        tracing::info!("Ratchet check passed");
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{}", violations.join("\n")))
-    }
-}
-
-/// ベースラインを更新（PR 作成成功後に呼ぶ）
-async fn update_quality_baseline(worktree_path: &Path) {
-    match capture_quality_metrics(worktree_path).await {
-        Ok((test_count, clippy_warnings)) => {
-            let baseline = QualityBaseline {
-                test_count,
-                clippy_warnings,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            };
-            let bp = baseline_path(worktree_path);
-            if let Some(parent) = bp.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            match serde_json::to_string_pretty(&baseline) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&bp, json) {
-                        tracing::warn!("Failed to write quality baseline: {}", e);
-                    } else {
-                        tracing::info!("Quality baseline updated: tests={}, clippy={}", test_count, clippy_warnings);
-                    }
-                }
-                Err(e) => tracing::warn!("Failed to serialize quality baseline: {}", e),
-            }
-        }
-        Err(e) => tracing::warn!("Failed to capture quality metrics for baseline: {}", e),
-    }
-}
-
 /// spawn_task の Drop ガード。panic 時も running_tasks から task_id を確実に除去する。
 /// Mutex が poisoned でも除去を試みる（into_inner で回復）。
 struct RunningTaskGuard {
