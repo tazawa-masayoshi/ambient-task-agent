@@ -544,16 +544,21 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             match task.status.as_str() {
                 "executing" | "ci_pending" | "conversing" => {
                     let prev_status = task.status.clone();
-                    state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
+                    state.db.update_status(task.id, "manual")?;
+                    let process_note = if prev_status == "executing" {
+                        "\n_※ 進行中のプロセスは完走しますが、結果は反映されません_"
+                    } else {
+                        ""
+                    };
                     slack
                         .reply_thread(
                             channel,
                             thread_ts,
-                            &format!(":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
-                                      _※ 進行中のプロセスは完走しますが、結果は反映されません_", prev_status),
+                            &format!(":wrench: 手動対応モードに移行しました（`{}` → `manual`）{}\n\
+                                      完了したら `直した` と返信してください", prev_status, process_note),
                         )
                         .await?;
-                    tracing::info!("Task {} cancelled via thread reply (was {})", task.id, prev_status);
+                    tracing::info!("Task {} → manual via stop command (was {})", task.id, prev_status);
                 }
                 _ => {
                     slack

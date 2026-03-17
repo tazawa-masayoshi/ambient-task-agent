@@ -727,11 +727,11 @@ fn build_executing_blocks(task_id: i64, message: &str) -> serde_json::Value {
                     "type": "button",
                     "text": {
                         "type": "plain_text",
-                        "text": ":octagonal_sign: 中止",
+                        "text": ":wrench: 手動対応",
                         "emoji": true
                     },
                     "style": "danger",
-                    "action_id": "stop_task",
+                    "action_id": "task_manual",
                     "value": format!("{}", task_id)
                 }
             ]

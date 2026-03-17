@@ -238,55 +238,6 @@ async fn process_action(
         .unwrap_or("");
 
     match action_id {
-        "stop_task" => {
-            match task.status.as_str() {
-                "executing" | "ci_pending" | "conversing" => {
-                    let prev_status = task.status.clone();
-                    state.db.set_error(task.id, &format!("Cancelled by user (was {})", prev_status))?;
-
-                    // ボタンを無効化
-                    if let Some(msg_ts) = message_ts {
-                        let updated_blocks = serde_json::json!([
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": ":octagonal_sign: *中止されました*"
-                                }
-                            }
-                        ]);
-                        slack
-                            .update_blocks(channel, msg_ts, &updated_blocks, "中止されました")
-                            .await
-                            .ok();
-                    }
-
-                    slack
-                        .reply_thread(
-                            channel,
-                            reply_ts,
-                            &format!(
-                                ":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
-                                 _※ 進行中のプロセスは完走しますが、結果は反映されません_",
-                                prev_status
-                            ),
-                        )
-                        .await?;
-                    tracing::info!("Task {} stopped via Block Kit button (was {})", task.id, prev_status);
-                }
-                _ => {
-                    slack
-                        .reply_thread(
-                            channel,
-                            reply_ts,
-                            &format!(":no_entry: 現在のステータスは `{}` のため中止できません", task.status),
-                        )
-                        .await
-                        .ok();
-                }
-            }
-        }
-
         "task_execute" => {
             // conversing/manual → executing（直接実行開始）
             if matches!(task.status.as_str(), "conversing" | "manual") {
@@ -325,24 +276,46 @@ async fn process_action(
         }
 
         "task_manual" => {
-            if matches!(task.status.as_str(), "conversing" | "executing") {
+            if matches!(task.status.as_str(), "conversing" | "executing" | "ci_pending") {
+                let prev_status = task.status.clone();
                 state.db.update_status(task.id, "manual")?;
                 let branch_info = task
                     .branch_name
                     .as_deref()
                     .map(|b| format!("\nブランチ: `{}`", b))
                     .unwrap_or_default();
+                let process_note = if prev_status == "executing" {
+                    "\n_※ 進行中のプロセスは完走しますが、結果は反映されません_"
+                } else {
+                    ""
+                };
+                // ボタンを無効化
+                if let Some(msg_ts) = message_ts {
+                    let updated_blocks = serde_json::json!([
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": ":wrench: *手動対応モードに移行*"
+                            }
+                        }
+                    ]);
+                    slack
+                        .update_blocks(channel, msg_ts, &updated_blocks, "手動対応モードに移行")
+                        .await
+                        .ok();
+                }
                 slack
                     .reply_thread(
                         channel,
                         reply_ts,
                         &format!(
-                            ":wrench: 手動対応モードに入りました{}\n完了したら「再開」ボタンまたは `直した` と返信してください",
-                            branch_info
+                            ":wrench: 手動対応モードに入りました（`{}` → `manual`）{}{}\n完了したら「再開」ボタンまたは `直した` と返信してください",
+                            prev_status, branch_info, process_note
                         ),
                     )
                     .await?;
-                tracing::info!("Task {} → manual via task_manual button", task.id);
+                tracing::info!("Task {} → manual via task_manual button (was {})", task.id, prev_status);
             }
         }
 

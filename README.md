@@ -31,11 +31,11 @@ Rust 製の自律タスクエージェント。Asana/Slack からタスクを受
 new → executing（明確）/ conversing（曖昧）
 conversing → executing / manual / done / sleeping（5営業日タイムアウト）
 manual → executing / done
-executing → done / ci_pending / conversing（ブロッカー検知）
+executing → done / ci_pending / manual（stop） / conversing（ブロッカー検知）
 ```
 
 - **conversing**: 曖昧なタスクを Slack スレッドで要件確定。LLM が few-shot 分類履歴を参照して判定
-- **manual**: ブロッカー検知時に人間が terminal で直接対応
+- **manual**: ブロッカー検知時や stop コマンドで人間が terminal で直接対応。`直した` で再開
 - **sleeping**: conversing で5営業日返信なし → 自動休止
 
 ## 設計思想: Heartbeat + DB ポーリング
@@ -83,7 +83,12 @@ executing → done / ci_pending / conversing（ブロッカー検知）
 
 | コンポーネント | ファイル | 役割 |
 |---------------|---------|------|
-| Worker | `src/worker/runner.rs` | heartbeat ループ、タスク分類、tokio::spawn 並列実行 |
+| Worker | `src/worker/runner.rs` | heartbeat ループ、spawn_task ガード |
+| Classify | `src/worker/classify.rs` | タスク分類（few-shot LLM + heuristics フォールバック） |
+| Conversing | `src/worker/runner_conversing.rs` | conversing フロー（Slack ラリーで要件確定） |
+| Ops Dispatch | `src/worker/runner_ops.rs` | ops キュー処理（ルーティング・実行・結果投稿） |
+| CI Monitor | `src/worker/runner_ci.rs` | CI 監視・自動リトライ |
+| Ratchet | `src/worker/ratchet.rs` | git-ratchet（テスト数・warnings の品質ゲート） |
 | Executor | `src/worker/executor.rs` | `claude -p --append-system-prompt` でタスク実行 |
 | Ops | `src/worker/ops.rs` | Slack ops メッセージの処理（Execute/Plan/Inception） |
 | Scheduler | `src/worker/scheduler.rs` | cron ジョブ（朝会/夕会/リマインド/自己改善） |
@@ -153,6 +158,16 @@ ambient-task-agent <command>
 | [0006](docs/adr/0006-tokio-spawn-parallelization.md) | process_tasks() の tokio::spawn 並列化 |
 | [0007](docs/adr/0007-llm-classification-learning.md) | LLM 分類学習（few-shot classify） |
 
+## なぜ OpenClaw を使わないか
+
+[OpenClaw](https://github.com/openclaw/openclaw) はマルチチャンネル対応の汎用パーソナルアシスタントとして完成度が高い。ただし、チーム業務自動化という用途では合わない部分があった。
+
+**セキュリティ面**: OpenClaw はデフォルトでエージェントがホスト上でフルアクセスで動作する。チーム Slack からの任意メッセージがコード実行に繋がる経路を持つため、インプットを Asana タスク（承認済み）と ops_admin に限定したいチーム運用では攻撃面が広すぎる。
+
+**コスト面**: OpenClaw は Gateway が常時起動し、セッションが持続する設計になっている。ambient-task-agent はタスクがあるときだけ `claude -p` を起動するため、LLM 課金がタスク数に比例しコントロールしやすい。
+
+**自作の理由**: 既存のものを使うより、自分で作った方が面白い。マネでもいい。Rust でバイブコーディングするのが好きなので、TypeScript 製の OpenClaw をそのまま使うより Rust で書き直す方が自分にとって自然だった。社内チーム向けに閉じた用途なので、汎用性より業務フィット（Asana + Slack + GitHub）を優先した作りにできる。
+
 ## 参考プロジェクト
 
 | プロジェクト | 採用したパターン |
@@ -163,6 +178,7 @@ ambient-task-agent <command>
 | [multi-agent-shogun](https://github.com/yohey-w/multi-agent-shogun) | Bottom-up Skill Discovery |
 | [lossless-claw](https://github.com/Martian-Engineering/lossless-claw) | agent self-retrieval（将来検討） |
 | [prompt-review](https://github.com/tokoroten/prompt-review) | 分析テンプレート外部ファイル化 |
+| [OpenClaw](https://github.com/openclaw/openclaw) | 参考にしたが採用しなかった（理由は上記） |
 
 ## セットアップ
 

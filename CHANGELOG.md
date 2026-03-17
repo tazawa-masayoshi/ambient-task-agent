@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Changed
+- **runner.rs 分割** — 2158行を6ファイルに分割（runner.rs 904行 + classify.rs / ratchet.rs / runner_ops.rs / runner_ci.rs / runner_conversing.rs）。
+- **run_ops_item 関数分割** — 290行の単一関数を `resolve_ops_repo_entry` / `prepare_ops_execution` / `post_ops_result` の3ヘルパーに分割。
+- **ops キュー二重実行防止** — `dequeue_ops_item` を `UPDATE...RETURNING` でアトミック化。`running_ops` + `RunningOpsGuard` で `recover_stale_ops` との競合を排除。
+- **カレンダー登録の中断安全性** — delete-then-create → create-then-delete パターンに変更。途中失敗でカレンダーが空にならない。
+- **stop コマンドメッセージ修正** — 「次のターン終了時に停止」→「進行中プロセスは完走するが結果は反映されない」に統一（slack_events.rs / slack_actions.rs）。
+- **`stop_task` → `task_manual` 統合** — executing 中の「中止」ボタンを `error` 遷移から `manual` 遷移に変更。stop/cancel テキストコマンドも同様。`stop_task` action_id を廃止。
+
 ### Breaking Changes
 - **旧 plan/approve フロー完全削除** — `planning`, `proposed`, `approved`, `auto_approved` ステータスを廃止。v12 マイグレーションで自動変換。
 - **analyzer.rs 削除** — 旧 `plan_task()`, `PlanResult`, `extract_complexity()` を削除。
