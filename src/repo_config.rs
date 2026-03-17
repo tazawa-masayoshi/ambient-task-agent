@@ -68,6 +68,9 @@ pub struct Defaults {
     /// Slack user ID → Asana 表示名のマッピング（DM タスクフィルタ用）
     #[serde(default)]
     pub slack_user_map: HashMap<String, String>,
+    /// LLM 分類に必要な最小 few-shot 履歴件数（これ未満は heuristics のみ使用）
+    #[serde(default = "default_min_fewshot_examples")]
+    pub min_fewshot_examples: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -98,6 +101,10 @@ fn default_timeout_secs() -> u64 {
 
 fn default_max_output_bytes() -> usize {
     100_000
+}
+
+fn default_min_fewshot_examples() -> usize {
+    5
 }
 
 fn default_max_concurrent() -> usize {

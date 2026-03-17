@@ -1111,6 +1111,7 @@ impl Worker {
 
     /// タスク処理を spawn し、panic/エラー時に DB を error 状態に復帰させる。
     /// 同一 task_id が既に実行中なら spawn しない（二重実行防止）。
+    /// Drop ガードにより panic 時も running_tasks から確実に除去される。
     fn spawn_task<F, Fut>(self: &Arc<Self>, task_id: i64, f: F)
     where
         F: FnOnce(Arc<Worker>) -> Fut + Send + 'static,
@@ -1126,6 +1127,11 @@ impl Worker {
         let w = Arc::clone(self);
         let db = self.db.clone();
         tokio::spawn(async move {
+            // Drop ガード: panic 時も running_tasks から task_id を確実に除去
+            let _guard = RunningTaskGuard {
+                running_tasks: Arc::clone(&w),
+                task_id,
+            };
             match f(Arc::clone(&w)).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -1133,7 +1139,6 @@ impl Worker {
                     db.set_error(task_id, &format!("Task failed: {}", e)).ok();
                 }
             }
-            w.running_tasks.lock().unwrap().remove(&task_id);
         });
     }
 
@@ -1853,12 +1858,8 @@ fn classify_new_task_heuristic(task: &CodingTask, repos_config: &ReposConfig) ->
     }
 }
 
-/// LLM 分類に必要な最小 few-shot 履歴件数。
-/// これ未満の場合、LLM の分類精度が信頼できないため heuristics のみを使用する。
-const MIN_FEWSHOT_EXAMPLES: usize = 5;
-
 /// new タスクを LLM で分類（past examples を few-shot で渡す）
-/// few-shot 履歴が MIN_FEWSHOT_EXAMPLES 未満の場合は heuristics にフォールバック。
+/// few-shot 履歴が `defaults.min_fewshot_examples` 未満の場合は heuristics にフォールバック。
 /// LLM 呼び出しに失敗した場合も heuristics にフォールバック。
 async fn classify_new_task_llm(
     task: &CodingTask,
@@ -1871,10 +1872,11 @@ async fn classify_new_task_llm(
     let history = db.get_recent_classification_history(10).unwrap_or_default();
 
     // 履歴が不十分な場合は LLM を呼ばず heuristics で判定（誤分類リスク回避）
-    if history.len() < MIN_FEWSHOT_EXAMPLES {
+    let min_examples = repos_config.defaults.min_fewshot_examples;
+    if history.len() < min_examples {
         tracing::info!(
             "LLM classify skipped: only {} examples (need {}), using heuristics",
-            history.len(), MIN_FEWSHOT_EXAMPLES
+            history.len(), min_examples
         );
         return classify_new_task_heuristic(task, repos_config);
     }
@@ -2139,4 +2141,18 @@ async fn update_quality_baseline(worktree_path: &Path) {
     }
 }
 
+/// spawn_task の Drop ガード。panic 時も running_tasks から task_id を確実に除去する。
+/// Mutex が poisoned でも除去を試みる（into_inner で回復）。
+struct RunningTaskGuard {
+    running_tasks: Arc<Worker>,
+    task_id: i64,
+}
 
+impl Drop for RunningTaskGuard {
+    fn drop(&mut self) {
+        match self.running_tasks.running_tasks.lock() {
+            Ok(mut set) => { set.remove(&self.task_id); }
+            Err(poisoned) => { poisoned.into_inner().remove(&self.task_id); }
+        }
+    }
+}
