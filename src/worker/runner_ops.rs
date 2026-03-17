@@ -6,8 +6,15 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::db::OpsQueueItem;
+use crate::repo_config::RepoEntry;
 
-use super::{context, runner::{Worker, count_business_days, extract_slack_summary, ERROR_LOG_HINT}};
+use super::{context, ops::OpsExecMode, runner::{Worker, count_business_days, extract_slack_summary, ERROR_LOG_HINT}};
+
+/// `prepare_ops_execution` の戻り値。実行結果 + メタ情報を保持する。
+struct OpsExecutionResult {
+    output: Result<String, anyhow::Error>,
+    exec_mode: OpsExecMode,
+}
 
 impl Worker {
     /// ops キューを処理。spawn して即戻る。DB エラー時に true を返す。
@@ -50,37 +57,91 @@ impl Worker {
     /// - pending: classify → actionable なら実行、そうでなければ skipped
     /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
     async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
+        let repo_entry = match self.resolve_ops_repo_entry(&item, max_retries).await? {
+            Some(entry) => entry,
+            None => return Ok(()),
+        };
+
+        let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+        let slack = self.slack.clone();
+        slack.reply_thread(&item.channel, reply_ts, ":gear: 処理中...").await.ok();
+
+        let exec_result = self.prepare_ops_execution(&item, &repo_entry).await?;
+
+        let admin_mention = self.repos_config.defaults.ops_admin_user
+            .as_deref()
+            .map(|uid| format!(" <@{}>", uid))
+            .unwrap_or_default();
+
+        match exec_result.output {
+            Ok(raw_output) => {
+                let output = if raw_output.trim().is_empty() {
+                    tracing::warn!("ops item {}: Claude returned empty output after resume retry", item.id);
+                    ":warning: 作業を実行しましたが、結果の要約を取得できませんでした。ログを確認してください。".to_string()
+                } else {
+                    raw_output
+                };
+                if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, &item.repo_key, "assistant", &output) {
+                    tracing::warn!("Failed to save ops context (assistant): {}", e);
+                }
+
+                self.post_ops_result(&item, &output, exec_result.exec_mode, reply_ts, &admin_mention).await?;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if item.retry_count + 1 >= max_retries {
+                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}", err_str, ERROR_LOG_HINT);
+                    slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
+                    self.db.mark_ops_failed(item.id, &err_str)?;
+                } else {
+                    tracing::warn!("ops execution failed for item {} (retry {}): {}", item.id, item.retry_count, err_str);
+                    self.db.mark_ops_retry(item.id, &err_str)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// ops アイテムのルーティング: key → channel → content-based の3段階で RepoEntry を解決。
+    /// `None` = non-actionable（skipped/failed 処理済み）。
+    async fn resolve_ops_repo_entry(
+        &self,
+        item: &OpsQueueItem,
+        max_retries: i64,
+    ) -> Result<Option<RepoEntry>> {
         // 1. repo_key で直接マッチ（DM 等チャンネルに紐づかないケース）
-        // 2. チャンネルが ops_channel に紐づいている場合はそのエントリを使う
-        // 3. いずれも該当しない場合のみコンテンツベースルーティング
-        let repo_entry = if let Some(direct) = self.repos_config.find_repo_by_key(&item.repo_key) {
+        if let Some(direct) = self.repos_config.find_repo_by_key(&item.repo_key) {
             tracing::info!("ops item {} key-matched to scope: {} ({})",
                 item.id, direct.key,
                 direct.ops_description.as_deref().unwrap_or("no description"));
-            direct.clone()
-        } else if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
+            return Ok(Some(direct.clone()));
+        }
+        // 2. チャンネルが ops_channel に紐づいている場合はそのエントリを使う
+        if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
             tracing::info!("ops item {} channel-matched to scope: {} ({})",
                 item.id, direct.key,
                 direct.ops_description.as_deref().unwrap_or("no description"));
-            direct.clone()
-        } else {
-            match self.route_ops(&item).await {
+            return Ok(Some(direct.clone()));
+        }
+        // 3. いずれも該当しない場合のみコンテンツベースルーティング
+        match self.route_ops(item).await {
             Ok(Some(idx)) => {
                 let entry = self.repos_config.repo[idx].clone();
                 tracing::info!("ops item {} routed to scope: {} ({})",
                     item.id, entry.key,
                     entry.ops_description.as_deref().unwrap_or("no description"));
-                entry
+                Ok(Some(entry))
             }
             Ok(None) if item.status == "pending" => {
                 tracing::debug!("ops item {} classified as non-actionable", item.id);
                 self.db.mark_ops_skipped(item.id)?;
-                return Ok(());
+                Ok(None)
             }
             Ok(None) => {
                 let err = format!("No matching ops scope for item {}", item.id);
                 self.db.mark_ops_failed(item.id, &err)?;
-                return Ok(());
+                Ok(None)
             }
             Err(e) => {
                 tracing::warn!("ops routing failed for item {}: {}", item.id, e);
@@ -89,24 +150,26 @@ impl Worker {
                 } else {
                     self.db.mark_ops_retry(item.id, &e.to_string())?;
                 }
-                return Ok(());
+                Ok(None)
             }
         }
-        };
+    }
 
-        // 実行
+    /// ファイルダウンロード → 会話履歴保存 → OpsExecMode 判定 → execute_ops 実行。
+    async fn prepare_ops_execution(
+        self: &Arc<Self>,
+        item: &OpsQueueItem,
+        repo_entry: &RepoEntry,
+    ) -> Result<OpsExecutionResult> {
         let event: serde_json::Value =
             serde_json::from_str(&item.event_json).unwrap_or_default();
 
-        // スレッド返信先: thread_ts があればそちら、なければ message_ts 自体がスレッドの起点
         let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
-
         let slack = self.slack.clone();
-        slack.reply_thread(&item.channel, reply_ts, ":gear: 処理中...").await.ok();
 
         // ファイルダウンロード
         let files = super::ops::extract_slack_files_from_json(&event);
-        let repo_path = self.repos_config.repo_local_path(&repo_entry);
+        let repo_path = self.repos_config.repo_local_path(repo_entry);
         if !files.is_empty() {
             if let Some(ref dl_dir) = repo_entry.ops_download_dir {
                 let download_dir = repo_path.join(dl_dir);
@@ -122,11 +185,10 @@ impl Worker {
             }
         }
 
-        let repo_key = &item.repo_key;
         let message_text = crate::server::slack_events::extract_command(&item.message_text).to_string();
 
         // 会話履歴を保存 & 取得（スレッドの ts で管理）
-        if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "user", &message_text) {
+        if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, &item.repo_key, "user", &message_text) {
             tracing::warn!("Failed to save ops context (user): {}", e);
         }
         let history = self.db.get_ops_context(&item.channel, reply_ts)?;
@@ -148,192 +210,173 @@ impl Worker {
         // 注意: append_ops_context("user") 後に get_ops_context を呼んでいるため
         // history には既に今回の user メッセージが含まれている。
         let exec_mode = match repo_entry.ops_mode {
-            crate::repo_config::OpsMode::Plan => super::ops::OpsExecMode::PlanOnly,
+            crate::repo_config::OpsMode::Plan => OpsExecMode::PlanOnly,
             crate::repo_config::OpsMode::Inception => {
                 if history.iter().any(|m| m.role == "assistant") {
-                    super::ops::OpsExecMode::InceptionTurn2
+                    OpsExecMode::InceptionTurn2
                 } else {
-                    super::ops::OpsExecMode::InceptionTurn1
+                    OpsExecMode::InceptionTurn1
                 }
             }
-            crate::repo_config::OpsMode::Execute => super::ops::OpsExecMode::Execute,
+            crate::repo_config::OpsMode::Execute => OpsExecMode::Execute,
         };
-        let is_plan_only = exec_mode == super::ops::OpsExecMode::PlanOnly;
-        let is_inception_turn1 = exec_mode == super::ops::OpsExecMode::InceptionTurn1;
-        let is_inception_turn2 = exec_mode == super::ops::OpsExecMode::InceptionTurn2;
 
         let dl_dir_ref = ops_download_dir.as_deref();
-        let exec_result = super::ops::execute_ops(
+        let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
             exec_mode,
         ).await;
 
-        // admin ユーザーへのメンション（完了通知に含める）
-        let admin_mention = self.repos_config.defaults.ops_admin_user
-            .as_deref()
-            .map(|uid| format!(" <@{}>", uid))
-            .unwrap_or_default();
+        Ok(OpsExecutionResult { output, exec_mode })
+    }
 
-        match exec_result {
-            Ok(raw_output) => {
-                let output = if raw_output.trim().is_empty() {
-                    tracing::warn!("ops item {}: Claude returned empty output after resume retry", item.id);
-                    ":warning: 作業を実行しましたが、結果の要約を取得できませんでした。ログを確認してください。".to_string()
-                } else {
-                    raw_output
-                };
-                if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, repo_key, "assistant", &output) {
-                    tracing::warn!("Failed to save ops context (assistant): {}", e);
-                }
+    /// 実行成功時の Slack 投稿: Inception Turn1/Turn2 / Execute / Plan。
+    async fn post_ops_result(
+        self: &Arc<Self>,
+        item: &OpsQueueItem,
+        output: &str,
+        exec_mode: OpsExecMode,
+        reply_ts: &str,
+        admin_mention: &str,
+    ) -> Result<()> {
+        let slack = self.slack.clone();
 
-                // Inception ターン1: 質問を投稿してユーザー返信待ち
-                if is_inception_turn1 {
-                    let truncated = crate::claude::truncate_str(&output, 2800);
-                    let msg = format!(":bulb: *要件ヒアリング*{}\n{}", admin_mention, truncated);
-                    slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
-                    self.db.mark_ops_done(item.id)?;
-                    tracing::info!("inception turn1 done for ops item {}, waiting for user reply", item.id);
-                    return Ok(());
-                }
+        // Inception ターン1: 質問を投稿してユーザー返信待ち
+        if exec_mode == OpsExecMode::InceptionTurn1 {
+            let truncated = crate::claude::truncate_str(output, 2800);
+            let msg = format!(":bulb: *要件ヒアリング*{}\n{}", admin_mention, truncated);
+            slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+            self.db.mark_ops_done(item.id)?;
+            tracing::info!("inception turn1 done for ops item {}, waiting for user reply", item.id);
+            return Ok(());
+        }
 
-                // Inception ターン2: 要件整理 + タスク分解完了 → 承認ゲートボタン
-                if is_inception_turn2 {
-                    let truncated = crate::claude::truncate_str(&output, 2800);
-                    let blocks = serde_json::json!([
+        // Inception ターン2: 要件整理 + タスク分解完了 → 承認ゲートボタン
+        if exec_mode == OpsExecMode::InceptionTurn2 {
+            let truncated = crate::claude::truncate_str(output, 2800);
+            let blocks = serde_json::json!([
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!(":memo: *要件定義完了*{}\n```\n{}\n```", admin_mention, truncated)
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
                         {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": format!(":memo: *要件定義完了*{}\n```\n{}\n```", admin_mention, truncated)
-                            }
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{2705} 承認（自動実行）" },
+                            "style": "primary",
+                            "action_id": "ops_inception_approve",
+                            "value": item.id.to_string()
                         },
                         {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{2705} 承認（自動実行）" },
-                                    "style": "primary",
-                                    "action_id": "ops_inception_approve",
-                                    "value": item.id.to_string()
-                                },
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{1f4cb} Asana登録のみ" },
-                                    "action_id": "ops_inception_asana",
-                                    "value": item.id.to_string()
-                                },
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{1f527} 修正して" },
-                                    "action_id": "ops_inception_revise",
-                                    "value": item.id.to_string()
-                                },
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{274c} キャンセル" },
-                                    "style": "danger",
-                                    "action_id": "ops_inception_cancel",
-                                    "value": item.id.to_string()
-                                }
-                            ]
-                        }
-                    ]);
-                    let fallback = format!(":memo: *要件定義完了*{}\n{}", admin_mention, truncated);
-                    match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
-                        Ok(ts) => {
-                            self.db.set_ops_notify_ts(item.id, &ts).ok();
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to post inception blocks: {}", e);
-                            slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
-                        }
-                    }
-                    self.db.mark_ops_done(item.id)?;
-                    tracing::info!("inception turn2 done for ops item {}, awaiting approval", item.id);
-                    return Ok(());
-                }
-
-                // 通常モード（Execute / Plan）
-                let is_no_action = output.contains("対応不要")
-                    || output.contains("作業対象外")
-                    || output.contains("スコープ外");
-                let emoji = if is_no_action {
-                    ":information_source:"
-                } else if is_plan_only {
-                    ":memo:"
-                } else {
-                    ":white_check_mark:"
-                };
-                let label = if is_no_action {
-                    "対応不要"
-                } else if is_plan_only {
-                    "分析完了"
-                } else {
-                    "ops 完了"
-                };
-                // 作業結果まとめセクションがあればそこだけ抽出
-                let slack_output = extract_slack_summary(&output);
-                let truncated = crate::claude::truncate_str(slack_output, 2800);
-                // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
-                if is_no_action {
-                    let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);
-                    slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
-                    self.db.resolve_ops(item.id).ok();
-                } else {
-                    let blocks = serde_json::json!([
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
-                            }
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{1f4cb} Asana登録のみ" },
+                            "action_id": "ops_inception_asana",
+                            "value": item.id.to_string()
                         },
                         {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{2705} 完了" },
-                                    "style": "primary",
-                                    "action_id": "ops_resolve",
-                                    "value": item.id.to_string()
-                                },
-                                {
-                                    "type": "button",
-                                    "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
-                                    "action_id": "ops_escalate",
-                                    "value": item.id.to_string()
-                                }
-                            ]
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{1f527} 修正して" },
+                            "action_id": "ops_inception_revise",
+                            "value": item.id.to_string()
+                        },
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{274c} キャンセル" },
+                            "style": "danger",
+                            "action_id": "ops_inception_cancel",
+                            "value": item.id.to_string()
                         }
-                    ]);
-                    let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);
-                    match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
-                        Ok(ts) => {
-                            self.db.set_ops_notify_ts(item.id, &ts).ok();
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to post ops blocks: {}", e);
-                            slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
-                        }
-                    }
+                    ]
                 }
-                self.db.mark_ops_done(item.id)?;
+            ]);
+            let fallback = format!(":memo: *要件定義完了*{}\n{}", admin_mention, truncated);
+            match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
+                Ok(ts) => {
+                    self.db.set_ops_notify_ts(item.id, &ts).ok();
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to post inception blocks: {}", e);
+                    slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
+                }
             }
-            Err(e) => {
-                let err_str = e.to_string();
-                if item.retry_count + 1 >= max_retries {
-                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}", err_str, ERROR_LOG_HINT);
-                    slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
-                    self.db.mark_ops_failed(item.id, &err_str)?;
-                } else {
-                    tracing::warn!("ops execution failed for item {} (retry {}): {}", item.id, item.retry_count, err_str);
-                    self.db.mark_ops_retry(item.id, &err_str)?;
+            self.db.mark_ops_done(item.id)?;
+            tracing::info!("inception turn2 done for ops item {}, awaiting approval", item.id);
+            return Ok(());
+        }
+
+        // 通常モード（Execute / Plan）
+        let is_plan_only = exec_mode == OpsExecMode::PlanOnly;
+        let is_no_action = output.contains("対応不要")
+            || output.contains("作業対象外")
+            || output.contains("スコープ外");
+        let emoji = if is_no_action {
+            ":information_source:"
+        } else if is_plan_only {
+            ":memo:"
+        } else {
+            ":white_check_mark:"
+        };
+        let label = if is_no_action {
+            "対応不要"
+        } else if is_plan_only {
+            "分析完了"
+        } else {
+            "ops 完了"
+        };
+        // 作業結果まとめセクションがあればそこだけ抽出
+        let slack_output = extract_slack_summary(output);
+        let truncated = crate::claude::truncate_str(slack_output, 2800);
+        // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
+        if is_no_action {
+            let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);
+            slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+            self.db.resolve_ops(item.id).ok();
+        } else {
+            let blocks = serde_json::json!([
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{2705} 完了" },
+                            "style": "primary",
+                            "action_id": "ops_resolve",
+                            "value": item.id.to_string()
+                        },
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                            "action_id": "ops_escalate",
+                            "value": item.id.to_string()
+                        }
+                    ]
+                }
+            ]);
+            let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);
+            match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
+                Ok(ts) => {
+                    self.db.set_ops_notify_ts(item.id, &ts).ok();
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to post ops blocks: {}", e);
+                    slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
                 }
             }
         }
+        self.db.mark_ops_done(item.id)?;
 
         Ok(())
     }
