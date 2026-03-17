@@ -23,3 +23,5 @@
 - [03/11 17:05, auto] Plan/Act mode全自動化 + quality-gate (Slack path traversal, extract_complexity修正)
 - [03/11 18:xx, manual] Plan/Act mode全自動化（decompose廃止、worktree隔離、--resume継続）+ 旧サブタスクコード完全削除
 - [03/11 20:54, auto] Implement the following plan:
+- [03/11 22:41, auto] ..
+- [03/12 13:04, auto] ..

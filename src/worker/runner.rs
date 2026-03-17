@@ -618,13 +618,40 @@ impl Worker {
                 self.db.mark_ops_on_hold(item.id).ok();
                 tracing::info!("ops item {} moved to on_hold after {} business days", item.id, business_days);
             } else {
-                // 営業日1日 / 3日後: リマインド
+                // 営業日1日 / 3日後: リマインド（完了ボタン付き）
                 let label = if item.reminder_count == 0 { "1営業日" } else { "3営業日" };
                 let msg = format!(
                     ":bell: *リマインド* {}\n{}経過: _{}_",
                     admin_mention, label, short_text
                 );
-                slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+                let blocks = serde_json::json!([
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": msg
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": { "type": "plain_text", "text": "\u{2705} 完了" },
+                                "style": "primary",
+                                "action_id": "ops_resolve",
+                                "value": item.id.to_string()
+                            },
+                            {
+                                "type": "button",
+                                "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                                "action_id": "ops_escalate",
+                                "value": item.id.to_string()
+                            }
+                        ]
+                    }
+                ]);
+                slack.post_blocks(&item.channel, reply_ts, &blocks, &msg).await.ok();
                 self.db.increment_ops_reminder(item.id).ok();
                 tracing::info!("ops item {} reminder {} sent ({}bd elapsed)", item.id, item.reminder_count + 1, business_days);
             }
