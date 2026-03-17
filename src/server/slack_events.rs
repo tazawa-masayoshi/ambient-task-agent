@@ -550,7 +550,7 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                             channel,
                             thread_ts,
                             &format!(":octagonal_sign: タスクを中止しました（`{}` → `error`）\n\
-                                      実行中のプロセスは次のターン終了時に停止します", prev_status),
+                                      _※ 進行中のプロセスは完走しますが、結果は反映されません_", prev_status),
                         )
                         .await?;
                     tracing::info!("Task {} cancelled via thread reply (was {})", task.id, prev_status);
