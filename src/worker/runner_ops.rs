@@ -111,7 +111,7 @@ impl Worker {
         Ok(())
     }
 
-    /// ops アイテムのルーティング: key → channel → content-based の3段階で RepoEntry を解決。
+    /// ops アイテムのルーティング: key → content-based の2段階で RepoEntry を解決。
     /// `None` = non-actionable（skipped/failed 処理済み）。
     async fn resolve_ops_repo_entry(
         &self,
@@ -125,14 +125,7 @@ impl Worker {
                 direct.ops_description.as_deref().unwrap_or("no description"));
             return Ok(Some(direct.clone()));
         }
-        // 2. チャンネルが ops_channel に紐づいている場合はそのエントリを使う
-        if let Some(direct) = self.repos_config.find_repo_by_ops_channel(&item.channel) {
-            tracing::info!("ops item {} channel-matched to scope: {} ({})",
-                item.id, direct.key,
-                direct.ops_description.as_deref().unwrap_or("no description"));
-            return Ok(Some(direct.clone()));
-        }
-        // 3. いずれも該当しない場合のみコンテンツベースルーティング
+        // 2. コンテンツベースルーティング（LLM が内容からスコープを判定）
         match self.route_ops(item).await {
             Ok(Some(idx)) => {
                 let entry = self.repos_config.repo[idx].clone();
