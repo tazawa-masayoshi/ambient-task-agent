@@ -1495,10 +1495,31 @@ async fn run_self_improvement(
         include_str!("../../config/self-improvement-template.md").to_string()
     });
 
+    // ops 実行結果を集計
+    let ops_outcomes = ctx.db.get_recent_ops_outcomes(30).unwrap_or_default();
+    let ops_outcome_section = if !ops_outcomes.is_empty() {
+        let total = ops_outcomes.len();
+        let no_action_count = ops_outcomes.iter().filter(|(_, _, o, _)| o == "no_action").count();
+        let error_count = ops_outcomes.iter().filter(|(_, _, o, _)| o == "error").count();
+        let mut s = format!("直近{}件: completed={}, no_action={}, error={}\n",
+            total, total - no_action_count - error_count, no_action_count, error_count);
+        if no_action_count > 0 {
+            s.push_str("\n対応不要と判定されたメッセージ:\n");
+            for (repo_key, msg, _, _) in ops_outcomes.iter().filter(|(_, _, o, _)| o == "no_action") {
+                s.push_str(&format!("- [{}] {}\n", repo_key,
+                    crate::claude::truncate_str(msg, 80)));
+            }
+        }
+        s
+    } else {
+        "データなし".to_string()
+    };
+
     let prompt = template
         .replace("{{classification_section}}", &classification_section)
         .replace("{{error_section}}", &error_section)
-        .replace("{{memory_section}}", &memory_section);
+        .replace("{{memory_section}}", &memory_section)
+        .replace("{{ops_outcome_section}}", &ops_outcome_section);
     let schema = r#"{"type":"object","properties":{"proposals":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["title","description","priority"]}}},"required":["proposals"]}"#;
 
     let result = ClaudeRunner::new("self_improvement", &prompt)

@@ -101,6 +101,7 @@ impl Worker {
                     let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}", err_str, ERROR_LOG_HINT);
                     slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
                     self.db.mark_ops_failed(item.id, &err_str)?;
+                    self.db.set_ops_outcome(item.id, "error").ok();
                 } else {
                     tracing::warn!("ops execution failed for item {} (retry {}): {}", item.id, item.retry_count, err_str);
                     self.db.mark_ops_retry(item.id, &err_str)?;
@@ -333,6 +334,10 @@ impl Worker {
         // 作業結果まとめセクションがあればそこだけ抽出
         let slack_output = extract_slack_summary(output);
         let truncated = crate::claude::truncate_str(slack_output, 2800);
+        // outcome を記録（self_improvement 分析用）
+        let outcome = if is_no_action { "no_action" } else { "completed" };
+        self.db.set_ops_outcome(item.id, outcome).ok();
+
         // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
         if is_no_action {
             let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);

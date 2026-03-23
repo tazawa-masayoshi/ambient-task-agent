@@ -329,6 +329,7 @@ impl Db {
             ("resolved_at", "TEXT"),
             ("reminder_count", "INTEGER DEFAULT 0"),
             ("notify_ts", "TEXT"),
+            ("outcome", "TEXT"),  // completed / no_action / error
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -1115,6 +1116,31 @@ impl Db {
             params![id],
         )?;
         Ok(())
+    }
+
+    /// ops アイテムの実行結果を記録（completed / no_action / error）
+    pub fn set_ops_outcome(&self, id: i64, outcome: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET outcome = ?2, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id, outcome],
+        )?;
+        Ok(())
+    }
+
+    /// 直近の ops 実行結果を集計（self_improvement 分析用）
+    pub fn get_recent_ops_outcomes(&self, limit: usize) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repo_key, message_text, outcome, COALESCE(error_message, '') \
+             FROM ops_queue WHERE outcome IS NOT NULL \
+             ORDER BY updated_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// フォローアップが必要な ops アイテムを取得
