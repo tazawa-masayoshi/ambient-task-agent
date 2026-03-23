@@ -29,6 +29,8 @@ pub struct AgentRequest {
     pub resume_session_id: Option<String>,
     /// JSON Schema を指定すると構造化出力モード（result ではなく structured_output に入る）
     pub json_schema: Option<String>,
+    /// フォールバックモデル（--fallback-model）
+    pub fallback_model: Option<String>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -234,6 +236,10 @@ impl AgentBackend for ClaudeCliBackend {
             args.extend(["--json-schema", schema]);
         }
 
+        if let Some(ref fb) = request.fallback_model {
+            args.extend(["--fallback-model", fb]);
+        }
+
         let mut cmd = Command::new("claude");
         // stdinからプロンプトを投入（長大プロンプトでの引数長制限を回避）
         cmd.args(&args).arg("-");
@@ -365,6 +371,8 @@ pub struct ClaudeRunner {
     resume_session_id: Option<String>,
     /// JSON Schema（構造化出力モード）
     json_schema: Option<String>,
+    /// フォールバックモデル（Opus 過負荷時に自動切替）
+    fallback_model: Option<String>,
 }
 
 impl ClaudeRunner {
@@ -387,6 +395,7 @@ impl ClaudeRunner {
             backend: None,
             resume_session_id: None,
             json_schema: None,
+            fallback_model: None,
         }
     }
 
@@ -458,6 +467,9 @@ impl ClaudeRunner {
         }
         if self.semaphore.is_none() {
             self.semaphore = Some(ctx.semaphore.clone());
+        }
+        if self.fallback_model.is_none() {
+            self.fallback_model = ctx.defaults.claude_fallback_model.clone();
         }
         self.hooks = Some(ctx.hooks.clone());
         self.backend = Some(ctx.backend.clone());
@@ -542,6 +554,7 @@ impl ClaudeRunner {
             max_output_bytes: self.max_output_bytes,
             resume_session_id: self.resume_session_id.clone(),
             json_schema: self.json_schema.clone(),
+            fallback_model: self.fallback_model.clone(),
         };
 
         let backend = self.backend.as_ref()

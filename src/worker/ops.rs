@@ -25,6 +25,7 @@ const OPS_RULES: &str = "\
 ## ルール
 - 作業手順に従って処理すること
 - 不明な点があれば作業を中断し、確認が必要な内容を報告すること
+- スキルの作業手順に該当しないメッセージは「対応不要」として処理すること（障害報告、雑談、別チームへの依頼など）
 
 ## 出力（重要）
 最後に必ずテキストで作業結果を出力すること。ツール操作だけで終了してはいけない。
@@ -208,19 +209,51 @@ fn build_ops_prompt(req: &OpsRequest, history: &[OpsMessage], download_dir: Opti
     parts.join("\n\n")
 }
 
-/// スキルファイルを読み込んで結合
+/// スキルファイルを読み込んで結合（Progressive Disclosure 対応）。
+///
+/// SKILL.md を指定すると、同フォルダの `gotchas.md` と `references/*.md` も自動読み込み。
 fn read_ops_skills(repo_path: &Path, skill_paths: &[String]) -> String {
     skill_paths
         .iter()
         .filter_map(|p| {
             let full = repo_path.join(p);
-            match std::fs::read_to_string(&full) {
-                Ok(content) => Some(content),
+            let main_content = match std::fs::read_to_string(&full) {
+                Ok(content) => content,
                 Err(e) => {
                     tracing::warn!("Failed to read skill file {}: {}", full.display(), e);
-                    None
+                    return None;
+                }
+            };
+
+            let mut parts = vec![main_content];
+
+            // Progressive Disclosure: 同フォルダの補助ファイルを自動読み込み
+            if let Some(skill_dir) = full.parent() {
+                // gotchas.md
+                let gotchas = skill_dir.join("gotchas.md");
+                if let Ok(content) = std::fs::read_to_string(&gotchas) {
+                    parts.push(format!("## Gotchas（よくある失敗）\n{}", content));
+                }
+
+                // references/*.md
+                let refs_dir = skill_dir.join("references");
+                if refs_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&refs_dir) {
+                        let mut ref_files: Vec<_> = entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                            .collect();
+                        ref_files.sort_by_key(|e| e.file_name());
+                        for entry in ref_files {
+                            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                                parts.push(content);
+                            }
+                        }
+                    }
                 }
             }
+
+            Some(parts.join("\n\n"))
         })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n")

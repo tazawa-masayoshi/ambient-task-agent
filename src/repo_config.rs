@@ -71,6 +71,9 @@ pub struct Defaults {
     /// LLM 分類に必要な最小 few-shot 履歴件数（これ未満は heuristics のみ使用）
     #[serde(default = "default_min_fewshot_examples")]
     pub min_fewshot_examples: usize,
+    /// claude -p の --fallback-model（Opus 過負荷時のフォールバック）
+    #[serde(default)]
+    pub claude_fallback_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
