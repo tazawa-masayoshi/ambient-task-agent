@@ -1440,19 +1440,45 @@ async fn run_self_improvement(
         .filter(|r| r.outcome != "correct")
         .collect();
 
-    // 2. 直近のエラータスクを取得
+    // 2. 直近のエラータスクを取得（重複排除: エラーメッセージの先頭80文字で判定）
     let error_tasks = ctx.db.get_tasks_by_status("error").unwrap_or_default();
+    let unique_errors: Vec<_> = {
+        let mut seen = std::collections::HashSet::new();
+        error_tasks.iter()
+            .filter(|t| {
+                let key = format!("{}::{}",
+                    t.asana_task_name,
+                    crate::claude::truncate_str(t.error_message.as_deref().unwrap_or(""), 80));
+                seen.insert(key)
+            })
+            .collect()
+    };
 
     // 3. memory.md を読む
     let memory = context::read_memory(&ctx.repos_base_dir);
 
-    // 分析材料がなければスキップ
-    if total == 0 && error_tasks.is_empty() && memory.is_empty() {
-        tracing::debug!("self_improvement: no data to analyze, skipping");
+    // 4. ops 実行結果を集計（重複排除: repo_key + メッセージ先頭80文字で判定）
+    let ops_outcomes = ctx.db.get_recent_ops_outcomes(30).unwrap_or_default();
+    let unique_no_actions: Vec<_> = {
+        let mut seen = std::collections::HashSet::new();
+        ops_outcomes.iter()
+            .filter(|(_, _, o, _)| o == "no_action")
+            .filter(|(repo_key, msg, _, _)| {
+                let key = format!("{}::{}", repo_key,
+                    crate::claude::truncate_str(msg, 80));
+                seen.insert(key)
+            })
+            .collect()
+    };
+
+    // 最小新規データ閾値: 新規シグナルが少なすぎる場合は LLM 呼び出しをスキップ
+    let novel_signal_count = incorrect.len() + unique_errors.len() + unique_no_actions.len();
+    if novel_signal_count == 0 && memory.is_empty() {
+        tracing::info!("self_improvement: insufficient novel signal (0 items), skipping LLM call");
         return Ok(());
     }
 
-    // 4. 分析プロンプト構築（外部テンプレート + データ注入）
+    // 5. 分析プロンプト構築（外部テンプレート + データ注入）
     let classification_section = if total > 0 {
         let accuracy = ((total - incorrect.len()) as f64 / total as f64 * 100.0) as u32;
         let mut s = format!("正解率: {}% ({}/{}件)\n", accuracy, total - incorrect.len(), total);
@@ -1468,9 +1494,9 @@ async fn run_self_improvement(
         "データなし".to_string()
     };
 
-    let error_section = if !error_tasks.is_empty() {
-        let mut s = format!("直近のエラー ({}件):\n", error_tasks.len());
-        for t in error_tasks.iter().take(5) {
+    let error_section = if !unique_errors.is_empty() {
+        let mut s = format!("直近のユニークエラー ({}件, 重複排除済み):\n", unique_errors.len());
+        for t in unique_errors.iter().take(5) {
             let err = t.error_message.as_deref().unwrap_or("不明");
             s.push_str(&format!("- #{} {} — {}\n", t.id, t.asana_task_name,
                 crate::claude::truncate_str(err, 100)));
@@ -1495,17 +1521,16 @@ async fn run_self_improvement(
         include_str!("../../config/self-improvement-template.md").to_string()
     });
 
-    // ops 実行結果を集計
-    let ops_outcomes = ctx.db.get_recent_ops_outcomes(30).unwrap_or_default();
+    // ops 実行結果セクション構築（重複排除済みデータを使用）
     let ops_outcome_section = if !ops_outcomes.is_empty() {
         let total = ops_outcomes.len();
         let no_action_count = ops_outcomes.iter().filter(|(_, _, o, _)| o == "no_action").count();
         let error_count = ops_outcomes.iter().filter(|(_, _, o, _)| o == "error").count();
         let mut s = format!("直近{}件: completed={}, no_action={}, error={}\n",
             total, total - no_action_count - error_count, no_action_count, error_count);
-        if no_action_count > 0 {
-            s.push_str("\n対応不要と判定されたメッセージ:\n");
-            for (repo_key, msg, _, _) in ops_outcomes.iter().filter(|(_, _, o, _)| o == "no_action") {
+        if !unique_no_actions.is_empty() {
+            s.push_str(&format!("\n対応不要のユニークパターン ({}件, 重複排除済み):\n", unique_no_actions.len()));
+            for (repo_key, msg, _, _) in &unique_no_actions {
                 s.push_str(&format!("- [{}] {}\n", repo_key,
                     crate::claude::truncate_str(msg, 80)));
             }
