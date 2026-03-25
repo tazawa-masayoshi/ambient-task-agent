@@ -12,6 +12,8 @@ tasks_cache_file = "/home/ec2-user/.config/wez-sidebar/tasks-cache.json"
 
 # Slack user ID → Asana 表示名マッピング（DM タスクフィルタ用）
 # 未登録ユーザーの DM では全タスクが表示される
+ops_admin_user = "U0700J8MN3W"
+
 [defaults.slack_user_map]
 U0700J8MN3W = "田澤雅義"
 W920CSQ04 = "佐々木直人"
@@ -37,6 +39,7 @@ project_gid = "1209044193035773"
 key = "hikken_schedule"
 github = "amu-tazawa-scripts/hikken_schedule"
 ops_channel = "必見自動化"
+ops_monitor = true
 ops_description = "必見パチ/スロの「▼サブカテ追加」「▼クローズ対応」指示のみ。障害報告・確認依頼・雑談はスコープ外"
 ops_skills = [".claude/skills/ops/SKILL.md"]
 
@@ -55,6 +58,14 @@ ops_monitor = true
 ops_mode = "plan"
 ops_description = "favorite_popの新規取材タイプ追加。YAML設定・テンプレート作成の定型作業"
 ops_skills = [".claude/skills/add-interview/SKILL.md"]
+
+[[repo]]
+key = "amu-tazawa-scripts"
+github = "amu-tazawa-scripts"
+ops_channel = "amz_企画チーム_自動化支援"
+ops_monitor = true
+ops_mode = "plan"
+ops_description = "上記スコープに該当しない汎用依頼。amu-tazawa-scripts モノリポ全体を対象とした調査・分析・作業計画"
 
 # ── 自己改善（self-improvement）──────────────
 [[repo]]

@@ -31,6 +31,9 @@ pub struct AgentRequest {
     pub json_schema: Option<String>,
     /// フォールバックモデル（--fallback-model）
     pub fallback_model: Option<String>,
+    /// --bare モード: hooks/LSP/plugin/CLAUDE.md自動検出をスキップ。
+    /// cwd が設定されている場合は自動的に --add-dir で CLAUDE.md を明示ロードする。
+    pub bare: bool,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -172,7 +175,7 @@ impl ClaudeCliBackend {
         // --verbose 時は JSON 配列が返る
         if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
             let parsed = Self::find_result_in_verbose(&items);
-            let is_error = parsed.as_ref().map_or(false, |p| p.is_error);
+            let is_error = parsed.as_ref().is_some_and(|p| p.is_error);
 
             // result フィールドを取得、空なら assistant テキストからフォールバック
             let mut stdout = parsed
@@ -330,6 +333,11 @@ impl AgentBackend for ClaudeCliBackend {
             "--no-chrome",
         ];
 
+        // --bare: hooks/plugin/CLAUDE.md自動検出をスキップ（ops 実行時のコンテキスト汚染防止）
+        if request.bare {
+            args.push("--bare");
+        }
+
         // セッション継続: --resume session_id
         if let Some(ref sid) = request.resume_session_id {
             args.extend(["--resume", sid]);
@@ -352,9 +360,18 @@ impl AgentBackend for ClaudeCliBackend {
             args.extend(["--fallback-model", fb]);
         }
 
+        // --bare + --add-dir: CLAUDE.md だけ明示的にロード（hooks はスキップ）
+        let add_dir_str;
         let mut cmd = Command::new("claude");
         // stdinからプロンプトを投入（長大プロンプトでの引数長制限を回避）
-        cmd.args(&args).arg("-");
+        cmd.args(&args);
+        if request.bare {
+            if let Some(ref dir) = request.cwd {
+                add_dir_str = dir.display().to_string();
+                cmd.args(["--add-dir", &add_dir_str]);
+            }
+        }
+        cmd.arg("-");
         if let Some(ref dir) = request.cwd {
             cmd.current_dir(dir);
         }
@@ -485,6 +502,8 @@ pub struct ClaudeRunner {
     json_schema: Option<String>,
     /// フォールバックモデル（Opus 過負荷時に自動切替）
     fallback_model: Option<String>,
+    /// --bare モード: hooks/plugin/CLAUDE.md自動検出をスキップ
+    bare: bool,
 }
 
 impl ClaudeRunner {
@@ -508,7 +527,15 @@ impl ClaudeRunner {
             resume_session_id: None,
             json_schema: None,
             fallback_model: None,
+            bare: false,
         }
+    }
+
+    /// --bare モード: hooks/LSP/plugin/CLAUDE.md自動検出をスキップ。
+    /// cwd が設定されていれば --add-dir で CLAUDE.md を明示ロードする。
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
     }
 
     /// JSON Schema を指定して構造化出力モードを有効化
@@ -667,6 +694,7 @@ impl ClaudeRunner {
             resume_session_id: self.resume_session_id.clone(),
             json_schema: self.json_schema.clone(),
             fallback_model: self.fallback_model.clone(),
+            bare: self.bare,
         };
 
         let backend = self.backend.as_ref()

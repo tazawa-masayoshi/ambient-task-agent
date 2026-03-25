@@ -3,6 +3,13 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [03/27 10:58, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
+- [03/27 09:00, end] -
+- [03/26 21:37, end] -
+- [03/26 18:00, end] -
+- [03/26 09:00, end] -
+- [03/25 18:00, end] -
+- [03/19 16:18, end] Implement the following plan:
 - [03/18 09:10, end] Implement the following plan:
 - [03/17 19:05, end] 2.1.77
 - [03/17 19:05, end] 2.1.77
@@ -26,10 +33,3 @@
 - [03/14 20:10, auto] ops/task統合設計 + Phase 1 部分実装（sisyphus workflow）
 - [03/14 19:49, auto] Implement the following plan:
 - [03/14 19:44, auto] Implement the following plan:
-- [03/13 18:00, end] -
-- [03/13 17:01, end] -
-- [03/13 14:54, auto] jj pull
-- [03/13 14:46, end] ## 前回の会話履歴
-- [03/13 14:41, end] ## 前回の会話履歴
-- [03/12 20:56, end] jj pull
-- [03/12 20:54, end] jj pull

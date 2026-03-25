@@ -28,6 +28,9 @@
 - Plan mode の `--resume` は session_id が Claude CLI の内部ID → 攻撃者がそのIDを知るには DB アクセスが必要、直接の外部入力経路はない
 - Bedrock バックエンド (`bedrock.rs`) に `bash -c <LLM生成コマンド>` が実装されている。`execute_ops_with_tools` では `allowed_tools("")` で無効化済みだが、他の呼び出しパスでは有効になりうる (Warning)
 - `OpsToolDispatcher`: LLM生成パラメータを `PARAM_xxx` 環境変数としてシェルスクリプトに渡す。値の長さ・内容バリデーションなし。シェルスクリプト側の実装に依存 (Warning)
+- `--bare` + `--add-dir` の追加 (claude.rs:368-372): `cmd.args(["--add-dir", &add_dir_str])` 経由で安全。ただし cwd は設定ファイル由来であることが前提 — 外部入力が cwd に入ると任意 CLAUDE.md ロードの経路になりうる (Warning)
+- `OPS_RESULT` マーカー判定 (runner_ops.rs:319-328): 全文検索のため、Slack 入力にマーカー文字列が含まれると LLM 出力に反射して is_no_action が偽装される可能性あり (Warning)。末尾 N 行のみ検索すると軽減可能。
+- `route_ops` プロンプト (runner_ops.rs:547-553): `item.message_text` を無加工埋め込み。ただし `json_schema` + `allowed_tools("")` で出力形式が `{"scope": N}` に制約されており実害は限定的 (Warning)
 
 ## Accepted Risks
 - subprocess `claude -p` はユーザー入力をプロンプトとして渡す。シェル展開なし (args()使用) のためコマンドインジェクションは非該当だが、プロンプトインジェクションは設計上の受容リスク
@@ -37,3 +40,4 @@
 - 過去に `/slack/actions` の署名検証なしを Critical と判定したが、今回確認したところ署名検証コードは実装済み（fail-open だが Critical ではなく Warning に降格）。Critical 判定には実際のコードを確認してから行う必要がある。
 - worktree 系の引数は設定ファイル / DB 由来が多く、ユーザー入力直接流入は少ない → コマンドインジェクション過剰検知に注意。
 - Socket Mode はクライアント側 WebSocket → cross-site WebSocket hijacking は構造的に非該当。openclaw 系の WebSocket 脆弱性をそのまま適用しないこと。
+- `json_schema` + `allowed_tools("")` の組み合わせはプロンプトインジェクションの実害を大きく限定する — ルーティング専用の LLM 呼び出しでこのパターンが使われている場合は Confidence を下げてよい。

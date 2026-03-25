@@ -412,9 +412,9 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                 tracing::info!("ops admin-mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
             }
-            // トップレベル + メンションなし → 自動分類
+            // トップレベル + メンションなし → 自動分類（admin の投稿は除外）
             (None, false) => {
-                if repo_entry.ops_monitor {
+                if repo_entry.ops_monitor && !is_admin {
                     enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
                 }
             }
@@ -996,8 +996,14 @@ fn enqueue_ops_request(
     status: &str,
 ) -> Result<()> {
     let event_json = serde_json::to_string(event).unwrap_or_default();
+    // 同一チャンネルに複数 repo がある場合は key を空にしてコンテンツルーティングに回す
+    let repo_key = if state.repos_config.has_multiple_ops_repos(channel) {
+        ""
+    } else {
+        &repo_entry.key
+    };
     let id = state.db.enqueue_ops(
-        channel, message_ts, thread_ts, &repo_entry.key, text, &event_json, status,
+        channel, message_ts, thread_ts, repo_key, text, &event_json, status,
     )?;
     tracing::info!("Enqueued ops item {} (status={}, channel={})", id, status, channel);
     state.wake_worker();

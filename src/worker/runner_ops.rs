@@ -314,9 +314,20 @@ impl Worker {
 
         // 通常モード（Execute / Plan）
         let is_plan_only = exec_mode == OpsExecMode::PlanOnly;
-        let is_no_action = output.contains("対応不要")
-            || output.contains("作業対象外")
-            || output.contains("スコープ外");
+        // OPS_RESULT マーカーで判定: 最終非空行のみ検査（本文中の誤検知を防止）。
+        // フォールバック: マーカーがない場合のみ、先頭200文字のキーワード検索。
+        let last_line = output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let is_no_action = if last_line.contains("OPS_RESULT: no_action") {
+            true
+        } else if last_line.contains("OPS_RESULT: completed") || last_line.contains("OPS_RESULT: failed") {
+            false
+        } else {
+            // レガシー: マーカーなし → 先頭部分のみでキーワード検索（誤検知防止）
+            let head: String = output.chars().take(200).collect();
+            head.contains("対応不要")
+                || head.contains("作業対象外")
+                || head.contains("スコープ外")
+        };
         let emoji = if is_no_action {
             ":information_source:"
         } else if is_plan_only {
@@ -550,6 +561,7 @@ impl Worker {
             .max_turns(1)
             .allowed_tools("")
             .json_schema(schema)
+            .bare()
             .log_dir(&log_dir)
             .with_context(&self.runner_ctx)
             .run()

@@ -29,10 +29,12 @@ const OPS_RULES: &str = "\
 
 ## 出力（重要）
 最後に必ずテキストで作業結果を出力すること。ツール操作だけで終了してはいけない。
-以下の形式で要約を出力:
-- 何を確認/実行したか
-- 結果（成功/失敗/対応不要）
-- 対応不要の場合はその理由";
+出力の最終行に必ず以下のステータスマーカーを付けること（これはシステムが自動解析する）:
+- 作業を実行した場合: `OPS_RESULT: completed`
+- 対応不要の場合: `OPS_RESULT: no_action`（理由も添えること）
+- 失敗した場合: `OPS_RESULT: failed`
+
+マーカーの前に作業内容の要約を記載すること。";
 
 const OPS_PLAN_RULES: &str = "\
 ## ルール
@@ -46,7 +48,12 @@ const OPS_PLAN_RULES: &str = "\
 日本語で箇条書きにまとめ、以下を含めること:
 - 問題の特定結果
 - 原因分析
-- 具体的な修正方針（対応不要の場合はその理由）";
+- 具体的な修正方針
+
+出力の最終行に必ず以下のステータスマーカーを付けること:
+- 分析完了: `OPS_RESULT: completed`
+- 対応不要: `OPS_RESULT: no_action`（理由も添えること）
+- 失敗: `OPS_RESULT: failed`";
 
 const OPS_INCEPTION_TURN1_RULES: &str = "\
 ## Inception モード — ターン1: Intent 分析と質問生成
@@ -348,6 +355,7 @@ pub async fn execute_ops(
         .max_turns(max_turns)
         .allowed_tools(tools)
         .cwd(repo_path)
+        .bare()  // hooks/plugin をスキップしてコンテキスト汚染を防止
         .optional_log_dir(log_dir)
         .with_context(runner_ctx)
         .run()
@@ -368,6 +376,7 @@ pub async fn execute_ops(
                 .max_turns(1)
                 .allowed_tools("") // ツールなし
                 .cwd(repo_path)
+                .bare()
                 .resume(sid)
                 .with_context(runner_ctx)
                 .run()

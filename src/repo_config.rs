@@ -236,6 +236,15 @@ impl ReposConfig {
             .find(|r| r.ops_channel.as_deref() == Some(channel))
     }
 
+    /// 同じ ops_channel に複数の repo がマッピングされているか
+    pub fn has_multiple_ops_repos(&self, channel: &str) -> bool {
+        self.repo
+            .iter()
+            .filter(|r| r.ops_channel.as_deref() == Some(channel))
+            .count()
+            > 1
+    }
+
     /// ops スキルが設定されている全リポジトリエントリを (index, entry) で返す
     pub fn get_all_ops_entries(&self) -> Vec<(usize, &RepoEntry)> {
         self.repo
