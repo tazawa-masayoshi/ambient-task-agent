@@ -561,7 +561,6 @@ impl Worker {
             .max_turns(1)
             .allowed_tools("")
             .json_schema(schema)
-            .bare()
             .log_dir(&log_dir)
             .with_context(&self.runner_ctx)
             .run()

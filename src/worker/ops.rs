@@ -355,7 +355,6 @@ pub async fn execute_ops(
         .max_turns(max_turns)
         .allowed_tools(tools)
         .cwd(repo_path)
-        .bare()  // hooks/plugin をスキップしてコンテキスト汚染を防止
         .optional_log_dir(log_dir)
         .with_context(runner_ctx)
         .run()
@@ -376,7 +375,6 @@ pub async fn execute_ops(
                 .max_turns(1)
                 .allowed_tools("") // ツールなし
                 .cwd(repo_path)
-                .bare()
                 .resume(sid)
                 .with_context(runner_ctx)
                 .run()
