@@ -224,10 +224,29 @@ impl Worker {
         };
 
         let dl_dir_ref = ops_download_dir.as_deref();
+
+        // ストリーミング進捗: tool_use イベントを Slack スレッドに投稿（2秒デバウンス済み）
+        let progress_slack = self.slack.clone();
+        let progress_channel = item.channel.clone();
+        let progress_ts = reply_ts.to_string();
+        let progress_cb: crate::claude::ProgressCallback = std::sync::Arc::new(move |event| {
+            match event {
+                crate::claude::ProgressEvent::ToolUse(tool_name) => {
+                    let slack = progress_slack.clone();
+                    let channel = progress_channel.clone();
+                    let ts = progress_ts.clone();
+                    let msg = format!(":wrench: `{}`", tool_name);
+                    tokio::spawn(async move {
+                        slack.reply_thread(&channel, &ts, &msg).await.ok();
+                    });
+                }
+            }
+        });
+
         let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
-            exec_mode,
+            exec_mode, Some(progress_cb),
         ).await;
 
         Ok(OpsExecutionResult { output, exec_mode })

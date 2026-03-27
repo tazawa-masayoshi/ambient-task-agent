@@ -3,6 +3,7 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [03/27 14:42, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
 - [03/27 13:26, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
 - [03/27 10:58, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
 - [03/27 09:00, end] -
@@ -32,4 +33,3 @@
 - [03/14 20:45, auto] Implement the following plan:
 - [03/14 20:15, end] ops/task 統合設計（Symphony/Devin 型） + claude -p 改善 + 土日除外
 - [03/14 20:10, auto] ops/task統合設計 + Phase 1 部分実装（sisyphus workflow）
-- [03/14 19:49, auto] Implement the following plan:

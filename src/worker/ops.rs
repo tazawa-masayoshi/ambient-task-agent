@@ -316,6 +316,7 @@ pub async fn execute_ops(
     history: &[OpsMessage],
     download_dir: Option<&str>,
     exec_mode: OpsExecMode,
+    progress: Option<crate::claude::ProgressCallback>,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
 
@@ -350,15 +351,17 @@ pub async fn execute_ops(
 
     let prompt = build_ops_prompt(req, history, download_dir);
 
-    let result = ClaudeRunner::new("ops", &prompt)
+    let mut runner = ClaudeRunner::new("ops", &prompt)
         .system_prompt(&system_prompt)
         .max_turns(max_turns)
         .allowed_tools(tools)
         .cwd(repo_path)
         .optional_log_dir(log_dir)
-        .with_context(runner_ctx)
-        .run()
-        .await?;
+        .with_context(runner_ctx);
+    if let Some(cb) = progress {
+        runner = runner.on_progress(cb);
+    }
+    let result = runner.run().await?;
 
     if !result.success {
         anyhow::bail!("claude -p ops failed: {}", result.error_output());

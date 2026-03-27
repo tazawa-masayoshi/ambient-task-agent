@@ -16,6 +16,17 @@ const MAX_LOG_FILES: usize = 100;
 // ============================================================================
 
 /// LLM バックエンドに渡すリクエスト
+/// ストリーミング進捗コールバック（tool_use イベント等を通知）
+pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// ストリーミング進捗イベント
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ProgressEvent {
+    /// ツール使用中（ツール名）
+    ToolUse(String),
+}
+
 pub struct AgentRequest {
     pub prompt: String,
     pub system_prompt: Option<String>,
@@ -31,6 +42,8 @@ pub struct AgentRequest {
     pub json_schema: Option<String>,
     /// フォールバックモデル（--fallback-model）
     pub fallback_model: Option<String>,
+    /// ストリーミング進捗コールバック（設定すると stream-json モードで実行）
+    pub progress: Option<ProgressCallback>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -65,6 +78,27 @@ impl TokenUsage {
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
     }
+}
+
+/// `claude -p --output-format stream-json` の NDJSON イベント
+#[derive(Debug, Deserialize)]
+struct StreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    /// tool_use イベント時のツール名
+    tool_name: Option<String>,
+    /// result イベント時の最終出力
+    result: Option<String>,
+    /// json-schema 使用時の構造化出力
+    structured_output: Option<serde_json::Value>,
+    #[serde(default)]
+    is_error: bool,
+    /// result イベント時の使用量
+    usage: Option<ClaudeJsonUsage>,
+    total_cost_usd: Option<f64>,
+    session_id: Option<String>,
+    #[allow(dead_code)]
+    num_turns: Option<u32>,
 }
 
 /// `claude -p --output-format json` のレスポンス構造体
@@ -313,6 +347,130 @@ impl ClaudeCliBackend {
             }
         }
     }
+
+    /// ストリーミングモード: stdout を NDJSON として行単位で読み、進捗を通知
+    async fn execute_streaming(
+        &self,
+        mut child: tokio::process::Child,
+        progress: Option<ProgressCallback>,
+        max_output_bytes: Option<usize>,
+        timeout_dur: std::time::Duration,
+        start: std::time::Instant,
+    ) -> Result<AgentOutput> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let stdout = child.stdout.take().context("Failed to take stdout")?;
+        let mut reader = BufReader::new(stdout).lines();
+
+        let mut last_progress = std::time::Instant::now();
+        let debounce = std::time::Duration::from_secs(2);
+        let mut final_result = String::new();
+        let mut final_error = false;
+        let mut usage: Option<TokenUsage> = None;
+        let mut cost_usd: Option<f64> = None;
+        let mut session_id: Option<String> = None;
+
+        let read_lines = async {
+            while let Some(line) = reader.next_line().await? {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<StreamEvent>(&line) {
+                    match event.event_type.as_str() {
+                        "tool_use" => {
+                            if let (Some(ref cb), Some(ref name)) = (&progress, &event.tool_name) {
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_progress) >= debounce {
+                                    cb(ProgressEvent::ToolUse(name.clone()));
+                                    last_progress = now;
+                                }
+                            }
+                        }
+                        "assistant" => {
+                            // assistant テキストの最後のものを保持
+                            // stream-json では部分テキストが来ることがある
+                        }
+                        "result" => {
+                            if let Some(ref so) = event.structured_output {
+                                final_result = serde_json::to_string(so).unwrap_or_default();
+                            } else {
+                                final_result = event.result.unwrap_or_default();
+                            }
+                            final_error = event.is_error;
+                            usage = event.usage.map(|u| TokenUsage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                cache_creation_input_tokens: u.cache_creation_input_tokens,
+                                cache_read_input_tokens: u.cache_read_input_tokens,
+                            });
+                            cost_usd = event.total_cost_usd;
+                            session_id = event.session_id;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            anyhow::Ok(())
+        };
+
+        match tokio::time::timeout(timeout_dur, read_lines).await {
+            Ok(result) => { result.ok(); }
+            Err(_) => {
+                return Ok(AgentOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!("Process timed out after {}s", timeout_dur.as_secs()),
+                    duration: start.elapsed(),
+                    truncated: false,
+                    usage: None,
+                    cost_usd: None,
+                    session_id: None,
+                });
+            }
+        }
+
+        // child の終了を待つ
+        let _ = child.wait().await;
+        let duration = start.elapsed();
+
+        if let Some(ref u) = usage {
+            tracing::info!(
+                "Claude CLI usage: in={} out={} cache_create={} cache_read={} total={}",
+                u.input_tokens, u.output_tokens,
+                u.cache_creation_input_tokens, u.cache_read_input_tokens,
+                u.total(),
+            );
+        }
+        if let Some(cost) = cost_usd {
+            tracing::info!("Claude CLI cost: ${:.6}", cost);
+        }
+
+        let truncated = if let Some(max_bytes) = max_output_bytes {
+            if final_result.len() > max_bytes {
+                let total = final_result.len();
+                let safe_end = truncate_str(&final_result, max_bytes).len();
+                final_result.truncate(safe_end);
+                final_result.push_str(&format!("\n[truncated, {} total bytes]", total));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        Ok(AgentOutput {
+            success: !final_error,
+            stdout: final_result,
+            stderr: String::new(),
+            duration,
+            truncated,
+            usage,
+            cost_usd,
+            session_id,
+        })
+    }
 }
 
 #[async_trait]
@@ -321,10 +479,12 @@ impl AgentBackend for ClaudeCliBackend {
         let turns_str = request.max_turns.to_string();
 
         // OpenFang/PicoClaw 参考: -p + JSON出力 + 権限スキップ + UI無効化
+        let is_streaming = request.progress.is_some();
+        let output_format = if is_streaming { "stream-json" } else { "json" };
         // --verbose: Claude Code #36632 回避策（result が空になるバグ対策）
         let mut args = vec![
             "-p",
-            "--output-format", "json",
+            "--output-format", output_format,
             "--verbose",
             "--dangerously-skip-permissions",
             "--no-chrome",
@@ -388,6 +548,15 @@ impl AgentBackend for ClaudeCliBackend {
             let _ = stdin.write_all(request.prompt.as_bytes()).await;
         }
 
+        // ストリーミングモード: stdout を行単位で読んで進捗通知
+        if is_streaming {
+            return self.execute_streaming(
+                child, request.progress, request.max_output_bytes,
+                timeout_dur, start,
+            ).await;
+        }
+
+        // 非ストリーミングモード: 従来通り wait_with_output
         let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
             Ok(result) => result.context("Failed to execute claude -p")?,
             Err(_) => {
@@ -487,6 +656,8 @@ pub struct ClaudeRunner {
     json_schema: Option<String>,
     /// フォールバックモデル（Opus 過負荷時に自動切替）
     fallback_model: Option<String>,
+    /// ストリーミング進捗コールバック
+    progress: Option<ProgressCallback>,
 }
 
 impl ClaudeRunner {
@@ -510,7 +681,14 @@ impl ClaudeRunner {
             resume_session_id: None,
             json_schema: None,
             fallback_model: None,
+            progress: None,
         }
+    }
+
+    /// ストリーミング進捗コールバックを設定（stream-json モードで実行）
+    pub fn on_progress(mut self, cb: ProgressCallback) -> Self {
+        self.progress = Some(cb);
+        self
     }
 
     /// JSON Schema を指定して構造化出力モードを有効化
@@ -669,6 +847,7 @@ impl ClaudeRunner {
             resume_session_id: self.resume_session_id.clone(),
             json_schema: self.json_schema.clone(),
             fallback_model: self.fallback_model.clone(),
+            progress: self.progress.clone(),
         };
 
         let backend = self.backend.as_ref()
