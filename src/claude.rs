@@ -366,6 +366,8 @@ impl AgentBackend for ClaudeCliBackend {
                 cmd.env(key, val);
             }
         }
+        // o-m-cc hooks をスキップ（session-resume, stop-guard, memory-digest 等）
+        cmd.env("CLAUDE_HEADLESS", "1");
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
