@@ -2,13 +2,20 @@
 
 > セッション間の引き継ぎ情報。学びは MEMORY.md、タスクは TaskList、設定は CLAUDE.md。
 
-### Snapshot (03/30 11:17, end)
+### Snapshot (03/31 12:33, end)
 
 **Intent:** Implement the following plan:
+
+**Next:**
+- claude codeを使うのではなく
+- 専用のエージェントハーネスを作る方向で
+- 次のセッションで計画をたてるか
 
 **Outcomes:** 15 files changed
 
 **Changed Files:**
+- `/Users/tazawa-masayoshi/.claude/projects/-Users-tazawa-masayoshi-Documents-personal-dev-ambient-task-agent/memory/MEMORY.md`
+- `/Users/tazawa-masayoshi/.claude/projects/-Users-tazawa-masayoshi-Documents-personal-dev-ambient-task-agent/memory/project_harness_migration.md`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/CHANGELOG.md`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/CLAUDE.md`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/config/repos.toml`
@@ -22,6 +29,4 @@
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/repo_config.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_actions.rs`
 - `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/server/slack_events.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/ops.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/worker/runner_ops.rs`
 

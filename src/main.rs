@@ -1,3 +1,4 @@
+mod anthropic;
 mod asana;
 mod claude;
 mod config;
@@ -487,7 +488,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         registry: registry.clone(),
         hooks: hooks.clone(),
         resolved_env,
-        backend: std::sync::Arc::new(claude::ClaudeCliBackend),
+        backend: build_agent_backend(),
     };
 
     if slack_config.signing_secret.is_none() {
@@ -562,4 +563,32 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
 
     // HTTP サーバー起動
     server::http::run_server(app_state, port).await
+}
+
+/// AGENT_BACKEND 環境変数で LLM バックエンドを切り替え
+/// - "cli" → claude -p (ClaudeCliBackend)
+/// - それ以外 or 未設定 → Anthropic API 直叩き (AnthropicApiBackend)
+fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
+    let backend_type = std::env::var("AGENT_BACKEND").unwrap_or_default();
+    if backend_type == "cli" {
+        tracing::info!("Using ClaudeCliBackend (AGENT_BACKEND=cli)");
+        return std::sync::Arc::new(claude::ClaudeCliBackend);
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        tracing::warn!(
+            "ANTHROPIC_API_KEY not set, falling back to ClaudeCliBackend"
+        );
+        return std::sync::Arc::new(claude::ClaudeCliBackend);
+    }
+
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+
+    tracing::info!(
+        "Using AnthropicApiBackend (model={})",
+        model
+    );
+    std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::new(api_key, model))
 }
