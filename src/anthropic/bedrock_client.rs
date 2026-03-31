@@ -141,22 +141,20 @@ impl BedrockClient {
         {
             match event {
                 br::ConverseStreamOutput::ContentBlockStart(e) => {
-                    if let Some(start) = e.start() {
-                        match start {
-                            br::ContentBlockStart::ToolUse(tool) => {
-                                if let Some(ref cb) = on_tool_use {
-                                    cb(tool.name());
-                                }
-                                current_tool_id = tool.tool_use_id().to_string();
-                                current_tool_name = tool.name().to_string();
-                                current_json_parts.clear();
-                                current_block_type = Some(BlockType::ToolUse);
+                    match e.start() {
+                        Some(br::ContentBlockStart::ToolUse(tool)) => {
+                            if let Some(ref cb) = on_tool_use {
+                                cb(tool.name());
                             }
-                            _ => {
-                                // Text ブロック開始
-                                current_text.clear();
-                                current_block_type = Some(BlockType::Text);
-                            }
+                            current_tool_id = tool.tool_use_id().to_string();
+                            current_tool_name = tool.name().to_string();
+                            current_json_parts.clear();
+                            current_block_type = Some(BlockType::ToolUse);
+                        }
+                        _ => {
+                            // Text ブロック開始（start が None またはその他の場合）
+                            current_text.clear();
+                            current_block_type = Some(BlockType::Text);
                         }
                     }
                 }
@@ -164,6 +162,11 @@ impl BedrockClient {
                     if let Some(delta) = e.delta() {
                         match delta {
                             br::ContentBlockDelta::Text(text) => {
+                                // ContentBlockStart なしで Text delta が来る場合がある
+                                if current_block_type.is_none() {
+                                    current_text.clear();
+                                    current_block_type = Some(BlockType::Text);
+                                }
                                 current_text.push_str(text);
                             }
                             br::ContentBlockDelta::ToolUse(d) => {

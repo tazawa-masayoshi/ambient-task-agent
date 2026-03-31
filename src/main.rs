@@ -613,3 +613,49 @@ async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
         }
     }
 }
+
+#[cfg(test)]
+mod bedrock_smoke {
+    use crate::anthropic::bedrock_client::BedrockClient;
+    use crate::anthropic::llm_client::LlmClient;
+    use crate::anthropic::types::*;
+
+    #[tokio::test]
+    async fn test_bedrock_converse() {
+        if std::env::var("BEDROCK_SMOKE").is_err() {
+            return;
+        }
+        let model = std::env::var("BEDROCK_MODEL")
+            .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string());
+        let client = BedrockClient::new("us-east-1", model.clone())
+            .await
+            .unwrap();
+        let req = MessagesRequest {
+            model,
+            max_tokens: 50,
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "Say hello in one word.".into(),
+                }],
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+        };
+        let resp = client.send_streaming(req, None).await.unwrap();
+        println!("Stop reason: {:?}", resp.stop_reason);
+        println!("Content blocks: {}", resp.content.len());
+        println!("Content: {:?}", resp.content);
+        assert!(!resp.content.is_empty(), "Response content should not be empty");
+        match &resp.content[0] {
+            ContentBlock::Text { text } => println!("Bedrock response: {}", text),
+            other => println!("Bedrock response: {:?}", other),
+        }
+        println!(
+            "Usage: in={} out={}",
+            resp.usage.input_tokens, resp.usage.output_tokens
+        );
+    }
+}
