@@ -193,7 +193,49 @@ impl Worker {
         if let Err(e) = self.db.append_ops_context(&item.channel, reply_ts, &item.repo_key, "user", &message_text) {
             tracing::warn!("Failed to save ops context (user): {}", e);
         }
-        let history = self.db.get_ops_context(&item.channel, reply_ts)?;
+        let mut history = self.db.get_ops_context(&item.channel, reply_ts)?;
+
+        // Slack スレッドの全メッセージを取得してコンテキストに追加
+        if let Some(thread_ts) = item.thread_ts.as_deref() {
+            match slack.fetch_thread_replies(&item.channel, thread_ts).await {
+                Ok(replies) => {
+                    let thread_messages: Vec<crate::db::OpsMessage> = replies
+                        .iter()
+                        .filter_map(|msg| {
+                            let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            if text.is_empty() {
+                                return None;
+                            }
+                            let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                            // bot 自身のメッセージは除外（既に history に含まれる）
+                            let is_bot = msg.get("bot_id").is_some()
+                                || msg.get("subtype").and_then(|s| s.as_str()) == Some("bot_message");
+                            let role = if is_bot { "assistant" } else { "user" };
+                            Some(crate::db::OpsMessage {
+                                role: role.to_string(),
+                                content: text.to_string(),
+                                created_at: ts.to_string(),
+                            })
+                        })
+                        .collect();
+                    if !thread_messages.is_empty() {
+                        tracing::info!(
+                            "ops item {}: loaded {} Slack thread messages as context",
+                            item.id,
+                            thread_messages.len()
+                        );
+                        // Slack スレッド履歴を ops_contexts 履歴の前に挿入
+                        // （スレッド全体が文脈、ops_contexts はエージェント内部履歴）
+                        let mut merged = thread_messages;
+                        merged.extend(history);
+                        history = merged;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch Slack thread replies for ops {}: {}", item.id, e);
+                }
+            }
+        }
 
         let ops_skills = repo_entry.ops_skills.clone().unwrap_or_default();
         let ops_download_dir = repo_entry.ops_download_dir.clone();
@@ -225,28 +267,10 @@ impl Worker {
 
         let dl_dir_ref = ops_download_dir.as_deref();
 
-        // ストリーミング進捗: tool_use イベントを Slack スレッドに投稿（2秒デバウンス済み）
-        let progress_slack = self.slack.clone();
-        let progress_channel = item.channel.clone();
-        let progress_ts = reply_ts.to_string();
-        let progress_cb: crate::claude::ProgressCallback = std::sync::Arc::new(move |event| {
-            match event {
-                crate::claude::ProgressEvent::ToolUse(tool_name) => {
-                    let slack = progress_slack.clone();
-                    let channel = progress_channel.clone();
-                    let ts = progress_ts.clone();
-                    let msg = format!(":wrench: `{}`", tool_name);
-                    tokio::spawn(async move {
-                        slack.reply_thread(&channel, &ts, &msg).await.ok();
-                    });
-                }
-            }
-        });
-
         let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
-            exec_mode, Some(progress_cb),
+            exec_mode, None,
         ).await;
 
         Ok(OpsExecutionResult { output, exec_mode })

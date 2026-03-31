@@ -38,6 +38,8 @@ struct MessageInfo {
     ts: String,
     #[serde(default)]
     thread_ts: Option<String>,
+    #[serde(default)]
+    blocks: Option<Vec<serde_json::Value>>,
 }
 
 /// POST /slack/actions — Slack Block Kit interactivity endpoint
@@ -99,7 +101,11 @@ pub async fn handle_slack_action(
         .message
         .as_ref()
         .and_then(|m| m.thread_ts.clone());
-    let user_id = payload.user.map(|u| u.id);
+    let user_id = payload.user.as_ref().map(|u| u.id.clone());
+    let message_blocks = payload
+        .message
+        .as_ref()
+        .and_then(|m| m.blocks.clone());
 
     // 非同期で処理
     let state_clone = state.clone();
@@ -113,6 +119,7 @@ pub async fn handle_slack_action(
             message_ts.as_deref(),
             thread_ts.as_deref(),
             user_id.as_deref(),
+            message_blocks.as_deref(),
         )
         .await
         {
@@ -157,6 +164,10 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
         .as_ref()
         .and_then(|m| m.thread_ts.as_deref());
     let user_id = action_payload.user.as_ref().map(|u| u.id.as_str());
+    let message_blocks = action_payload
+        .message
+        .as_ref()
+        .and_then(|m| m.blocks.clone());
 
     process_action(
         state,
@@ -166,10 +177,12 @@ pub async fn dispatch_action(state: &AppState, payload: &serde_json::Value) -> a
         message_ts,
         thread_ts,
         user_id,
+        message_blocks.as_deref(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_action(
     state: &AppState,
     action_id: &str,
@@ -178,10 +191,12 @@ async fn process_action(
     message_ts: Option<&str>,
     thread_ts: Option<&str>,
     user_id: Option<&str>,
+    message_blocks: Option<&[serde_json::Value]>,
 ) -> anyhow::Result<()> {
     // ops 系アクションは task_id ではなく ops_queue の id を使う
     if action_id == "ops_resolve" {
-        return process_ops_resolve(state, action_value, channel, message_ts).await;
+        return process_ops_resolve(state, action_value, channel, message_ts, message_blocks)
+            .await;
     }
     if action_id == "ops_escalate" {
         return process_ops_escalate(state, action_value, channel, message_ts, thread_ts).await;
@@ -439,6 +454,7 @@ async fn process_ops_resolve(
     action_value: &str,
     channel: &str,
     message_ts: Option<&str>,
+    original_blocks: Option<&[serde_json::Value]>,
 ) -> anyhow::Result<()> {
     let ops_id: i64 = action_value
         .parse()
@@ -447,18 +463,36 @@ async fn process_ops_resolve(
     state.db.resolve_ops(ops_id)?;
     tracing::info!("ops item {} resolved via button", ops_id);
 
-    // ボタンを除去してメッセージを更新
+    // 元のメッセージを残しつつ、ボタンを完了ラベルに置き換え
     if let Some(msg_ts) = message_ts {
         let slack = state.slack_client();
-        let updated_blocks = serde_json::json!([
-            {
+
+        let updated_blocks = if let Some(blocks) = original_blocks {
+            // 元のブロックから actions を除去し、完了ラベルを追加
+            let mut new_blocks: Vec<serde_json::Value> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("actions"))
+                .cloned()
+                .collect();
+            new_blocks.push(serde_json::json!({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: 対応完了"
+                }]
+            }));
+            serde_json::Value::Array(new_blocks)
+        } else {
+            // フォールバック: 元のブロックが取得できない場合
+            serde_json::json!([{
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": ":white_check_mark: *対応完了*"
                 }
-            }
-        ]);
+            }])
+        };
+
         slack
             .update_blocks(channel, msg_ts, &updated_blocks, "対応完了")
             .await
