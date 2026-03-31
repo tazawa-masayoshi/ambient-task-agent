@@ -3,6 +3,8 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [03/31 13:30, end] claude -p 脱却 — Anthropic API 直叩き Rust エージェントハーネス実装
+- [03/31 13:30, end] Anthropic API 直叩きハーネス実装 + Bash safeguard + pi-mono extensions 調査
 - [03/31 12:32, end] Implement the following plan:
 - [03/30 14:04, end] Implement the following plan:
 - [03/30 11:17, end] Implement the following plan:
@@ -31,5 +33,3 @@
 - [03/16 16:30, end] ⏺ EC2 でのテスト項目:
 - [03/16 15:48, end] ⏺ EC2 でのテスト項目:
 - [03/16 14:31, end] ## 前回の会話履歴
-- [03/14 20:46, auto] Implement the following plan:
-- [03/14 20:46, auto] Implement the following plan:
