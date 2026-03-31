@@ -170,7 +170,7 @@ impl Worker {
         let slack = self.slack.clone();
 
         // ファイルダウンロード
-        let files = super::ops::extract_slack_files_from_json(&event);
+        let mut files = super::ops::extract_slack_files_from_json(&event);
         let repo_path = self.repos_config.repo_local_path(repo_entry);
         if !files.is_empty() {
             if let Some(ref dl_dir) = repo_entry.ops_download_dir {
@@ -207,7 +207,6 @@ impl Worker {
                                 return None;
                             }
                             let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                            // bot 自身のメッセージは除外（既に history に含まれる）
                             let is_bot = msg.get("bot_id").is_some()
                                 || msg.get("subtype").and_then(|s| s.as_str()) == Some("bot_message");
                             let role = if is_bot { "assistant" } else { "user" };
@@ -224,11 +223,35 @@ impl Worker {
                             item.id,
                             thread_messages.len()
                         );
-                        // Slack スレッド履歴を ops_contexts 履歴の前に挿入
-                        // （スレッド全体が文脈、ops_contexts はエージェント内部履歴）
                         let mut merged = thread_messages;
                         merged.extend(history);
                         history = merged;
+                    }
+
+                    // スレッド内の全メッセージから添付ファイルをダウンロード
+                    if let Some(ref dl_dir) = repo_entry.ops_download_dir {
+                        let download_dir = repo_path.join(dl_dir);
+                        for msg in &replies {
+                            let thread_files = super::ops::extract_slack_files_from_json(msg);
+                            for f in &thread_files {
+                                let safe_name = std::path::Path::new(&f.name)
+                                    .file_name()
+                                    .unwrap_or_else(|| std::ffi::OsStr::new("download"));
+                                let dest = download_dir.join(safe_name);
+                                if dest.exists() {
+                                    continue; // 既にダウンロード済み
+                                }
+                                match slack.download_file(&f.url_private_download, &dest).await {
+                                    Ok(()) => {
+                                        tracing::info!("Downloaded thread file: {} → {}", f.name, dest.display());
+                                        files.push(f.clone());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to download thread file {}: {}", f.name, e);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {

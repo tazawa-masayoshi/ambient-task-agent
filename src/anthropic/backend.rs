@@ -10,6 +10,7 @@ use super::bedrock_client::BedrockClient;
 use super::client::AnthropicClient;
 use super::llm_client::LlmClient;
 use super::mcp::McpManager;
+use super::oauth::OAuthManager;
 use super::tools::build_tool_definitions;
 
 /// Anthropic Messages API を直接叩くバックエンド
@@ -22,6 +23,14 @@ impl AnthropicApiBackend {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             client: Arc::new(AnthropicClient::new(api_key)),
+            model,
+        }
+    }
+
+    /// Claude Code Max プランの OAuth 認証で初期化
+    pub fn with_oauth(oauth: Arc<OAuthManager>, model: String) -> Self {
+        Self {
+            client: Arc::new(AnthropicClient::with_oauth(oauth)),
             model,
         }
     }

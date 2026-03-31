@@ -568,7 +568,8 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
 /// AGENT_BACKEND 環境変数で LLM バックエンドを切り替え
 /// - "cli"     → claude -p (ClaudeCliBackend)
 /// - "bedrock" → AWS Bedrock Converse API (BedrockBackend)
-/// - それ以外  → Anthropic API 直叩き (AnthropicApiBackend)
+/// - "max"     → Claude Code Max プランの OAuth 認証 (AnthropicApiBackend)
+/// - それ以外  → Anthropic API キー認証 (AnthropicApiBackend)
 async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
     let backend_type = std::env::var("AGENT_BACKEND").unwrap_or_default();
 
@@ -576,6 +577,27 @@ async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
         "cli" => {
             tracing::info!("Using ClaudeCliBackend (AGENT_BACKEND=cli)");
             std::sync::Arc::new(claude::ClaudeCliBackend)
+        }
+        "max" => {
+            let model = std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+            match anthropic::oauth::OAuthManager::load() {
+                Ok(oauth) => {
+                    tracing::info!(
+                        "Using AnthropicApiBackend with Max OAuth (model={})",
+                        model
+                    );
+                    std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::with_oauth(
+                        std::sync::Arc::new(oauth),
+                        model,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load OAuth credentials: {}", e);
+                    tracing::warn!("Falling back to ClaudeCliBackend");
+                    std::sync::Arc::new(claude::ClaudeCliBackend)
+                }
+            }
         }
         "bedrock" => {
             let region = std::env::var("AWS_REGION")
@@ -652,6 +674,53 @@ mod bedrock_smoke {
         match &resp.content[0] {
             ContentBlock::Text { text } => println!("Bedrock response: {}", text),
             other => println!("Bedrock response: {:?}", other),
+        }
+        println!(
+            "Usage: in={} out={}",
+            resp.usage.input_tokens, resp.usage.output_tokens
+        );
+    }
+}
+
+#[cfg(test)]
+mod oauth_smoke {
+    use std::sync::Arc;
+
+    use crate::anthropic::client::AnthropicClient;
+    use crate::anthropic::llm_client::LlmClient;
+    use crate::anthropic::oauth::OAuthManager;
+    use crate::anthropic::types::*;
+
+    #[tokio::test]
+    async fn test_oauth_max_plan() {
+        if std::env::var("OAUTH_SMOKE").is_err() {
+            return;
+        }
+        let oauth = Arc::new(OAuthManager::load().expect("Failed to load OAuth credentials"));
+        let client = AnthropicClient::with_oauth(oauth);
+        let model = std::env::var("ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let req = MessagesRequest {
+            model,
+            max_tokens: 50,
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "Say hello in one word.".into(),
+                }],
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+        };
+        let resp = client.send_streaming(req, None).await.unwrap();
+        println!("Stop reason: {:?}", resp.stop_reason);
+        println!("Content: {:?}", resp.content);
+        assert!(!resp.content.is_empty(), "Response should have content");
+        match &resp.content[0] {
+            ContentBlock::Text { text } => println!("OAuth response: {}", text),
+            other => println!("OAuth response: {:?}", other),
         }
         println!(
             "Usage: in={} out={}",

@@ -486,6 +486,7 @@ impl AgentBackend for ClaudeCliBackend {
         let is_streaming = request.progress.is_some();
         let output_format = if is_streaming { "stream-json" } else { "json" };
         // --verbose: Claude Code #36632 回避策（result が空になるバグ対策）
+        let model_env = std::env::var("CLAUDE_CLI_MODEL").unwrap_or_default();
         let mut args = vec![
             "-p",
             "--output-format", output_format,
@@ -493,6 +494,11 @@ impl AgentBackend for ClaudeCliBackend {
             "--dangerously-skip-permissions",
             "--no-chrome",
         ];
+
+        // モデル指定（CLAUDE_CLI_MODEL 環境変数）
+        if !model_env.is_empty() {
+            args.extend(["--model", &model_env]);
+        }
 
         // セッション継続: --resume session_id
         if let Some(ref sid) = request.resume_session_id {

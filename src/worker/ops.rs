@@ -146,6 +146,7 @@ pub struct OpsRequest {
     pub files: Vec<SlackFile>,
 }
 
+#[derive(Clone)]
 pub struct SlackFile {
     pub name: String,
     pub url_private_download: String,

@@ -42,6 +42,7 @@ ops_channel = "必見自動化"
 ops_monitor = true
 ops_description = "必見パチ/スロの「▼サブカテ追加」「▼クローズ対応」指示のみ。障害報告・確認依頼・雑談はスコープ外"
 ops_skills = [".claude/commands/ops.md"]
+ops_download_dir = "images"
 
 [[repo]]
 key = "send_survey_mail"

@@ -1,34 +1,63 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
 use super::llm_client::{LlmClient, OnToolUseCallback};
+use super::oauth::OAuthManager;
 use super::types::*;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const MAX_RETRIES: u32 = 3;
 
+/// 認証方式
+enum AuthMode {
+    ApiKey(String),
+    OAuth(Arc<OAuthManager>),
+}
+
 pub struct AnthropicClient {
     http: reqwest::Client,
-    api_key: String,
+    auth: AuthMode,
     base_url: String,
 }
 
 impl AnthropicClient {
+    /// API キー認証で初期化
     pub fn new(api_key: String) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key,
+            auth: AuthMode::ApiKey(api_key),
             base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
 
-    fn headers(&self) -> HeaderMap {
+    /// OAuth 認証（Claude Code Max プラン）で初期化
+    pub fn with_oauth(oauth: Arc<OAuthManager>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            auth: AuthMode::OAuth(oauth),
+            base_url: DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
+    async fn headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        if let Ok(val) = HeaderValue::from_str(&self.api_key) {
-            headers.insert("x-api-key", val);
+        match &self.auth {
+            AuthMode::ApiKey(key) => {
+                if let Ok(val) = HeaderValue::from_str(key) {
+                    headers.insert("x-api-key", val);
+                }
+            }
+            AuthMode::OAuth(oauth) => {
+                let token = oauth.access_token().await?;
+                if let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+                    headers.insert("authorization", val);
+                }
+            }
         }
         headers.insert(
             "anthropic-version",
@@ -40,7 +69,7 @@ impl AnthropicClient {
             "anthropic-beta",
             HeaderValue::from_static("prompt-caching-2024-07-31"),
         );
-        headers
+        Ok(headers)
     }
 
     /// 非ストリーミング呼び出し
@@ -54,10 +83,11 @@ impl AnthropicClient {
                 tracing::info!("Anthropic API retry attempt {}/{}", attempt, MAX_RETRIES);
             }
 
+            let headers = self.headers().await?;
             let resp = self
                 .http
                 .post(&url)
-                .headers(self.headers())
+                .headers(headers)
                 .json(&request)
                 .send()
                 .await
@@ -113,10 +143,11 @@ impl LlmClient for AnthropicClient {
                 tracing::info!("Anthropic API retry attempt {}/{}", attempt, MAX_RETRIES);
             }
 
+            let headers = self.headers().await?;
             let resp = self
                 .http
                 .post(&url)
-                .headers(self.headers())
+                .headers(headers)
                 .json(&request)
                 .send()
                 .await

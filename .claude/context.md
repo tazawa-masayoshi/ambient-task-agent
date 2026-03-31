@@ -2,31 +2,26 @@
 
 > セッション間の引き継ぎ情報。学びは MEMORY.md、タスクは TaskList、設定は CLAUDE.md。
 
-### Snapshot (03/31 14:29, end)
+### Snapshot (03/31 21:24, end)
 
-**Intent:** https://zenn.dev/omniwired/articles/2640a8301dd9c4
-
-**Next:**
-- そうかここでskillが出てくるか
-- なるほどねいいね忘れていた
-- そしたらこの方向でまずtool(mcp)を増やそう
+**Intent:** jj git pull
 
 **Outcomes:** 15 files changed
 
 **Changed Files:**
-- `/Users/tazawa-masayoshi/.claude/plans/clever-sprouting-moonbeam.md`
-- `/Users/tazawa-masayoshi/.claude/projects/-Users-tazawa-masayoshi-Documents-personal-dev-ambient-task-agent/memory/MEMORY.md`
-- `/Users/tazawa-masayoshi/.claude/projects/-Users-tazawa-masayoshi-Documents-personal-dev-ambient-task-agent/memory/project_harness_migration.md`
-- `/Users/tazawa-masayoshi/.claude/projects/-Users-tazawa-masayoshi-Documents-personal-dev-ambient-task-agent/memory/project_mcp_tools.md`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/chronicle.md`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/.claude/context.md`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/Cargo.toml`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/agent_loop.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/backend.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/client.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/context.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/mod.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/tool_impls.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/tools.rs`
-- `/Users/tazawa-masayoshi/Documents/personal-dev/ambient-task-agent/src/anthropic/types.rs`
+- `/home/ec2-user/.credentials/ambient-task-agent.env`
+- `/home/ec2-user/amu-tazawa-scripts/favorite_pop/.claude/commands/ops.md`
+- `/home/ec2-user/amu-tazawa-scripts/hikken_schedule/.claude/commands/ops.md`
+- `/home/ec2-user/amu-tazawa-scripts/send_survey_mail/.claude/commands/ops.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/Cargo.toml`
+- `/home/ec2-user/masayoshi/ambient-task-agent/config/repos.toml`
+- `/home/ec2-user/masayoshi/ambient-task-agent/config/skill-templates/gws.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/config/skill-templates/hikken_schedule/ops/SKILL.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/config/skill-templates/hikken_schedule/ops/gotchas.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/config/skill-templates/kintone.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/plan/design.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/plan/requirements.md`
+- `/home/ec2-user/masayoshi/ambient-task-agent/scripts/agent-sdk-bridge.mjs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/anthropic/agent_loop.rs`
+- `/home/ec2-user/masayoshi/ambient-task-agent/src/anthropic/backend.rs`
 
