@@ -5,8 +5,8 @@ use anyhow::Result;
 
 use crate::claude::ProgressCallback;
 
-use super::client::AnthropicClient;
 use super::context::maybe_compact_context;
+use super::llm_client::LlmClient;
 use super::mcp::{parse_mcp_tool_name, McpManager};
 use super::tool_impls::{execute_tool, ToolExecutionContext, ToolExecutionResult};
 use super::types::*;
@@ -32,7 +32,7 @@ pub struct AgentLoopResult {
 
 /// エージェントループ: LLM 呼び出し → ツール実行 → 繰り返し
 pub async fn run_agent_loop(
-    client: &AnthropicClient,
+    client: &dyn LlmClient,
     config: AgentLoopConfig,
     initial_prompt: &str,
 ) -> Result<AgentLoopResult> {
@@ -117,17 +117,15 @@ pub async fn run_agent_loop(
         };
 
         // 3. LLM 呼び出し（ストリーミング）
-        #[allow(clippy::type_complexity)]
-        let on_tool_use: Option<Box<dyn Fn(&str) + Send + Sync + '_>> =
-            progress_for_stream.as_ref().map(|cb| {
-                let cb = Arc::clone(cb);
-                Box::new(move |name: &str| {
-                    cb(crate::claude::ProgressEvent::ToolUse(name.to_string()));
-                }) as Box<dyn Fn(&str) + Send + Sync>
-            });
+        let on_tool_use = progress_for_stream.as_ref().map(|cb| {
+            let cb = Arc::clone(cb);
+            Arc::new(move |name: &str| {
+                cb(crate::claude::ProgressEvent::ToolUse(name.to_string()));
+            }) as Arc<dyn Fn(&str) + Send + Sync>
+        });
 
         let response = client
-            .send_streaming(request, on_tool_use.as_deref())
+            .send_streaming(request, on_tool_use)
             .await?;
 
         // 4. usage 集計

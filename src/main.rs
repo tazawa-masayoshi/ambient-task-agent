@@ -488,7 +488,7 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         registry: registry.clone(),
         hooks: hooks.clone(),
         resolved_env,
-        backend: build_agent_backend(),
+        backend: build_agent_backend().await,
     };
 
     if slack_config.signing_secret.is_none() {
@@ -566,29 +566,50 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
 }
 
 /// AGENT_BACKEND 環境変数で LLM バックエンドを切り替え
-/// - "cli" → claude -p (ClaudeCliBackend)
-/// - それ以外 or 未設定 → Anthropic API 直叩き (AnthropicApiBackend)
-fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
+/// - "cli"     → claude -p (ClaudeCliBackend)
+/// - "bedrock" → AWS Bedrock Converse API (BedrockBackend)
+/// - それ以外  → Anthropic API 直叩き (AnthropicApiBackend)
+async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
     let backend_type = std::env::var("AGENT_BACKEND").unwrap_or_default();
-    if backend_type == "cli" {
-        tracing::info!("Using ClaudeCliBackend (AGENT_BACKEND=cli)");
-        return std::sync::Arc::new(claude::ClaudeCliBackend);
+
+    match backend_type.as_str() {
+        "cli" => {
+            tracing::info!("Using ClaudeCliBackend (AGENT_BACKEND=cli)");
+            std::sync::Arc::new(claude::ClaudeCliBackend)
+        }
+        "bedrock" => {
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let model = std::env::var("BEDROCK_MODEL").unwrap_or_else(|_| {
+                "us.anthropic.claude-sonnet-4-20250514-v1:0".to_string()
+            });
+            tracing::info!(
+                "Using BedrockBackend (region={}, model={})",
+                region,
+                model
+            );
+            match anthropic::backend::BedrockBackend::new(region, model).await {
+                Ok(backend) => std::sync::Arc::new(backend),
+                Err(e) => {
+                    tracing::error!("Failed to initialize BedrockBackend: {}", e);
+                    tracing::warn!("Falling back to ClaudeCliBackend");
+                    std::sync::Arc::new(claude::ClaudeCliBackend)
+                }
+            }
+        }
+        _ => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+            if api_key.is_empty() {
+                tracing::warn!(
+                    "ANTHROPIC_API_KEY not set, falling back to ClaudeCliBackend"
+                );
+                return std::sync::Arc::new(claude::ClaudeCliBackend);
+            }
+            let model = std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+            tracing::info!("Using AnthropicApiBackend (model={})", model);
+            std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::new(api_key, model))
+        }
     }
-
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        tracing::warn!(
-            "ANTHROPIC_API_KEY not set, falling back to ClaudeCliBackend"
-        );
-        return std::sync::Arc::new(claude::ClaudeCliBackend);
-    }
-
-    let model = std::env::var("ANTHROPIC_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-
-    tracing::info!(
-        "Using AnthropicApiBackend (model={})",
-        model
-    );
-    std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::new(api_key, model))
 }

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
+use super::llm_client::{LlmClient, OnToolUseCallback};
 use super::types::*;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -92,12 +94,16 @@ impl AnthropicClient {
         )
     }
 
-    /// SSE ストリーミング呼び出し。全イベントを組み立てて MessagesResponse を返す。
-    pub async fn send_streaming(
+}
+
+#[async_trait]
+impl LlmClient for AnthropicClient {
+    async fn send_streaming(
         &self,
-        mut request: MessagesRequest,
-        on_tool_use: Option<&(dyn Fn(&str) + Send + Sync)>,
+        request: MessagesRequest,
+        on_tool_use: Option<OnToolUseCallback>,
     ) -> Result<MessagesResponse> {
+        let mut request = request;
         request.stream = true;
         let url = format!("{}/v1/messages", self.base_url);
         let mut last_error = None;
@@ -134,7 +140,7 @@ impl AnthropicClient {
                 anyhow::bail!("Anthropic API error: HTTP {} - {}", status, body);
             }
 
-            return parse_sse_stream(resp, on_tool_use).await;
+            return parse_sse_stream(resp, on_tool_use.as_deref()).await;
         }
 
         anyhow::bail!(

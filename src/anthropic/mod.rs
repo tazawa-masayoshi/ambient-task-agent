@@ -1,4 +1,5 @@
 pub mod types;
+pub mod llm_client;
 pub mod client;
 pub mod tools;
 pub mod tool_impls;
@@ -6,3 +7,5 @@ pub mod agent_loop;
 pub mod backend;
 pub mod context;
 pub mod mcp;
+pub mod bedrock_convert;
+pub mod bedrock_client;
