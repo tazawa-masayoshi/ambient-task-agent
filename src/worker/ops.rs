@@ -318,6 +318,7 @@ pub async fn execute_ops(
     download_dir: Option<&str>,
     exec_mode: OpsExecMode,
     progress: Option<crate::claude::ProgressCallback>,
+    failure_context: Option<&str>,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
 
@@ -344,11 +345,15 @@ pub async fn execute_ops(
     };
 
     // システムプロンプト構築
-    let system_prompt = if skill_content.is_empty() {
+    let failure_section = failure_context.unwrap_or("");
+    let mut system_prompt = if skill_content.is_empty() {
         format!("{}\n\n{}", base_soul, rules)
     } else {
         format!("{}\n\n## 作業手順\n{}\n\n{}", base_soul, skill_content, rules)
     };
+    if !failure_section.is_empty() {
+        system_prompt.push_str(failure_section);
+    }
 
     let prompt = build_ops_prompt(req, history, download_dir);
 

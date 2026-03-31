@@ -298,6 +298,29 @@ impl Db {
             ",
         )?;
 
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS ops_failure_patterns (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_key        TEXT NOT NULL,
+                skill_paths_json TEXT NOT NULL DEFAULT '[]',
+                failure_summary TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                expires_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ops_failure_patterns_repo
+                ON ops_failure_patterns(repo_key, expires_at);
+
+            CREATE TABLE IF NOT EXISTS context_rot_notifications (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_key    TEXT NOT NULL,
+                notified_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_rot_notifications_repo
+                ON context_rot_notifications(repo_key, notified_at);
+            ",
+        )?;
+
         // v4-v8: 不足カラムを一括追加（PRAGMA table_info は1回のみ）
         self.add_missing_columns(&conn, "coding_tasks", &[
             ("slack_plan_ts", "TEXT"),      // v4
@@ -1143,6 +1166,98 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    // ── 失敗パターン ───────────────────────────────
+
+    /// 失敗パターンを保存（有効期限: 30日）
+    #[allow(dead_code)]
+    pub fn insert_ops_failure_pattern(
+        &self,
+        repo_key: &str,
+        skill_paths_json: &str,
+        failure_summary: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ops_failure_patterns (repo_key, skill_paths_json, failure_summary, expires_at) \
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 days'))",
+            params![repo_key, skill_paths_json, failure_summary],
+        )?;
+        Ok(())
+    }
+
+    /// 有効期限内の失敗パターンを取得（created_at 降順、最大 limit 件）
+    #[allow(dead_code)]
+    pub fn get_active_failure_patterns(
+        &self,
+        repo_key: &str,
+        limit: usize,
+    ) -> Result<Vec<FailurePattern>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT failure_summary, created_at FROM ops_failure_patterns \
+             WHERE repo_key = ?1 AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![repo_key, limit as i64], |row| {
+            Ok(FailurePattern {
+                failure_summary: row.get(0)?,
+                created_at: row.get(1)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ── Context Rot 通知 ──────────────────────────
+
+    /// repo_key ごとの直近 N 件の outcome を取得（成功率計算用）
+    #[allow(dead_code)]
+    pub fn get_recent_ops_outcomes_by_repo(
+        &self,
+        repo_key: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT outcome FROM ops_queue \
+             WHERE repo_key = ?1 AND outcome IS NOT NULL \
+             ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![repo_key, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 直近の Context Rot 通知日時を取得
+    #[allow(dead_code)]
+    pub fn get_last_context_rot_notification(
+        &self,
+        repo_key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT notified_at FROM context_rot_notifications \
+             WHERE repo_key = ?1 ORDER BY notified_at DESC LIMIT 1",
+        )?;
+        let result = stmt.query_row(params![repo_key], |row| row.get::<_, String>(0));
+        match result {
+            Ok(ts) => Ok(Some(ts)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Context Rot 通知記録を保存
+    #[allow(dead_code)]
+    pub fn insert_context_rot_notification(&self, repo_key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO context_rot_notifications (repo_key) VALUES (?1)",
+            params![repo_key],
+        )?;
+        Ok(())
+    }
+
     /// フォローアップが必要な ops アイテムを取得
     /// （done + resolved_at IS NULL + done_at が指定時間以上経過）
     pub fn get_ops_needing_followup(&self) -> Result<Vec<OpsFollowupItem>> {
@@ -1499,6 +1614,13 @@ pub struct OpsQueueItem {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
+pub struct FailurePattern {
+    pub failure_summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OpsFollowupItem {
     pub id: i64,
     pub channel: String,
@@ -1509,4 +1631,104 @@ pub struct OpsFollowupItem {
     pub done_at: String,
     pub reminder_count: i64,
     pub notify_ts: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").unwrap();
+        let db = Db { conn: Arc::new(Mutex::new(conn)) };
+        db.migrate().unwrap();
+        db
+    }
+
+    #[test]
+    fn test_insert_and_get_failure_patterns() {
+        let db = test_db();
+        db.insert_ops_failure_pattern("repo1", "[]", "error: file not found").unwrap();
+        db.insert_ops_failure_pattern("repo1", "[]", "error: permission denied").unwrap();
+        db.insert_ops_failure_pattern("repo1", "[]", "error: timeout").unwrap();
+
+        let patterns = db.get_active_failure_patterns("repo1", 5).unwrap();
+        assert_eq!(patterns.len(), 3);
+        // 全3件が取得されること
+        let summaries: Vec<&str> = patterns.iter().map(|p| p.failure_summary.as_str()).collect();
+        assert!(summaries.contains(&"error: file not found"));
+        assert!(summaries.contains(&"error: permission denied"));
+        assert!(summaries.contains(&"error: timeout"));
+    }
+
+    #[test]
+    fn test_failure_patterns_repo_isolation() {
+        let db = test_db();
+        db.insert_ops_failure_pattern("repo1", "[]", "error A").unwrap();
+        db.insert_ops_failure_pattern("repo2", "[]", "error B").unwrap();
+
+        let p1 = db.get_active_failure_patterns("repo1", 5).unwrap();
+        assert_eq!(p1.len(), 1);
+        assert!(p1[0].failure_summary.contains("error A"));
+
+        let p2 = db.get_active_failure_patterns("repo2", 5).unwrap();
+        assert_eq!(p2.len(), 1);
+        assert!(p2[0].failure_summary.contains("error B"));
+    }
+
+    #[test]
+    fn test_failure_patterns_limit() {
+        let db = test_db();
+        for i in 0..6 {
+            db.insert_ops_failure_pattern("repo1", "[]", &format!("error {}", i)).unwrap();
+        }
+
+        let patterns = db.get_active_failure_patterns("repo1", 5).unwrap();
+        assert_eq!(patterns.len(), 5); // 最大5件
+    }
+
+    #[test]
+    fn test_context_rot_notifications() {
+        let db = test_db();
+
+        // 初回は通知なし
+        let last = db.get_last_context_rot_notification("repo1").unwrap();
+        assert!(last.is_none());
+
+        // 通知記録
+        db.insert_context_rot_notification("repo1").unwrap();
+        let last = db.get_last_context_rot_notification("repo1").unwrap();
+        assert!(last.is_some());
+
+        // 別リポジトリは影響なし
+        let last2 = db.get_last_context_rot_notification("repo2").unwrap();
+        assert!(last2.is_none());
+    }
+
+    #[test]
+    fn test_recent_ops_outcomes_by_repo() {
+        let db = test_db();
+        // ops_queue にテストデータを挿入（message_ts はユニークにする）
+        let conn = db.conn.lock().unwrap();
+        for (i, (repo, outcome)) in [
+            ("repo1", "completed"),
+            ("repo1", "error"),
+            ("repo1", "completed"),
+            ("repo2", "no_action"),
+        ].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO ops_queue (channel, message_ts, repo_key, message_text, status, outcome) \
+                 VALUES ('ch', ?1, ?2, 'test', 'done', ?3)",
+                params![format!("ts_{}", i), repo, outcome],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let outcomes = db.get_recent_ops_outcomes_by_repo("repo1", 10).unwrap();
+        assert_eq!(outcomes.len(), 3);
+
+        let outcomes2 = db.get_recent_ops_outcomes_by_repo("repo2", 10).unwrap();
+        assert_eq!(outcomes2.len(), 1);
+        assert_eq!(outcomes2[0], "no_action");
+    }
 }

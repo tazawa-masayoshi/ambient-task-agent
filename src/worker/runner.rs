@@ -262,6 +262,7 @@ impl Worker {
             skill: context::read_skill(base_dir),
             log_dir: self.log_dir(),
             runner_ctx: self.runner_ctx.clone(),
+            repos_config: self.repos_config.clone(),
         };
 
         let had_error = if let Err(e) = scheduler::check_and_run(&mut ctx).await {

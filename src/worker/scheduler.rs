@@ -44,6 +44,7 @@ pub struct SchedulerContext {
     pub skill: String,
     pub log_dir: PathBuf,
     pub runner_ctx: crate::execution::RunnerContext,
+    pub repos_config: crate::repo_config::ReposConfig,
 }
 
 /// repos.toml のスケジュール設定を DB に反映（起動時に呼ぶ）
@@ -125,6 +126,7 @@ async fn execute_job(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<(
         "stagnation_check" => run_stagnation_check(job, ctx).await,
         "weekly_pm_review" => run_weekly_pm_review(job, ctx).await,
         "self_improvement" => run_self_improvement(job, ctx).await,
+        "context_rot_scan" => run_context_rot_scan(job, ctx).await,
         other => {
             tracing::warn!("Unknown job type: {}", other);
             Ok(())
@@ -1885,4 +1887,32 @@ mod tests {
         assert!(timeline.contains("大きなタスク"));
         assert!(allocated_list.is_empty());
     }
+}
+
+// ============================================================================
+// Context Rot Scan
+// ============================================================================
+
+async fn run_context_rot_scan(
+    _job: &ScheduledJob,
+    ctx: &mut SchedulerContext,
+) -> Result<()> {
+    let alerts = super::context_rot::scan_all_repos(&ctx.repos_config, &ctx.db);
+
+    if alerts.is_empty() {
+        tracing::info!("context_rot_scan: no stale skills detected");
+        return Ok(());
+    }
+
+    for alert in &alerts {
+        let msg = super::context_rot::format_rot_alert(alert);
+        if let Err(e) = ctx.slack.post_message(&alert.ops_channel, &msg).await {
+            tracing::warn!("Failed to send context rot notification: {}", e);
+        } else {
+            ctx.db.insert_context_rot_notification(&alert.repo_key).ok();
+        }
+    }
+
+    tracing::info!("context_rot_scan: {} alerts sent", alerts.len());
+    Ok(())
 }

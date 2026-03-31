@@ -1,4 +1,5 @@
 pub mod classify;
+pub mod context_rot;
 pub mod context;
 pub mod executor;
 pub mod ops;

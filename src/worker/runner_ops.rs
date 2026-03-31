@@ -290,10 +290,36 @@ impl Worker {
 
         let dl_dir_ref = ops_download_dir.as_deref();
 
+        // 失敗パターン注入: 3件以上あればシステムプロンプト末尾に追加
+        let failure_context = {
+            let patterns = self.db.get_active_failure_patterns(&item.repo_key, 5)
+                .unwrap_or_default();
+            if patterns.len() >= 3 {
+                let mut section = String::from(
+                    "\n\n## 過去の失敗パターン（参考情報）\n\
+                     以下は同リポジトリで過去に失敗した際のサマリです。同じミスを避けてください。\n"
+                );
+                for p in &patterns {
+                    let date = if p.created_at.len() >= 10 { &p.created_at[..10] } else { &p.created_at };
+                    // サニタイズ: 改行除去 + 200文字制限（プロンプト注入防止）
+                    let sanitized: String = p.failure_summary
+                        .chars()
+                        .filter(|c| *c != '\n' && *c != '\r')
+                        .take(200)
+                        .collect();
+                    section.push_str(&format!("\n- [{}] {}", date, sanitized));
+                }
+                Some(section)
+            } else {
+                None
+            }
+        };
+
         let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
             exec_mode, None,
+            failure_context.as_deref(),
         ).await;
 
         Ok(OpsExecutionResult { output, exec_mode })
@@ -412,8 +438,28 @@ impl Worker {
         let slack_output = extract_slack_summary(output);
         let truncated = crate::claude::truncate_str(slack_output, 2800);
         // outcome を記録（self_improvement 分析用）
-        let outcome = if is_no_action { "no_action" } else { "completed" };
+        let is_failed = last_line.contains("OPS_RESULT: failed");
+        let outcome = if is_no_action {
+            "no_action"
+        } else if is_failed {
+            "failed"
+        } else {
+            "completed"
+        };
         self.db.set_ops_outcome(item.id, outcome).ok();
+
+        // 失敗パターンを DB に保存（次回実行時のプロンプト注入用）
+        if is_failed {
+            let summary: String = output.chars().rev().take(500).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            if let Err(e) = self.db.insert_ops_failure_pattern(
+                &item.repo_key,
+                "[]", // skill_paths は post_ops_result からは不明なので空配列
+                &summary,
+            ) {
+                tracing::warn!("Failed to save failure pattern: {}", e);
+            }
+        }
 
         // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
         if is_no_action {
