@@ -45,3 +45,5 @@
 - [03/14 20:45, auto] Implement the following plan:
 - [03/14 20:46, auto] Implement the following plan:
 - [03/14 20:46, auto] Implement the following plan:
+- [03/16 14:31, end] ## 前回の会話履歴
+- [03/16 15:48, end] ⏺ EC2 でのテスト項目:

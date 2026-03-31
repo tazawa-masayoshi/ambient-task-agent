@@ -7,7 +7,8 @@ use crate::claude::ProgressCallback;
 
 use super::client::AnthropicClient;
 use super::context::maybe_compact_context;
-use super::tool_impls::{execute_tool, ToolExecutionContext};
+use super::mcp::{parse_mcp_tool_name, McpManager};
+use super::tool_impls::{execute_tool, ToolExecutionContext, ToolExecutionResult};
 use super::types::*;
 
 pub struct AgentLoopConfig {
@@ -20,6 +21,7 @@ pub struct AgentLoopConfig {
     pub timeout_secs: u64,
     pub json_schema: Option<String>,
     pub progress: Option<ProgressCallback>,
+    pub mcp_manager: Option<Arc<McpManager>>,
 }
 
 pub struct AgentLoopResult {
@@ -164,7 +166,7 @@ pub async fn run_agent_loop(
                     break;
                 }
 
-                // 全ツールを並列実行
+                // 全ツールを並列実行（builtin / MCP 自動ルーティング）
                 let tool_futures: Vec<_> = tool_calls
                     .iter()
                     .map(|(id, name, input)| {
@@ -172,9 +174,10 @@ pub async fn run_agent_loop(
                         let name = name.clone();
                         let input = input.clone();
                         let ctx = &tool_ctx;
+                        let mcp = config.mcp_manager.clone();
                         async move {
                             tracing::info!("Executing tool: {} (id={})", name, id);
-                            let result = execute_tool(&name, &input, ctx).await;
+                            let result = dispatch_tool(&name, &input, ctx, mcp.as_deref()).await;
                             tracing::info!(
                                 "Tool {} completed: is_error={}, output_len={}",
                                 name,
@@ -218,6 +221,37 @@ pub async fn run_agent_loop(
         total_usage,
         turn_count,
     })
+}
+
+/// builtin ツールか MCP ツールかを判定してディスパッチ
+async fn dispatch_tool(
+    name: &str,
+    input: &serde_json::Value,
+    ctx: &ToolExecutionContext,
+    mcp: Option<&McpManager>,
+) -> ToolExecutionResult {
+    if parse_mcp_tool_name(name).is_some() {
+        // MCP ツール
+        match mcp {
+            Some(mgr) => match mgr.call_tool(name, input).await {
+                Ok((output, is_error)) => {
+                    if is_error {
+                        ToolExecutionResult::err(output)
+                    } else {
+                        ToolExecutionResult::ok(output)
+                    }
+                }
+                Err(e) => ToolExecutionResult::err(format!("MCP tool '{}' failed: {}", name, e)),
+            },
+            None => ToolExecutionResult::err(format!(
+                "MCP tool '{}' called but no MCP manager available",
+                name
+            )),
+        }
+    } else {
+        // builtin ツール
+        execute_tool(name, input, ctx).await
+    }
 }
 
 /// 最後の assistant メッセージからテキストを抽出

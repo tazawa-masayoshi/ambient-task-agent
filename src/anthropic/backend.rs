@@ -7,6 +7,7 @@ use crate::claude::{AgentBackend, AgentOutput, AgentRequest, TokenUsage};
 
 use super::agent_loop::{run_agent_loop, AgentLoopConfig};
 use super::client::AnthropicClient;
+use super::mcp::McpManager;
 use super::tools::build_tool_definitions;
 
 /// Anthropic Messages API を直接叩くバックエンド
@@ -37,13 +38,28 @@ impl AgentBackend for AnthropicApiBackend {
             );
         }
 
-        // ツール定義を構築
-        let tools = request
+        // ツール定義を構築（builtin）
+        let mut tools = request
             .allowed_tools
             .as_deref()
             .filter(|t| !t.is_empty())
             .map(build_tool_definitions)
             .unwrap_or_default();
+
+        // MCP サーバー起動 + ツール収集
+        let mcp_manager = if !request.mcp_servers.is_empty() {
+            let mgr = McpManager::start(&request.mcp_servers).await?;
+            if !mgr.is_empty() {
+                let mcp_tools = mgr.list_all_tools().await;
+                tracing::info!("MCP tools loaded: {} total", mcp_tools.len());
+                tools.extend(mcp_tools);
+                Some(Arc::new(mgr))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let cwd = request
             .cwd
@@ -61,6 +77,7 @@ impl AgentBackend for AnthropicApiBackend {
             timeout_secs: request.timeout_secs.unwrap_or(600),
             json_schema: request.json_schema.clone(),
             progress: request.progress.clone(),
+            mcp_manager: mcp_manager.clone(),
         };
 
         // タイムアウト付きでエージェントループ実行
@@ -71,6 +88,11 @@ impl AgentBackend for AnthropicApiBackend {
                 .await;
 
         let duration = start.elapsed();
+
+        // MCP サーバーをシャットダウン
+        if let Some(ref mgr) = mcp_manager {
+            mgr.shutdown().await;
+        }
 
         match result {
             Ok(Ok(loop_result)) => {

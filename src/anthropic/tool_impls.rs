@@ -16,14 +16,14 @@ pub struct ToolExecutionResult {
 }
 
 impl ToolExecutionResult {
-    fn ok(output: String) -> Self {
+    pub(crate) fn ok(output: String) -> Self {
         Self {
             output,
             is_error: false,
         }
     }
 
-    fn err(output: String) -> Self {
+    pub(crate) fn err(output: String) -> Self {
         Self {
             output,
             is_error: true,

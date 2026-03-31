@@ -3,6 +3,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::anthropic::mcp::McpServerConfig;
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecMode {
@@ -158,6 +160,9 @@ pub struct RepoEntry {
     /// CI 失敗時の最大リトライ回数（デフォルト: 3）
     #[serde(default = "default_ci_max_retry")]
     pub ci_max_retry: u32,
+    /// MCP サーバー設定リスト
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 fn default_ci_max_retry() -> u32 {

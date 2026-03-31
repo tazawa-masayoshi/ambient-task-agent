@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+use crate::anthropic::mcp::McpServerConfig;
 use crate::execution::{ExecutionRecord, HookDecision, RunnerContext};
 use crate::repo_config::ExecMode;
 
@@ -44,6 +45,9 @@ pub struct AgentRequest {
     pub fallback_model: Option<String>,
     /// ストリーミング進捗コールバック（設定すると stream-json モードで実行）
     pub progress: Option<ProgressCallback>,
+    /// MCP サーバー設定（AnthropicApiBackend でのみ使用）
+    #[allow(dead_code)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -658,6 +662,8 @@ pub struct ClaudeRunner {
     fallback_model: Option<String>,
     /// ストリーミング進捗コールバック
     progress: Option<ProgressCallback>,
+    /// MCP サーバー設定
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl ClaudeRunner {
@@ -682,6 +688,7 @@ impl ClaudeRunner {
             json_schema: None,
             fallback_model: None,
             progress: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -768,6 +775,12 @@ impl ClaudeRunner {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
     pub async fn run(self) -> Result<AgentOutput> {
         // 0. Hook: before_run
         if let Some(ref hooks) = self.hooks {
@@ -848,6 +861,7 @@ impl ClaudeRunner {
             json_schema: self.json_schema.clone(),
             fallback_model: self.fallback_model.clone(),
             progress: self.progress.clone(),
+            mcp_servers: self.mcp_servers.clone(),
         };
 
         let backend = self.backend.as_ref()

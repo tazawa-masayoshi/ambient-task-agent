@@ -5,3 +5,4 @@ pub mod tool_impls;
 pub mod agent_loop;
 pub mod backend;
 pub mod context;
+pub mod mcp;
