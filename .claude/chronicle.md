@@ -3,8 +3,9 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
-- [03/31 14:29, end] https://zenn.dev/omniwired/articles/2640a8301dd9c4
-- [03/31 14:29, end] https://zenn.dev/omniwired/articles/2640a8301dd9c4
+- [04/01 14:50, end] Context Rot 検知 + 失敗パターンフィードバック実装 + pi-mono風ハーネス移行調査
+- [03/31 21:24, end] jj git pull
+- [03/31 14:29, end] pi-mono extensions 調査 + Zenn 記事レビュー
 - [03/31 14:30, end] pi-mono extensions 調査 + Agent SDK/サブスク検討 + ツール拡張方針決定
 - [03/31 13:30, end] claude -p 脱却 — Anthropic API 直叩き Rust エージェントハーネス実装
 - [03/31 13:30, end] Anthropic API 直叩きハーネス実装 + Bash safeguard + pi-mono extensions 調査
