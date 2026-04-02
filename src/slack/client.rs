@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::config::SlackConfig;
-use super::mrkdwn::markdown_to_mrkdwn;
+use slack_mrkdwn::markdown_to_mrkdwn;
 
 #[derive(Debug, Clone)]
 pub struct SlackClient {

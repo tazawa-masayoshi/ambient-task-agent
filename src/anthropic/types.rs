@@ -133,80 +133,7 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
-// ============================================================================
-// SSE Stream Event types
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)]
-pub enum StreamEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: MessageStartPayload },
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: usize,
-        content_block: ContentBlockStartPayload,
-    },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { index: usize, delta: Delta },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: usize },
-    #[serde(rename = "message_delta")]
-    MessageDelta {
-        delta: MessageDeltaBody,
-        usage: Option<DeltaUsage>,
-    },
-    #[serde(rename = "message_stop")]
-    MessageStop,
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "error")]
-    Error { error: ApiError },
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MessageStartPayload {
-    pub id: String,
-    pub model: String,
-    pub usage: Usage,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentBlockStartPayload {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum Delta {
-    #[serde(rename = "text_delta")]
-    TextDelta { text: String },
-    #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MessageDeltaBody {
-    pub stop_reason: Option<StopReason>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeltaUsage {
-    #[serde(default)]
-    pub output_tokens: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ApiError {
-    #[serde(rename = "type")]
-    pub error_type: String,
-    pub message: String,
-}
+// SSE Stream Event types は claude-auth crate に移動済み
 
 // ============================================================================
 // Aggregated usage for multi-turn
@@ -282,50 +209,6 @@ mod tests {
         let json = r#""tool_use""#;
         let reason: StopReason = serde_json::from_str(json).unwrap();
         assert_eq!(reason, StopReason::ToolUse);
-    }
-
-    #[test]
-    fn test_stream_event_message_start() {
-        let json = r#"{"type":"message_start","message":{"id":"msg_123","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":0}}}"#;
-        let event: StreamEvent = serde_json::from_str(json).unwrap();
-        match event {
-            StreamEvent::MessageStart { message } => {
-                assert_eq!(message.id, "msg_123");
-                assert_eq!(message.usage.input_tokens, 100);
-            }
-            _ => panic!("Expected MessageStart"),
-        }
-    }
-
-    #[test]
-    fn test_stream_event_content_block_delta() {
-        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        let event: StreamEvent = serde_json::from_str(json).unwrap();
-        match event {
-            StreamEvent::ContentBlockDelta { index, delta } => {
-                assert_eq!(index, 0);
-                match delta {
-                    Delta::TextDelta { text } => assert_eq!(text, "Hello"),
-                    _ => panic!("Expected TextDelta"),
-                }
-            }
-            _ => panic!("Expected ContentBlockDelta"),
-        }
-    }
-
-    #[test]
-    fn test_stream_event_input_json_delta() {
-        let json = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file"}}"#;
-        let event: StreamEvent = serde_json::from_str(json).unwrap();
-        match event {
-            StreamEvent::ContentBlockDelta { delta, .. } => match delta {
-                Delta::InputJsonDelta { partial_json } => {
-                    assert_eq!(partial_json, r#"{"file"#);
-                }
-                _ => panic!("Expected InputJsonDelta"),
-            },
-            _ => panic!("Expected ContentBlockDelta"),
-        }
     }
 
     #[test]

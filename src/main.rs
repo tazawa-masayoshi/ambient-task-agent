@@ -581,16 +581,13 @@ async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
         "max" => {
             let model = std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-            match anthropic::oauth::OAuthManager::load() {
-                Ok(oauth) => {
+            match anthropic::backend::AnthropicApiBackend::from_env(model.clone()) {
+                Ok(backend) => {
                     tracing::info!(
                         "Using AnthropicApiBackend with Max OAuth (model={})",
                         model
                     );
-                    std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::with_oauth(
-                        std::sync::Arc::new(oauth),
-                        model,
-                    ))
+                    std::sync::Arc::new(backend)
                 }
                 Err(e) => {
                     tracing::error!("Failed to load OAuth credentials: {}", e);
@@ -688,7 +685,6 @@ mod oauth_smoke {
 
     use crate::anthropic::client::AnthropicClient;
     use crate::anthropic::llm_client::LlmClient;
-    use crate::anthropic::oauth::OAuthManager;
     use crate::anthropic::types::*;
 
     #[tokio::test]
@@ -696,12 +692,10 @@ mod oauth_smoke {
         if std::env::var("OAUTH_SMOKE").is_err() {
             return;
         }
-        let oauth = Arc::new(OAuthManager::load().expect("Failed to load OAuth credentials"));
-        let client = AnthropicClient::with_oauth(oauth);
-        let model = std::env::var("ANTHROPIC_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let client = AnthropicClient::from_env().expect("Failed to load OAuth credentials");
         let req = MessagesRequest {
-            model,
+            model: std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
             max_tokens: 50,
             system: None,
             messages: vec![Message {

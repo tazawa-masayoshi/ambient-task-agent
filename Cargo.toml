@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+
+# 共有 crate (amu-tazawa-scripts)
+claude-auth = { path = "../amu-tazawa-scripts/crates/claude-auth", features = ["stream"] }
+slack-socket = { path = "../amu-tazawa-scripts/crates/slack-socket" }
+slack-mrkdwn = { path = "../amu-tazawa-scripts/crates/slack-mrkdwn" }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1"
 aws-smithy-types = "1"
