@@ -76,7 +76,7 @@ impl AgentBackend for AnthropicApiBackend {
 
         let config = AgentLoopConfig {
             model: self.model.clone(),
-            max_tokens_per_turn: 8192,
+            max_tokens_per_turn: 32000,
             // json_schema 指定時は単発生成に強制（ツールループ不要）
             max_turns: if request.json_schema.is_some() { 1 } else { request.max_turns },
             system_prompt: request.system_prompt.clone(),
@@ -226,7 +226,7 @@ impl AgentBackend for BedrockBackend {
 
         let config = AgentLoopConfig {
             model: self.model.clone(),
-            max_tokens_per_turn: 8192,
+            max_tokens_per_turn: 32000,
             max_turns: if request.json_schema.is_some() {
                 1
             } else {

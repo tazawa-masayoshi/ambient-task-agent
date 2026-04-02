@@ -3,6 +3,8 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/03 08:21, end] jj git pull
+- [04/02 20:26, end] jj git pull
 - [04/02 18:08, end] jj git pull
 - [04/02 18:00, end] -
 - [04/02 17:40, end] jj git pull
@@ -31,5 +33,3 @@
 - [03/31 12:32, end] Implement the following plan:
 - [03/30 14:04, end] Implement the following plan:
 - [03/30 11:17, end] Implement the following plan:
-- [03/27 14:42, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
-- [03/27 13:26, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
