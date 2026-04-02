@@ -74,12 +74,23 @@ impl AgentBackend for AnthropicApiBackend {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+        // コンテキスト組立: system prompt に git 状態 + 環境情報を注入
+        let enriched_system_prompt = if request.json_schema.is_none() {
+            // json_schema モード（分類等の軽量タスク）ではコンテキスト注入をスキップ
+            request.system_prompt.as_ref().map(|sp| {
+                let ctx = super::context_builder::ProjectContext::discover(&cwd);
+                super::context_builder::build_enriched_system_prompt(sp, &ctx, &tools)
+            })
+        } else {
+            request.system_prompt.clone()
+        };
+
         let config = AgentLoopConfig {
             model: self.model.clone(),
             max_tokens_per_turn: 32000,
             // json_schema 指定時は単発生成に強制（ツールループ不要）
             max_turns: if request.json_schema.is_some() { 1 } else { request.max_turns },
-            system_prompt: request.system_prompt.clone(),
+            system_prompt: enriched_system_prompt,
             tools,
             cwd,
             timeout_secs: request.timeout_secs.unwrap_or(600),
@@ -224,6 +235,16 @@ impl AgentBackend for BedrockBackend {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+        // コンテキスト組立: system prompt に git 状態 + 環境情報を注入
+        let enriched_system_prompt = if request.json_schema.is_none() {
+            request.system_prompt.as_ref().map(|sp| {
+                let ctx = super::context_builder::ProjectContext::discover(&cwd);
+                super::context_builder::build_enriched_system_prompt(sp, &ctx, &tools)
+            })
+        } else {
+            request.system_prompt.clone()
+        };
+
         let config = AgentLoopConfig {
             model: self.model.clone(),
             max_tokens_per_turn: 32000,
@@ -232,7 +253,7 @@ impl AgentBackend for BedrockBackend {
             } else {
                 request.max_turns
             },
-            system_prompt: request.system_prompt.clone(),
+            system_prompt: enriched_system_prompt,
             tools,
             cwd,
             timeout_secs: request.timeout_secs.unwrap_or(600),

@@ -1,4 +1,4 @@
-use super::types::{ContentBlock, Message};
+use super::types::{ContentBlock, Message, Role};
 
 /// context compaction の閾値（推定トークン数）
 const COMPACTION_THRESHOLD: u64 = 150_000;
@@ -58,18 +58,18 @@ fn message_char_count(message: &Message) -> usize {
         .sum()
 }
 
-/// 中間ターンのツール結果を要約に圧縮する
+/// 中間ターンのツール結果を要約に圧縮し、統計サマリを挿入する
 fn compact_middle_turns(messages: &mut [Message]) {
     if messages.len() <= KEEP_RECENT_TURNS * 2 + 1 {
-        // 十分短い: 圧縮不要
         return;
     }
 
-    // 最初の user メッセージ (index 0) は保持
-    // 直近 KEEP_RECENT_TURNS * 2 メッセージは保持
-    // 間のメッセージのツール結果を要約に置換
     let keep_from = messages.len().saturating_sub(KEEP_RECENT_TURNS * 2);
 
+    // 圧縮対象のメッセージから統計を収集
+    let stats = collect_compaction_stats(&messages[1..keep_from]);
+
+    // 中間メッセージのツール結果を圧縮
     for msg in messages[1..keep_from].iter_mut() {
         for block in msg.content.iter_mut() {
             match block {
@@ -83,7 +83,6 @@ fn compact_middle_turns(messages: &mut [Message]) {
                         }
                     };
                     if original_len > 500 {
-                        // 長いツール結果を要約に置き換え
                         let summary = match content {
                             super::types::ToolResultContent::Text(t) => {
                                 let preview = truncate_at_char_boundary(t, 200);
@@ -100,8 +99,6 @@ fn compact_middle_turns(messages: &mut [Message]) {
                     }
                 }
                 ContentBlock::Text { text } => {
-                    // assistant のテキスト応答: 思考過程を保持（短縮はしない）
-                    // ただし極端に長い場合は要約
                     if text.len() > 5000 {
                         let preview = truncate_at_char_boundary(text, 1000);
                         *text = format!(
@@ -111,12 +108,85 @@ fn compact_middle_turns(messages: &mut [Message]) {
                         );
                     }
                 }
-                ContentBlock::ToolUse { .. } => {
-                    // ToolUse は保持（LLM が自身の呼び出しを認識するため）
-                }
+                ContentBlock::ToolUse { .. } => {}
             }
         }
     }
+
+    // 統計サマリを最初の user メッセージの後に挿入
+    if !stats.is_empty() {
+        let summary_block = ContentBlock::Text {
+            text: format!("<compaction-summary>\n{}\n</compaction-summary>", stats),
+        };
+        // index 1 に挿入（最初の user メッセージの直後）
+        if messages.len() > 1 {
+            messages[1].content.insert(0, summary_block);
+        }
+    }
+}
+
+/// 圧縮対象のメッセージから統計情報を収集
+fn collect_compaction_stats(messages: &[Message]) -> String {
+    let mut tool_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut files_referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut user_count = 0u32;
+    let mut assistant_count = 0u32;
+
+    for msg in messages {
+        match msg.role {
+            Role::User => user_count += 1,
+            Role::Assistant => assistant_count += 1,
+        }
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolUse { name, input, .. } => {
+                    *tool_counts.entry(name.clone()).or_default() += 1;
+                    // ファイルパスの抽出
+                    if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                        files_referenced.insert(path.to_string());
+                    }
+                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                        files_referenced.insert(path.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+
+    parts.push(format!(
+        "圧縮済み: {} ターン（user: {}, assistant: {}）",
+        user_count + assistant_count,
+        user_count,
+        assistant_count,
+    ));
+
+    if !tool_counts.is_empty() {
+        let mut tools: Vec<_> = tool_counts.iter().collect();
+        tools.sort_by(|a, b| b.1.cmp(a.1));
+        let tool_summary: Vec<String> = tools
+            .iter()
+            .take(10)
+            .map(|(name, count)| format!("{}({})", name, count))
+            .collect();
+        parts.push(format!("使用ツール: {}", tool_summary.join(", ")));
+    }
+
+    if !files_referenced.is_empty() {
+        let mut files: Vec<_> = files_referenced.into_iter().collect();
+        files.sort();
+        if files.len() > 10 {
+            let total = files.len();
+            files.truncate(10);
+            parts.push(format!("参照ファイル: {} ...他{}件", files.join(", "), total - 10));
+        } else {
+            parts.push(format!("参照ファイル: {}", files.join(", ")));
+        }
+    }
+
+    parts.join("\n")
 }
 
 /// UTF-8 境界を考慮した安全な文字列スライス
