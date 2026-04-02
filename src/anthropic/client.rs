@@ -37,11 +37,10 @@ impl LlmClient for AnthropicClient {
     async fn send_streaming(
         &self,
         request: MessagesRequest,
-        on_tool_use: Option<OnToolUseCallback>,
+        _on_tool_use: Option<OnToolUseCallback>,
     ) -> Result<MessagesResponse> {
         let body = convert_request(&request);
-        let cb = on_tool_use.as_deref();
-        let resp = self.inner.send_streaming(&body, cb).await?;
+        let resp = self.inner.send_request(&body).await?;
         Ok(convert_response(resp))
     }
 }
