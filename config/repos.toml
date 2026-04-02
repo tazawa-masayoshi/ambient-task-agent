@@ -1,6 +1,6 @@
 [defaults]
 slack_channel = "C09F1T4C6F3"
-repos_base_dir = "/home/ec2-user/repos"
+repos_base_dir = "/home/ec2-user/amu-tazawa-scripts"
 claude_max_plan_turns = 10
 claude_max_execute_turns = 20
 # claude_timeout_secs = 600
@@ -50,6 +50,7 @@ github = "amu-tazawa-scripts/send_survey_mail"
 ops_channel = "amz_結果アンケート自動化"
 ops_description = "結果アンケートの送信設定追加・サブカテ登録。GASベースのスプレッドシート操作"
 ops_skills = [".claude/commands/ops.md"]
+ops_download_dir = "downloads"
 
 [[repo]]
 key = "favorite_pop"
