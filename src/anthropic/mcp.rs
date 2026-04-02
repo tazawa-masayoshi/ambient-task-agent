@@ -51,6 +51,33 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
+impl McpServerConfig {
+    /// env と args 内の `${VAR_NAME}` を実際の環境変数値で展開する
+    #[allow(dead_code)]
+    pub fn resolve_env(&mut self) {
+        for value in self.env.values_mut() {
+            *value = resolve_template(value);
+        }
+        for arg in &mut self.args {
+            *arg = resolve_template(arg);
+        }
+    }
+}
+
+fn resolve_template(s: &str) -> String {
+    let mut result = s.to_string();
+    while let Some(start) = result.find("${") {
+        if let Some(end) = result[start..].find('}') {
+            let var_name = &result[start + 2..start + end];
+            let var_value = std::env::var(var_name).unwrap_or_default();
+            result = format!("{}{}{}", &result[..start], var_value, &result[start + end + 1..]);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 // ============================================================================
 // JSON-RPC 2.0
 // ============================================================================

@@ -9,3 +9,4 @@ pub mod context;
 pub mod mcp;
 pub mod bedrock_convert;
 pub mod bedrock_client;
+pub mod mcp_config;

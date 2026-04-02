@@ -4,6 +4,7 @@
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
 - [04/02 14:24, end] 0c
+- [04/02 14:24, end] 0c
 - [04/02 14:23, end] jj git pull
 - [04/02 14:20, end] jj git pull
 - [04/02 14:17, end] jj git pull
@@ -32,4 +33,3 @@
 - [03/26 21:37, end] -
 - [03/26 18:00, end] -
 - [03/26 09:00, end] -
-- [03/25 18:00, end] -

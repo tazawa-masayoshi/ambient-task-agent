@@ -1,0 +1,69 @@
+# Code Reviewer Memory
+
+## Project Patterns
+
+### 繰り返し見つかる品質問題
+- `truncate_str` 系のユーティリティ関数がモジュールをまたいで重複しやすい (`claude.rs` と `runner.rs` で確認済み)
+- ビルダーパターンのメソッドで "後方互換" と書かれた `#[allow(dead_code)]` メソッドが残留しやすい
+- `unsafe impl Send/Sync` が本当に必要かコメントが不正確なケースがある (trait bound で自動導出されるケース)
+- 複数フロー分岐（early return など）でサイドエフェクト（ファイル書き出し等）の呼び出しが片方だけ抜けやすい → `write_task_file` で確認済み
+- LLM 出力パーサーの `contains()` 部分一致は単語境界未チェックになりがち → `split_whitespace().any(|w| w == keyword)` が安全
+- `impl` 分散リファクタリング後、ユーティリティ関数（`truncate_for_slack`, `count_business_days` 等）が元のファイル（runner.rs）に残留して分割先から `super::runner::{}` 経由でインポートされる → 凝集度低下。utils モジュールへの移動を推奨
+- `impl` 分散後、同一ロジックの Drop ガード（`RunningTaskGuard` / `RunningOpsGuard`）が2ファイルに生まれやすい → 汎用 `RunningGuard` struct にまとめる
+- doc comment がリファクタリング中に前の struct/fn からずれやすい（`runner.rs:893` の RunningTaskGuard に誤った manual ボタン説明が残る例）→ `cargo doc` でチェック推奨
+- `i32 as u32` の型キャスト: `CodingTask.retry_count(i32)` を `repo_entry.ci_max_retry(u32)` と比較するとき `(new_count as u32) > max_retry` は new_count 負値で爆発 → `increment_retry_count` の戻り型統一が必要
+
+### プロジェクト固有の OK パターン
+- `ClaudeRunner` のビルダーチェーン末尾 `.with_context(runner_ctx).run()` は各 worker モジュールで統一されており正常
+- `build_system_prompt()` の共通化は analyzer/decomposer/executor/scheduler で適切に実施済み
+- `HookDecision` の `before_run` チェーンは設計として OK (短絡評価)
+
+### 効率・ホットパス上の既知パターン
+- `load_credentials_env()` が `load_slack_config/asana/server` ごとに独立呼び出しされ、起動時に3ファイルを複数回読む → `OnceLock` またはまとめて1回呼び出しにすべき
+- `cmd_task` のように複数フラグがある関数で DB を毎フラグ open するパターンが発生しやすい → 先頭で1回だけ open して使い回す
+- ops_monitor チャンネルで全トップレベルメッセージを LLM 分類するパターン → 高頻度チャンネルではコスト増大リスク
+- `load_credentials_env` の `set_var` ループは「プロセス env が最優先」になっており、`.env` 優先というコメントと矛盾しやすい
+- 二重 spawn（外側 spawn → 内側 spawn）は機能問題なし → 過剰検知寄り、デバッグ複雑性の指摘にとどめる
+
+### 繰り返し見つかるコード再利用問題
+- `AsanaConfig { pat: state.asana_pat.clone(), ... }` の inline 構築が `slack_events.rs` / `webhook.rs` / `hooks.rs` で繰り返し発生 → `AppState::asana_config()` メソッド化が有効
+- `OpsContext` 構造体が `http.rs` に定義されているが実際には未使用（会話履歴は DB 経由）→ デッドコードの可能性大
+- `classify_ops_message` の `answer.contains("YES")` は部分一致問題（memory 既記の `.split_whitespace().any(|w| w == keyword)` が安全）
+- `log_dir_from_state` はモジュールプライベートで `slack_events.rs` 内に閉じており、`Worker::log_dir()` と同ロジックが生まれている → `AppState` / `ReposConfig` のメソッドに移動が望ましい（3回目確認）
+- `reqwest::Client::new()` が `slack_socket.rs` と `SlackClient` / `AsanaClient` / `GoogleCalendarClient` に分散 → Socket Mode は `SlackClient` を共有できる可能性あり
+- `WorkContext` 構築と `resolve_execute_turns` の重複 → `build_worktree_context(ws, max_turns, has_session)` と `resolve_execute_turns(worktree_path, complexity)` ヘルパーに統合済み（Plan/Act mode 導入時に解消）
+- Block Kit ビルダー関数（`build_proposal_blocks` / `build_info_blocks`）が `_task_id` を受け取るが未使用 → /simplify で修正済み（パラメータ削除）。残骸パラメータはこのパターンで再発しやすいことに注意
+- `reset_for_regeneration` の `claude_session_id = NULL` 追加済み（再生成時に古いセッションが残留するバグ修正）
+
+### Blast Radius が大きかった変更の傾向
+- `RunnerContext` の導入: 11ファイルにシグネチャ変更が波及 (これは意図的なリファクタリング)
+- `truncate_for_slack` が `runner.rs` から `slack_events.rs` に参照されており、モジュール境界が曖昧になっている
+- `CalendarEvent` にメソッドを追加せず利用側で再パースするパターンが発生しやすい → `end_time()` 不在が原因
+
+### 重複ステート パターン (2回目確認)
+- `RunnerContext` 導入後も `AppState.semaphore` と `SchedulerContext.defaults/semaphore` が残留
+  → `#[allow(dead_code)]` を付けて移行期に放置するパターンは定着している。レビュー時は必ず残留フィールドを確認すること
+- `ClaudeRunner.registry` のように「書き込まれるが読み取られない」フィールドが発生しやすい
+
+### Plan/Act モード追加後の固有パターン
+- `build_worktree_context(has_session=true)` で context/memory を空にするのは意図的 → Plan セッションに既存コンテキストあり、soul のみ system_prompt 経由で渡す設計
+- `execute_task_with_session` は `resume_session_id.is_some()` で短縮プロンプトに切り替え → Plan → Act の継続性設計として OK
+- `extract_complexity` の部分一致バグ修正済み: `section.contains(keyword)` → `section.split_whitespace().any(|w| w == *keyword)`
+- decomposer.rs 削除後、`Subtask` / `get_actionable_subtasks` は `db.rs` に移動（旧 DB データ後方互換として保持）
+
+### ステータス名の不整合パターン（v12 マイグレーション後）
+- `set_error` が `status = 'failed'` を設定するが、コメント・Slack メッセージは `'error'` を想定 → 毎回要確認
+- `scheduler.rs` の停滞チェック・`db.get_stagnant_tasks` が `'ready'/'in_progress'` を参照 → v12 後は `'executing'/'conversing'` が正しい（機能していない停滞チェック）
+- `create_task_from_ops` が `source` を設定しないため `'asana'` デフォルトになる → `create_task_from_ops_with_status` は `'slack'` を設定するが非対称
+- `task_exists_for_gid` と `find_task_by_gid` の除外ステータスリスト不一致（`'archived'` の扱いが異なる）
+
+## Calibration
+- `#[allow(dead_code)]` 付きフィールドは移行期の意図的残留と誤用の区別が必要 → Context を読んで判断
+- `unsafe impl Send/Sync` の誤用は見逃しリスクが高い → 今後も重点確認する
+- 過剰検知: `else { if ... }` 構造を常に Warning にするのは厳しすぎる可能性。本体の return が絡む場合は許容
+- `i32 as u32` キャストは DB 由来の Optional フィールドで発生しやすい → simple パス特有のバイパスに注意
+- `compute_free_slots` のような区間演算は、一見バグに見えるコードが実は正しいことがある → テスト確認を先に行うこと（過剰検知防止）
+- `CalendarEvent::end_time()` の欠如は繰り返し指摘パターン → 新規コードが追加されるたびに再発する構造的問題。早期に追加を促す
+- `if result.is_empty() { result } else { result }` パターン（両分岐が同値）はコンパイラが通すが、意図不明瞭として必ず指摘する
+- `contains("KEYWORD:")` による LLM 出力キーワード検出は先頭一致にすべき（`lines().any(|l| l.trim().starts_with("KEYWORD:"))）` → プロンプトインジェクション耐性
+- ステータスマイグレーション後、旧ステータスを参照するコードが `scheduler.rs` 等に残留しやすい → マイグレーション変更時は全 status 参照を grep で確認すること

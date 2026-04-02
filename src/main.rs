@@ -566,69 +566,48 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
 }
 
 /// AGENT_BACKEND 環境変数で LLM バックエンドを切り替え
-/// - "cli"     → claude -p (ClaudeCliBackend)
 /// - "bedrock" → AWS Bedrock Converse API (BedrockBackend)
-/// - "max"     → Claude Code Max プランの OAuth 認証 (AnthropicApiBackend)
-/// - それ以外  → Anthropic API キー認証 (AnthropicApiBackend)
+/// - それ以外  → OAuth (Max) → API Key → Bedrock フォールバック
 async fn build_agent_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
     let backend_type = std::env::var("AGENT_BACKEND").unwrap_or_default();
 
-    match backend_type.as_str() {
-        "cli" => {
-            tracing::info!("Using ClaudeCliBackend (AGENT_BACKEND=cli)");
-            std::sync::Arc::new(claude::ClaudeCliBackend)
-        }
-        "max" => {
-            let model = std::env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-            match anthropic::backend::AnthropicApiBackend::from_env(model.clone()) {
-                Ok(backend) => {
-                    tracing::info!(
-                        "Using AnthropicApiBackend with Max OAuth (model={})",
-                        model
-                    );
-                    std::sync::Arc::new(backend)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load OAuth credentials: {}", e);
-                    tracing::warn!("Falling back to ClaudeCliBackend");
-                    std::sync::Arc::new(claude::ClaudeCliBackend)
-                }
-            }
-        }
-        "bedrock" => {
-            let region = std::env::var("AWS_REGION")
-                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_string());
-            let model = std::env::var("BEDROCK_MODEL").unwrap_or_else(|_| {
-                "us.anthropic.claude-sonnet-4-20250514-v1:0".to_string()
-            });
-            tracing::info!(
-                "Using BedrockBackend (region={}, model={})",
-                region,
-                model
-            );
-            match anthropic::backend::BedrockBackend::new(region, model).await {
-                Ok(backend) => std::sync::Arc::new(backend),
-                Err(e) => {
-                    tracing::error!("Failed to initialize BedrockBackend: {}", e);
-                    tracing::warn!("Falling back to ClaudeCliBackend");
-                    std::sync::Arc::new(claude::ClaudeCliBackend)
-                }
-            }
-        }
-        _ => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-            if api_key.is_empty() {
-                tracing::warn!(
-                    "ANTHROPIC_API_KEY not set, falling back to ClaudeCliBackend"
-                );
-                return std::sync::Arc::new(claude::ClaudeCliBackend);
-            }
-            let model = std::env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-            tracing::info!("Using AnthropicApiBackend (model={})", model);
-            std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::new(api_key, model))
+    if backend_type == "bedrock" {
+        return build_bedrock_backend().await;
+    }
+
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+
+    // 1. OAuth 認証（Max プラン）
+    if let Ok(backend) = anthropic::backend::AnthropicApiBackend::from_env(model.clone()) {
+        tracing::info!("Using AnthropicApiBackend with Max OAuth (model={})", model);
+        return std::sync::Arc::new(backend);
+    }
+
+    // 2. API Key 認証
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    if !api_key.is_empty() {
+        tracing::info!("Using AnthropicApiBackend with API Key (model={})", model);
+        return std::sync::Arc::new(anthropic::backend::AnthropicApiBackend::new(api_key, model));
+    }
+
+    // 3. Bedrock フォールバック
+    tracing::warn!("No OAuth or API Key found, falling back to Bedrock");
+    build_bedrock_backend().await
+}
+
+async fn build_bedrock_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    let model = std::env::var("BEDROCK_MODEL")
+        .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-20250514-v1:0".to_string());
+    tracing::info!("Using BedrockBackend (region={}, model={})", region, model);
+    match anthropic::backend::BedrockBackend::new(region, model).await {
+        Ok(backend) => std::sync::Arc::new(backend),
+        Err(e) => {
+            tracing::error!("Failed to initialize BedrockBackend: {}", e);
+            panic!("No LLM backend available: OAuth, API Key, and Bedrock all failed");
         }
     }
 }

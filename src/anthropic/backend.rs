@@ -49,28 +49,25 @@ impl AgentBackend for AnthropicApiBackend {
             );
         }
 
-        // ツール定義を構築（builtin）
-        let mut tools = request
-            .allowed_tools
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(build_tool_definitions)
-            .unwrap_or_default();
-
-        // MCP サーバー起動 + ツール収集
+        // MCP サーバー起動
         let mcp_manager = if !request.mcp_servers.is_empty() {
-            let mgr = McpManager::start(&request.mcp_servers).await?;
-            if !mgr.is_empty() {
-                let mcp_tools = mgr.list_all_tools().await;
-                tracing::info!("MCP tools loaded: {} total", mcp_tools.len());
-                tools.extend(mcp_tools);
-                Some(Arc::new(mgr))
-            } else {
-                None
+            match McpManager::start(&request.mcp_servers).await {
+                Ok(mgr) if !mgr.is_empty() => Some(Arc::new(mgr)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!("MCP startup failed: {}, falling back to builtin tools", e);
+                    None
+                }
             }
         } else {
             None
         };
+
+        // ツール定義を構築（Serena 有無で builtin/MCP を切り替え）
+        let tools = resolve_tools(
+            request.allowed_tools.as_deref(),
+            mcp_manager.as_deref(),
+        ).await;
 
         let cwd = request
             .cwd
@@ -204,26 +201,23 @@ impl AgentBackend for BedrockBackend {
             );
         }
 
-        let mut tools = request
-            .allowed_tools
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(build_tool_definitions)
-            .unwrap_or_default();
-
         let mcp_manager = if !request.mcp_servers.is_empty() {
-            let mgr = McpManager::start(&request.mcp_servers).await?;
-            if !mgr.is_empty() {
-                let mcp_tools = mgr.list_all_tools().await;
-                tracing::info!("MCP tools loaded: {} total", mcp_tools.len());
-                tools.extend(mcp_tools);
-                Some(Arc::new(mgr))
-            } else {
-                None
+            match McpManager::start(&request.mcp_servers).await {
+                Ok(mgr) if !mgr.is_empty() => Some(Arc::new(mgr)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!("MCP startup failed: {}, falling back to builtin tools", e);
+                    None
+                }
             }
         } else {
             None
         };
+
+        let tools = resolve_tools(
+            request.allowed_tools.as_deref(),
+            mcp_manager.as_deref(),
+        ).await;
 
         let cwd = request
             .cwd
@@ -345,6 +339,47 @@ fn calculate_cost(usage: &super::types::AggregatedUsage, model: &str) -> f64 {
         + (usage.output_tokens as f64 / million) * output_rate
         + (usage.cache_creation_input_tokens as f64 / million) * cache_write_rate
         + (usage.cache_read_input_tokens as f64 / million) * cache_read_rate
+}
+
+/// Serena MCP の有無で builtin/MCP ツールを動的に切り替え
+async fn resolve_tools(
+    allowed_tools: Option<&str>,
+    mcp_manager: Option<&McpManager>,
+) -> Vec<super::types::ToolDefinition> {
+    let mut tools = Vec::new();
+
+    if let Some(mgr) = mcp_manager {
+        let mcp_tools = mgr.list_all_tools().await;
+        let has_serena = mcp_tools.iter().any(|t| t.name.starts_with("mcp__serena__"));
+
+        if has_serena {
+            // Serena がファイル操作を提供するので、builtin は Bash のみ
+            tools.extend(build_tool_definitions("Bash"));
+            tracing::info!(
+                "Serena detected: using MCP tools ({}) + builtin Bash only",
+                mcp_tools.len()
+            );
+        } else {
+            // Serena なし: 全 builtin
+            tools.extend(
+                allowed_tools
+                    .filter(|t| !t.is_empty())
+                    .map(build_tool_definitions)
+                    .unwrap_or_default(),
+            );
+        }
+        tools.extend(mcp_tools);
+    } else {
+        // MCP なし: 全 builtin
+        tools.extend(
+            allowed_tools
+                .filter(|t| !t.is_empty())
+                .map(build_tool_definitions)
+                .unwrap_or_default(),
+        );
+    }
+
+    tools
 }
 
 #[cfg(test)]
