@@ -37,17 +37,14 @@ impl LlmClient for AnthropicClient {
     async fn send_streaming(
         &self,
         request: MessagesRequest,
-        _on_tool_use: Option<OnToolUseCallback>,
+        on_tool_use: Option<OnToolUseCallback>,
     ) -> Result<MessagesResponse> {
         let body = convert_request(&request);
-        let resp = self.inner.send_request(&body).await?;
+        let cb = on_tool_use.as_deref();
+        let resp = self.inner.send_streaming(&body, cb).await?;
         Ok(convert_response(resp))
     }
 }
-
-// ============================================================================
-// 型変換: types.rs → claude-auth (リクエスト)
-// ============================================================================
 
 fn convert_request(req: &MessagesRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -56,7 +53,6 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
         "stream": req.stream,
     });
 
-    // system
     if let Some(ref system) = req.system {
         let system_blocks: Vec<serde_json::Value> = system
             .iter()
@@ -76,7 +72,6 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
         body["system"] = serde_json::Value::Array(system_blocks);
     }
 
-    // messages
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -127,7 +122,6 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
         .collect();
     body["messages"] = serde_json::Value::Array(messages);
 
-    // tools
     if let Some(ref tools) = req.tools {
         let tool_defs: Vec<serde_json::Value> = tools
             .iter()
@@ -142,7 +136,6 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
         body["tools"] = serde_json::Value::Array(tool_defs);
     }
 
-    // tool_choice
     if let Some(ref tc) = req.tool_choice {
         match tc {
             ToolChoice::Auto => {
@@ -157,10 +150,6 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
     body
 }
 
-// ============================================================================
-// 型変換: claude-auth → types.rs (レスポンス)
-// ============================================================================
-
 fn convert_response(resp: claude_auth::MessagesResponse) -> MessagesResponse {
     let content: Vec<ContentBlock> = resp
         .content
@@ -174,13 +163,22 @@ fn convert_response(resp: claude_auth::MessagesResponse) -> MessagesResponse {
                 tool_use_id,
                 content,
                 is_error,
-            } => ContentBlock::ToolResult {
-                tool_use_id,
-                content: ToolResultContent::Text(
-                    content.as_str().unwrap_or_default().to_string(),
-                ),
-                is_error,
-            },
+            } => {
+                let text = match &content {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    other => other.to_string(),
+                };
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Text(text),
+                    is_error,
+                }
+            }
         })
         .collect();
 
