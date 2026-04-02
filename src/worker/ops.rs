@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::anthropic::mcp::McpServerConfig;
 use crate::claude::ClaudeRunner;
 use crate::db::OpsMessage;
 use crate::execution::RunnerContext;
@@ -320,6 +321,7 @@ pub async fn execute_ops(
     exec_mode: OpsExecMode,
     progress: Option<crate::claude::ProgressCallback>,
     failure_context: Option<&str>,
+    mcp_servers: Vec<McpServerConfig>,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
 
@@ -364,7 +366,8 @@ pub async fn execute_ops(
         .allowed_tools(tools)
         .cwd(repo_path)
         .optional_log_dir(log_dir)
-        .with_context(runner_ctx);
+        .with_context(runner_ctx)
+        .mcp_servers(mcp_servers);
     if let Some(cb) = progress {
         runner = runner.on_progress(cb);
     }

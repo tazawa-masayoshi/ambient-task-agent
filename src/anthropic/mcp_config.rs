@@ -9,7 +9,6 @@ use super::mcp::McpServerConfig;
 use crate::repo_config::RepoEntry;
 
 /// RepoEntry + 実行時コンテキストから McpServerConfig[] を構築
-#[allow(dead_code)] // #22 で ops.rs から呼ぶ
 pub fn build_mcp_configs(
     repo_entry: &RepoEntry,
     repo_path: &Path,

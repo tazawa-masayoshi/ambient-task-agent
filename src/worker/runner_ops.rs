@@ -65,10 +65,11 @@ impl Worker {
     /// - pending: classify → actionable なら実行、そうでなければ skipped
     /// - ready: 分類スキップで即実行（⚡手動トリガー、スレッド返信、@メンション）
     async fn run_ops_item(self: &Arc<Self>, item: OpsQueueItem, max_retries: i64) -> Result<()> {
-        let repo_entry = match self.resolve_ops_repo_entry(&item, max_retries).await? {
-            Some(entry) => entry,
+        let route_result = match self.resolve_ops_repo_entry(&item, max_retries).await? {
+            Some(r) => r,
             None => return Ok(()),
         };
+        let repo_entry = route_result.repo_entry;
 
         let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
         let slack = self.slack.clone();
@@ -118,22 +119,22 @@ impl Worker {
         &self,
         item: &OpsQueueItem,
         max_retries: i64,
-    ) -> Result<Option<RepoEntry>> {
-        // 1. repo_key で直接マッチ（DM 等チャンネルに紐づかないケース）
-        if let Some(direct) = self.repos_config.find_repo_by_key(&item.repo_key) {
-            tracing::info!("ops item {} key-matched to scope: {} ({})",
-                item.id, direct.key,
-                direct.ops_description.as_deref().unwrap_or("no description"));
-            return Ok(Some(direct.clone()));
-        }
-        // 2. コンテンツベースルーティング（LLM が内容からスコープを判定）
-        match self.route_ops(item).await {
-            Ok(Some(idx)) => {
-                let entry = self.repos_config.repo[idx].clone();
-                tracing::info!("ops item {} routed to scope: {} ({})",
-                    item.id, entry.key,
-                    entry.ops_description.as_deref().unwrap_or("no description"));
-                Ok(Some(entry))
+    ) -> Result<Option<super::content_router::RouteResult>> {
+        let router = super::content_router::ContentRouter::new(
+            &self.repos_config,
+            &self.runner_ctx,
+        );
+
+        match router.route(item).await {
+            Ok(Some(result)) => {
+                tracing::info!(
+                    "ops item {} routed to scope: {} ({}, {} MCP servers)",
+                    item.id,
+                    result.repo_entry.key,
+                    result.repo_entry.ops_description.as_deref().unwrap_or("no description"),
+                    result.mcp_configs.len(),
+                );
+                Ok(Some(result))
             }
             Ok(None) if item.status == "pending" => {
                 tracing::debug!("ops item {} classified as non-actionable", item.id);
@@ -315,11 +316,15 @@ impl Worker {
             }
         };
 
+        // MCP サーバー設定の動的構築
+        let mcp_configs = crate::anthropic::mcp_config::build_mcp_configs(repo_entry, &repo_path);
+
         let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
             exec_mode, None,
             failure_context.as_deref(),
+            mcp_configs,
         ).await;
 
         Ok(OpsExecutionResult { output, exec_mode })
@@ -619,92 +624,6 @@ impl Worker {
         }
     }
 
-    /// ops メッセージをルーティング（コンテンツベースで最適なopsスコープを選択）
-    async fn route_ops(&self, item: &OpsQueueItem) -> Result<Option<usize>> {
-        if item.message_text.trim().len() < 5 {
-            tracing::debug!("route_ops: message too short, skipping");
-            return Ok(None);
-        }
-
-        let ops_entries = self.repos_config.get_all_ops_entries();
-        if ops_entries.is_empty() {
-            tracing::warn!("route_ops: no ops entries found in config");
-            return Ok(None);
-        }
-
-        // スコープが1つしかない場合は分類不要
-        if ops_entries.len() == 1 {
-            tracing::info!("route_ops: single scope, auto-selecting: {}", ops_entries[0].1.key);
-            return Ok(Some(ops_entries[0].0));
-        }
-
-        let scopes: Vec<String> = ops_entries
-            .iter()
-            .enumerate()
-            .map(|(i, (_, entry))| {
-                let desc = entry
-                    .ops_description
-                    .as_deref()
-                    .unwrap_or(&entry.key);
-                format!("{}. {}", i + 1, desc)
-            })
-            .collect();
-
-        tracing::info!(
-            "route_ops: classifying item {} across {} scopes: [{}]",
-            item.id,
-            ops_entries.len(),
-            scopes.join(", ")
-        );
-
-        let prompt = format!(
-            "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\n\
-             ## 作業スコープ一覧\n{}\n\n\
-             ## メッセージ\n{}\n\n\
-             該当するスコープの番号を scope フィールドに返してください。どれにも該当しない場合は 0 にしてください。",
-            scopes.join("\n"),
-            item.message_text
-        );
-
-        let schema = r#"{"type":"object","properties":{"scope":{"type":"integer"}},"required":["scope"]}"#;
-
-        let log_dir = self.log_dir();
-        let result = crate::claude::ClaudeRunner::new("route", &prompt)
-            .max_turns(1)
-            .allowed_tools("")
-            .json_schema(schema)
-            .log_dir(&log_dir)
-            .with_context(&self.runner_ctx)
-            .run()
-            .await?;
-
-        if !result.success {
-            anyhow::bail!("route claude -p failed: {}", result.stderr);
-        }
-
-        let answer = result.stdout.trim();
-        tracing::info!("route_ops: Claude answer='{}' for item {}", answer, item.id);
-
-        let num: usize = serde_json::from_str::<serde_json::Value>(answer)
-            .ok()
-            .and_then(|v| v.get("scope")?.as_u64())
-            .unwrap_or(0) as usize;
-
-        if num == 0 || num > ops_entries.len() {
-            tracing::info!("route_ops: no match (answer='{}', parsed={})", answer, num);
-            return Ok(None);
-        }
-
-        let selected = &ops_entries[num - 1].1;
-        tracing::info!(
-            "route_ops: selected scope {} '{}' for item {}",
-            num,
-            selected.ops_description.as_deref().unwrap_or(&selected.key),
-            item.id
-        );
-
-        Ok(Some(ops_entries[num - 1].0))
-    }
 }
 
 /// process_ops_queue の Drop ガード。panic 時も running_ops から ops_id を確実に除去する。

@@ -342,7 +342,7 @@ async fn execute_grep(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
 // ============================================================================
 
 /// コマンドが危険パターンにマッチしたら理由を返す。None なら安全。
-fn check_dangerous_command(command: &str) -> Option<&'static str> {
+pub(crate) fn check_dangerous_command(command: &str) -> Option<&'static str> {
     let lower = command.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 

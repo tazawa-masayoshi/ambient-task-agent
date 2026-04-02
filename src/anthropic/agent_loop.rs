@@ -229,7 +229,10 @@ async fn dispatch_tool(
     mcp: Option<&McpManager>,
 ) -> ToolExecutionResult {
     if parse_mcp_tool_name(name).is_some() {
-        // MCP ツール
+        // MCP ツール — bash 系ツールには safeguard を適用
+        if let Some(reason) = check_mcp_safeguard(name, input) {
+            return ToolExecutionResult::err(format!("Blocked by safeguard: {}", reason));
+        }
         match mcp {
             Some(mgr) => match mgr.call_tool(name, input).await {
                 Ok((output, is_error)) => {
@@ -250,6 +253,17 @@ async fn dispatch_tool(
         // builtin ツール
         execute_tool(name, input, ctx).await
     }
+}
+
+/// MCP ツール呼び出し前のセーフガード
+/// Serena の bash_command / execute_command に builtin Bash と同じ safeguard を適用
+fn check_mcp_safeguard(name: &str, input: &serde_json::Value) -> Option<String> {
+    if name.ends_with("__bash_command") || name.ends_with("__execute_command") {
+        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            return super::tool_impls::check_dangerous_command(cmd).map(|r| r.to_string());
+        }
+    }
+    None
 }
 
 /// 最後の assistant メッセージからテキストを抽出
@@ -324,5 +338,25 @@ mod tests {
             }],
         }];
         assert_eq!(extract_final_text(&messages), "");
+    }
+
+    #[test]
+    fn test_check_mcp_safeguard_blocks_dangerous() {
+        let input = serde_json::json!({"command": "rm -rf /"});
+        assert!(check_mcp_safeguard("mcp__serena__bash_command", &input).is_some());
+        assert!(check_mcp_safeguard("mcp__serena__execute_command", &input).is_some());
+    }
+
+    #[test]
+    fn test_check_mcp_safeguard_allows_safe() {
+        let input = serde_json::json!({"command": "ls -la"});
+        assert!(check_mcp_safeguard("mcp__serena__bash_command", &input).is_none());
+    }
+
+    #[test]
+    fn test_check_mcp_safeguard_ignores_non_bash() {
+        let input = serde_json::json!({"command": "rm -rf /"});
+        // bash 以外のツールは safeguard を通さない
+        assert!(check_mcp_safeguard("mcp__serena__find_symbol", &input).is_none());
     }
 }

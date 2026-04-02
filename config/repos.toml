@@ -76,6 +76,12 @@ github = "tazawa-masayoshi/ambient-task-agent"
 default_branch = "main"
 auto_execute = true
 
+[[repo.mcp_servers]]
+name = "serena"
+command = "uvx"
+args = ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "autonomous-agent"]
+# --project は McpConfigBuilder が実行時に注入
+
 # ── スケジュールジョブ ──────────────────────
 # cron 式: "sec min hour day_of_month month day_of_week year"
 
