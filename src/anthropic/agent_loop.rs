@@ -84,6 +84,7 @@ pub async fn run_agent_loop(
 
     let has_tools = !config.tools.is_empty();
     let progress_for_stream = config.progress.clone();
+    let mut verified = false;
 
     loop {
         if turn_count >= config.max_turns {
@@ -205,7 +206,29 @@ pub async fn run_agent_loop(
                 });
             }
             _ => {
-                // EndTurn, MaxTokens, StopSequence, or no tools → 終了
+                // EndTurn 前に OPS_RESULT: completed を検出したら検証ターンを注入
+                if !verified {
+                    let last_text = extract_final_text(&messages);
+                    if last_text.contains("OPS_RESULT: completed") {
+                        verified = true;
+                        tracing::info!("Agent loop: OPS_RESULT detected, injecting verification turn");
+                        messages.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text {
+                                text: concat!(
+                                    "作業完了前の最終確認を行ってください:\n",
+                                    "1. `git status` で未コミットの変更がないか確認\n",
+                                    "2. `git log -1` で正しくコミットされているか確認\n",
+                                    "3. `git push` が成功しているか確認（必要なら実行）\n",
+                                    "4. デプロイが必要な場合（clasp push 等）、実行済みか確認\n",
+                                    "5. 問題があれば修正してください。問題なければそのまま最終報告してください。\n",
+                                    "\n最終報告には OPS_RESULT マーカーを含めてください。"
+                                ).to_string(),
+                            }],
+                        });
+                        continue; // 検証ターンを実行
+                    }
+                }
                 break;
             }
         }
