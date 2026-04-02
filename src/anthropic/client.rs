@@ -39,7 +39,8 @@ impl LlmClient for AnthropicClient {
         request: MessagesRequest,
         _on_tool_use: Option<OnToolUseCallback>,
     ) -> Result<MessagesResponse> {
-        let body = convert_request(&request);
+        let mut body = convert_request(&request);
+        body["stream"] = serde_json::Value::Bool(false);
         let resp = self.inner.send_request(&body).await?;
         Ok(convert_response(resp))
     }
@@ -52,24 +53,27 @@ fn convert_request(req: &MessagesRequest) -> serde_json::Value {
         "stream": req.stream,
     });
 
+    // OAuth 認証時は Claude Code 識別の system block が必要（rate limit tier に影響）
+    let mut system_blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "cache_control": { "type": "ephemeral" }
+    })];
     if let Some(ref system) = req.system {
-        let system_blocks: Vec<serde_json::Value> = system
-            .iter()
-            .map(|s| {
-                let mut block = serde_json::json!({
-                    "type": s.block_type,
-                    "text": s.text,
+        for s in system {
+            let mut block = serde_json::json!({
+                "type": s.block_type,
+                "text": s.text,
+            });
+            if let Some(ref cc) = s.cache_control {
+                block["cache_control"] = serde_json::json!({
+                    "type": cc.cache_type,
                 });
-                if let Some(ref cc) = s.cache_control {
-                    block["cache_control"] = serde_json::json!({
-                        "type": cc.cache_type,
-                    });
-                }
-                block
-            })
-            .collect();
-        body["system"] = serde_json::Value::Array(system_blocks);
+            }
+            system_blocks.push(block);
+        }
     }
+    body["system"] = serde_json::Value::Array(system_blocks);
 
     let messages: Vec<serde_json::Value> = req
         .messages
