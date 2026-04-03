@@ -106,6 +106,69 @@ pub fn build_enriched_system_prompt(
     sections.join("")
 }
 
+/// 動的コンテキストのみ生成（プロンプトキャッシュ分離用）
+///
+/// system prompt の static 部分（soul + rules + skill）とは別の SystemBlock に入れることで、
+/// 静的部分のプロンプトキャッシュヒット率を維持する。
+pub fn build_dynamic_context(
+    ctx: &ProjectContext,
+    tools: &[ToolDefinition],
+) -> String {
+    let mut sections = Vec::new();
+
+    // 環境コンテキスト
+    let mut env_section = format!(
+        "## 環境コンテキスト\n\
+         - 作業ディレクトリ: {}\n\
+         - 日付: {}",
+        ctx.cwd, ctx.current_date
+    );
+
+    if !tools.is_empty() {
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        env_section.push_str(&format!("\n- 利用可能ツール: {}", tool_names.join(", ")));
+    }
+
+    sections.push(env_section);
+
+    // Git コンテキスト
+    let has_git = ctx.git_status.is_some()
+        || ctx.git_diff_summary.is_some()
+        || ctx.git_recent_commits.is_some();
+
+    if has_git {
+        let mut git_section = String::from("\n## プロジェクト状態");
+
+        if let Some(ref status) = ctx.git_status {
+            if !status.trim().is_empty() {
+                git_section.push_str(&format!("\n### git status\n```\n{}\n```", status.trim()));
+            }
+        }
+
+        if let Some(ref diff) = ctx.git_diff_summary {
+            if !diff.trim().is_empty() {
+                git_section.push_str(&format!(
+                    "\n### 変更ファイル (git diff --stat)\n```\n{}\n```",
+                    diff.trim()
+                ));
+            }
+        }
+
+        if let Some(ref commits) = ctx.git_recent_commits {
+            if !commits.trim().is_empty() {
+                git_section.push_str(&format!(
+                    "\n### 直近のコミット\n```\n{}\n```",
+                    commits.trim()
+                ));
+            }
+        }
+
+        sections.push(git_section);
+    }
+
+    sections.join("\n\n")
+}
+
 /// git コマンドを実行して stdout を返す。失敗時は None。
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")

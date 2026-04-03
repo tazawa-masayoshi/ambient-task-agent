@@ -74,23 +74,20 @@ impl AgentBackend for AnthropicApiBackend {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        // コンテキスト組立: system prompt に git 状態 + 環境情報を注入
-        let enriched_system_prompt = if request.json_schema.is_none() {
-            // json_schema モード（分類等の軽量タスク）ではコンテキスト注入をスキップ
-            request.system_prompt.as_ref().map(|sp| {
-                let ctx = super::context_builder::ProjectContext::discover(&cwd);
-                super::context_builder::build_enriched_system_prompt(sp, &ctx, &tools)
-            })
+        // プロンプトキャッシュ最適化: static (soul+rules+skill) と dynamic (git+failure) を分離
+        let dynamic_context = if request.json_schema.is_none() {
+            let ctx = super::context_builder::ProjectContext::discover(&cwd);
+            let dynamic = super::context_builder::build_dynamic_context(&ctx, &tools);
+            if dynamic.is_empty() { None } else { Some(dynamic) }
         } else {
-            request.system_prompt.clone()
+            None
         };
 
         let config = AgentLoopConfig {
             model: self.model.clone(),
             max_tokens_per_turn: 32000,
-            // json_schema 指定時は単発生成に強制（ツールループ不要）
             max_turns: if request.json_schema.is_some() { 1 } else { request.max_turns },
-            system_prompt: enriched_system_prompt,
+            system_prompt: request.system_prompt.clone(),
             tools,
             cwd,
             timeout_secs: request.timeout_secs.unwrap_or(600),
@@ -98,6 +95,7 @@ impl AgentBackend for AnthropicApiBackend {
             progress: request.progress.clone(),
             mcp_manager: mcp_manager.clone(),
             permission_mode: super::agent_loop::PermissionMode::default(),
+            dynamic_context,
         };
 
         // タイムアウト付きでエージェントループ実行
@@ -236,14 +234,13 @@ impl AgentBackend for BedrockBackend {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        // コンテキスト組立: system prompt に git 状態 + 環境情報を注入
-        let enriched_system_prompt = if request.json_schema.is_none() {
-            request.system_prompt.as_ref().map(|sp| {
-                let ctx = super::context_builder::ProjectContext::discover(&cwd);
-                super::context_builder::build_enriched_system_prompt(sp, &ctx, &tools)
-            })
+        // プロンプトキャッシュ最適化: static と dynamic を分離
+        let dynamic_context = if request.json_schema.is_none() {
+            let ctx = super::context_builder::ProjectContext::discover(&cwd);
+            let dynamic = super::context_builder::build_dynamic_context(&ctx, &tools);
+            if dynamic.is_empty() { None } else { Some(dynamic) }
         } else {
-            request.system_prompt.clone()
+            None
         };
 
         let config = AgentLoopConfig {
@@ -254,7 +251,7 @@ impl AgentBackend for BedrockBackend {
             } else {
                 request.max_turns
             },
-            system_prompt: enriched_system_prompt,
+            system_prompt: request.system_prompt.clone(),
             tools,
             cwd,
             timeout_secs: request.timeout_secs.unwrap_or(600),
@@ -262,6 +259,7 @@ impl AgentBackend for BedrockBackend {
             progress: request.progress.clone(),
             mcp_manager: mcp_manager.clone(),
             permission_mode: super::agent_loop::PermissionMode::default(),
+            dynamic_context,
         };
 
         let timeout_dur = std::time::Duration::from_secs(request.timeout_secs.unwrap_or(600));

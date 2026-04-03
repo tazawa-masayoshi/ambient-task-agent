@@ -38,6 +38,8 @@ pub struct AgentLoopConfig {
     pub progress: Option<ProgressCallback>,
     pub mcp_manager: Option<Arc<McpManager>>,
     pub permission_mode: PermissionMode,
+    /// 動的コンテキスト（git status, failure patterns 等）。キャッシュ対象外。
+    pub dynamic_context: Option<String>,
 }
 
 pub struct AgentLoopResult {
@@ -67,21 +69,36 @@ pub async fn run_agent_loop(
     };
 
     let system = config.system_prompt.as_ref().map(|sp| {
-        let mut text = sp.clone();
-        // json_schema がある場合は system prompt に埋め込み
+        let mut blocks = Vec::new();
+
+        // Block 0: 静的コンテンツ（soul + rules + skill）→ キャッシュ対象
+        let mut static_text = sp.clone();
         if let Some(ref schema) = config.json_schema {
-            text.push_str(&format!(
+            static_text.push_str(&format!(
                 "\n\nYou must respond with valid JSON matching this schema:\n{}",
                 schema
             ));
         }
-        vec![SystemBlock {
+        blocks.push(SystemBlock {
             block_type: "text".to_string(),
-            text,
+            text: static_text,
             cache_control: Some(CacheControl {
                 cache_type: "ephemeral".to_string(),
             }),
-        }]
+        });
+
+        // Block 1: 動的コンテンツ（git status, failure patterns 等）→ キャッシュ対象外
+        if let Some(ref dynamic) = config.dynamic_context {
+            if !dynamic.is_empty() {
+                blocks.push(SystemBlock {
+                    block_type: "text".to_string(),
+                    text: dynamic.clone(),
+                    cache_control: None,
+                });
+            }
+        }
+
+        blocks
     });
 
     // json_schema のみ指定、system_prompt なしの場合
@@ -100,7 +117,8 @@ pub async fn run_agent_loop(
 
     let has_tools = !config.tools.is_empty();
     let progress_for_stream = config.progress.clone();
-    let mut verified = false;
+    let mut verify_attempts = 0u32;
+    const MAX_VERIFY_ATTEMPTS: u32 = 3;
 
     loop {
         if turn_count >= config.max_turns {
@@ -231,29 +249,53 @@ pub async fn run_agent_loop(
                 });
             }
             _ => {
-                // EndTurn 前に OPS_RESULT: completed を検出したら検証ターンを注入
-                if !verified {
-                    let last_text = extract_final_text(&messages);
-                    if last_text.contains("OPS_RESULT: completed") {
-                        verified = true;
-                        tracing::info!("Agent loop: OPS_RESULT detected, injecting verification turn");
-                        messages.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text {
-                                text: concat!(
-                                    "作業完了前の最終確認を行ってください:\n",
-                                    "1. `git status` で未コミットの変更がないか確認\n",
-                                    "2. `git log -1` で正しくコミットされているか確認\n",
-                                    "3. `git push` が成功しているか確認（必要なら実行）\n",
-                                    "4. デプロイが必要な場合（clasp push 等）、実行済みか確認\n",
-                                    "5. 問題があれば修正してください。問題なければそのまま最終報告してください。\n",
-                                    "\n最終報告には OPS_RESULT マーカーを含めてください。"
-                                ).to_string(),
-                            }],
-                        });
-                        continue; // 検証ターンを実行
-                    }
+                let last_text = extract_final_text(&messages);
+
+                // ラルフループ: OPS_RESULT: completed → 検証 → 失敗なら修正ループ
+                if last_text.contains("OPS_RESULT: completed") && verify_attempts < MAX_VERIFY_ATTEMPTS {
+                    verify_attempts += 1;
+                    tracing::info!(
+                        "Agent loop: OPS_RESULT detected, verification attempt {}/{}",
+                        verify_attempts,
+                        MAX_VERIFY_ATTEMPTS
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: format!(
+                                "作業完了前の最終確認を行ってください（検証 {}/{}）:\n\
+                                 1. `git status` で未コミットの変更がないか確認\n\
+                                 2. `git log -1` で正しくコミットされているか確認\n\
+                                 3. `git push` が成功しているか確認（必要なら実行）\n\
+                                 4. デプロイが必要な場合（clasp push 等）、実行済みか確認\n\
+                                 5. 問題があれば修正してください。問題なければそのまま最終報告してください。\n\
+                                 \n最終報告には OPS_RESULT マーカーを含めてください。",
+                                verify_attempts, MAX_VERIFY_ATTEMPTS,
+                            ),
+                        }],
+                    });
+                    continue; // 検証ターンを実行（失敗ならさらにループ）
                 }
+
+                // OPS_RESULT: failed で検証リトライ回数が残っていればループ継続
+                if last_text.contains("OPS_RESULT: failed") && verify_attempts > 0 && verify_attempts < MAX_VERIFY_ATTEMPTS {
+                    verify_attempts += 1;
+                    tracing::info!(
+                        "Agent loop: verification failed, retry {}/{}",
+                        verify_attempts,
+                        MAX_VERIFY_ATTEMPTS
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "検証で問題が見つかりました。修正して再度確認してください。\n\
+                                   最終報告には OPS_RESULT マーカーを含めてください。"
+                                .to_string(),
+                        }],
+                    });
+                    continue;
+                }
+
                 break;
             }
         }
@@ -356,6 +398,7 @@ async fn execute_subagent(
         progress: None,
         mcp_manager: None,
         permission_mode: PermissionMode::ReadOnly,
+        dynamic_context: None,
     };
 
     match run_agent_loop(client, sub_config, prompt).await {

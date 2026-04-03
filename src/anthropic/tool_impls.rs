@@ -538,19 +538,51 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-/// 出力を MAX_OUTPUT_BYTES で切り詰め
+/// 出力を MAX_OUTPUT_BYTES で切り詰め。超過分は一時ファイルに退避。
 fn truncate_output(mut output: String) -> String {
     if output.len() > MAX_OUTPUT_BYTES {
         let total = output.len();
+
+        // 一時ファイルに全文を退避（後から Read ツールで参照可能）
+        let spill_path = save_output_spill(&output);
+
         // UTF-8 境界で安全に切り詰め
         let mut end = MAX_OUTPUT_BYTES;
         while !output.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
         output.truncate(end);
-        output.push_str(&format!("\n[truncated, {} total bytes]", total));
+
+        if let Some(path) = spill_path {
+            output.push_str(&format!(
+                "\n[truncated: showing {}/{} bytes. Full output saved to: {}]",
+                end, total, path
+            ));
+        } else {
+            output.push_str(&format!("\n[truncated, {} total bytes]", total));
+        }
     }
     output
+}
+
+/// 大出力を一時ファイルに保存。パスを返す。
+fn save_output_spill(content: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("ambient-agent-spill");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let filename = format!(
+        "output-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let path = dir.join(&filename);
+    match std::fs::write(&path, content) {
+        Ok(_) => Some(path.to_string_lossy().to_string()),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -745,8 +777,9 @@ mod tests {
 
         let long = "a".repeat(MAX_OUTPUT_BYTES + 100);
         let truncated = truncate_output(long);
-        assert!(truncated.len() <= MAX_OUTPUT_BYTES + 50); // +50 for suffix
         assert!(truncated.contains("[truncated"));
+        // 一時ファイルパスが含まれる（退避成功時）
+        assert!(truncated.contains("Full output saved to:") || truncated.contains("total bytes"));
     }
 
     #[test]
