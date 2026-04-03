@@ -19,6 +19,7 @@ fn build_single_tool(name: &str) -> Option<ToolDefinition> {
         "Bash" => Some(bash_tool()),
         "Glob" => Some(glob_tool()),
         "Grep" => Some(grep_tool()),
+        "SubAgent" => Some(subagent_tool()),
         other => {
             tracing::warn!("Unknown tool: {}, skipping", other);
             None
@@ -160,6 +161,26 @@ fn grep_tool() -> ToolDefinition {
                 }
             },
             "required": ["pattern"]
+        }),
+    }
+}
+
+fn subagent_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "SubAgent".to_string(),
+        description: "Launch a sub-agent to investigate a question using read-only tools (Read, Glob, Grep). \
+            The sub-agent runs in an independent context and returns a summary. \
+            Use this for research tasks that would consume too many tokens in the main conversation. \
+            The sub-agent cannot modify files.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The investigation task for the sub-agent"
+                }
+            },
+            "required": ["prompt"]
         }),
     }
 }

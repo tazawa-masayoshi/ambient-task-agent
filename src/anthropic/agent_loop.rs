@@ -191,9 +191,17 @@ pub async fn run_agent_loop(
                         let ctx = &tool_ctx;
                         let mcp = config.mcp_manager.clone();
                         let perm = config.permission_mode;
+                        let model = config.model.clone();
+                        let cwd = config.cwd.clone();
+                        let timeout = config.timeout_secs;
                         async move {
                             tracing::info!("Executing tool: {} (id={})", name, id);
-                            let result = dispatch_tool(&name, &input, ctx, mcp.as_deref(), perm).await;
+                            let result = if name == "SubAgent" {
+                                // サブエージェント: 独立した ReadOnly ループを spawn
+                                execute_subagent(client, &input, &model, &cwd, timeout).await
+                            } else {
+                                dispatch_tool(&name, &input, ctx, mcp.as_deref(), perm).await
+                            };
                             tracing::info!(
                                 "Tool {} completed: is_error={}, output_len={}",
                                 name,
@@ -309,6 +317,61 @@ async fn dispatch_tool(
     } else {
         // builtin ツール
         execute_tool(name, input, ctx).await
+    }
+}
+
+/// サブエージェント実行: 独立した ReadOnly ループで調査を実行し要約を返す
+async fn execute_subagent(
+    client: &dyn LlmClient,
+    input: &serde_json::Value,
+    model: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+) -> ToolExecutionResult {
+    let prompt = match input.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolExecutionResult::err("Missing required parameter: prompt".into()),
+    };
+
+    tracing::info!("SubAgent: spawning read-only investigation loop");
+
+    // 読み取り専用ツールのみ
+    let tools = super::tools::build_tool_definitions("Read,Glob,Grep");
+
+    let sub_config = AgentLoopConfig {
+        model: model.to_string(),
+        max_tokens_per_turn: 16000,
+        max_turns: 10, // 調査は10ターンで十分
+        system_prompt: Some(
+            "あなたはコードベースを調査するサブエージェントです。\
+             与えられた質問に対して、ファイルを読み、検索し、正確な情報を収集してください。\
+             最後に調査結果を簡潔に要約してください。\
+             ファイルの変更はできません（読み取り専用モード）。"
+                .to_string(),
+        ),
+        tools,
+        cwd: cwd.to_path_buf(),
+        timeout_secs,
+        json_schema: None,
+        progress: None,
+        mcp_manager: None,
+        permission_mode: PermissionMode::ReadOnly,
+    };
+
+    match run_agent_loop(client, sub_config, prompt).await {
+        Ok(result) => {
+            tracing::info!(
+                "SubAgent: completed in {} turns, usage: in={} out={}",
+                result.turn_count,
+                result.total_usage.input_tokens,
+                result.total_usage.output_tokens,
+            );
+            ToolExecutionResult::ok(result.final_text)
+        }
+        Err(e) => {
+            tracing::warn!("SubAgent: failed: {}", e);
+            ToolExecutionResult::err(format!("SubAgent investigation failed: {}", e))
+        }
     }
 }
 

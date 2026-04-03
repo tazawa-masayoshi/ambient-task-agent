@@ -6,8 +6,8 @@ use crate::claude::ClaudeRunner;
 use crate::db::OpsMessage;
 use crate::execution::RunnerContext;
 
-const OPS_ALLOWED_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep";
-const OPS_PLAN_ALLOWED_TOOLS: &str = "Read,Glob,Grep,Bash";
+const OPS_ALLOWED_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep,SubAgent";
+const OPS_PLAN_ALLOWED_TOOLS: &str = "Read,Glob,Grep,Bash,SubAgent";
 const OPS_INCEPTION_ALLOWED_TOOLS: &str = "Read,Glob,Grep,Bash";
 
 const FALLBACK_OPS_SOUL: &str = "\
