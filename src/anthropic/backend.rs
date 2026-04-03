@@ -97,6 +97,7 @@ impl AgentBackend for AnthropicApiBackend {
             json_schema: request.json_schema.clone(),
             progress: request.progress.clone(),
             mcp_manager: mcp_manager.clone(),
+            permission_mode: super::agent_loop::PermissionMode::default(),
         };
 
         // タイムアウト付きでエージェントループ実行
@@ -260,6 +261,7 @@ impl AgentBackend for BedrockBackend {
             json_schema: request.json_schema.clone(),
             progress: request.progress.clone(),
             mcp_manager: mcp_manager.clone(),
+            permission_mode: super::agent_loop::PermissionMode::default(),
         };
 
         let timeout_dur = std::time::Duration::from_secs(request.timeout_secs.unwrap_or(600));

@@ -11,6 +11,21 @@ use super::mcp::{parse_mcp_tool_name, McpManager};
 use super::tool_impls::{execute_tool, ToolExecutionContext, ToolExecutionResult};
 use super::types::*;
 
+/// ツール権限レベル（claw-code 原則❶）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionMode {
+    /// 読み取り専用（Read, Glob, Grep のみ）
+    ReadOnly,
+    /// ワークスペース書き込み可（Read, Write, Edit, Glob, Grep, Bash）
+    WorkspaceWrite,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        Self::WorkspaceWrite
+    }
+}
+
 pub struct AgentLoopConfig {
     pub model: String,
     pub max_tokens_per_turn: u32,
@@ -22,6 +37,7 @@ pub struct AgentLoopConfig {
     pub json_schema: Option<String>,
     pub progress: Option<ProgressCallback>,
     pub mcp_manager: Option<Arc<McpManager>>,
+    pub permission_mode: PermissionMode,
 }
 
 pub struct AgentLoopResult {
@@ -174,9 +190,10 @@ pub async fn run_agent_loop(
                         let input = input.clone();
                         let ctx = &tool_ctx;
                         let mcp = config.mcp_manager.clone();
+                        let perm = config.permission_mode;
                         async move {
                             tracing::info!("Executing tool: {} (id={})", name, id);
-                            let result = dispatch_tool(&name, &input, ctx, mcp.as_deref()).await;
+                            let result = dispatch_tool(&name, &input, ctx, mcp.as_deref(), perm).await;
                             tracing::info!(
                                 "Tool {} completed: is_error={}, output_len={}",
                                 name,
@@ -250,7 +267,24 @@ async fn dispatch_tool(
     input: &serde_json::Value,
     ctx: &ToolExecutionContext,
     mcp: Option<&McpManager>,
+    permission_mode: PermissionMode,
 ) -> ToolExecutionResult {
+    // 権限チェック: ReadOnly モードでは書き込み系ツールをブロック
+    if permission_mode == PermissionMode::ReadOnly {
+        let is_write_tool = matches!(name, "Write" | "Edit" | "Bash")
+            || (parse_mcp_tool_name(name).is_some()
+                && (name.ends_with("__bash_command")
+                    || name.ends_with("__execute_command")
+                    || name.ends_with("__write_file")
+                    || name.ends_with("__create_file")));
+        if is_write_tool {
+            return ToolExecutionResult::err(format!(
+                "Tool '{}' blocked: read-only permission mode",
+                name
+            ));
+        }
+    }
+
     if parse_mcp_tool_name(name).is_some() {
         // MCP ツール — bash 系ツールには safeguard を適用
         if let Some(reason) = check_mcp_safeguard(name, input) {
