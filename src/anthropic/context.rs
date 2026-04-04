@@ -200,6 +200,7 @@ fn collect_compaction_stats(messages: &[Message]) -> String {
 }
 
 /// Stage 3: 古いターンを強制削除。最初の user メッセージ + 直近ターンのみ保持。
+/// drain で in-place 削除（clone を回避）。
 fn hard_truncate(messages: &mut Vec<Message>) {
     if messages.len() <= KEEP_RECENT_TURNS * 2 + 2 {
         return;
@@ -207,28 +208,16 @@ fn hard_truncate(messages: &mut Vec<Message>) {
 
     let keep_from = messages.len().saturating_sub(KEEP_RECENT_TURNS * 2);
 
-    // 最初の user メッセージ（プロンプト）は必ず保持
-    let first = messages[0].clone();
-    // 圧縮サマリがあれば保持（index 1 に compaction-summary が入っている場合）
+    // index 0 は最初の user メッセージ（常に保持）
+    // index 1 に compaction-summary があればそれも保持
     let has_summary = messages.get(1).is_some_and(|m| {
-        m.content.iter().any(|b| match b {
-            ContentBlock::Text { text } => text.contains("<compaction-summary>"),
-            _ => false,
-        })
+        m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("<compaction-summary>")))
     });
 
-    let mut kept = vec![first];
-    if has_summary {
-        kept.push(messages[1].clone());
-    }
-
-    // 直近ターンを追加
-    kept.extend(messages[keep_from..].iter().cloned());
-
-    let removed = messages.len() - kept.len();
-    tracing::info!("Hard truncate: removed {} messages, kept {}", removed, kept.len());
-
-    *messages = kept;
+    let remove_start = if has_summary { 2 } else { 1 };
+    let removed = keep_from - remove_start;
+    messages.drain(remove_start..keep_from);
+    tracing::info!("Hard truncate: removed {} messages, kept {}", removed, messages.len());
 }
 
 /// UTF-8 境界を考慮した安全な文字列スライス

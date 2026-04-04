@@ -16,19 +16,17 @@ pub fn build_tool_definitions(allowed_tools: &str) -> Vec<ToolDefinition> {
 /// 数千トークンのスキーマを初回プロンプトから省くことでキャッシュヒット率向上。
 #[allow(dead_code)] // backend.rs から呼ぶ予定
 pub fn build_deferred_tool_definitions(allowed_tools: &str) -> Vec<ToolDefinition> {
-    // 常にフルスキーマで返すツール（読み取り系 + 実行系 + メタ）
-    const EAGER_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash", "SubAgent", "ToolSearch"];
+    // スキーマが大きいツールは初期ロードせず ToolSearch 経由で取得させる
+    const DEFERRED_TOOLS: &[&str] = &["Write", "Edit"];
 
     let mut tools = Vec::new();
     for name in allowed_tools.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if EAGER_TOOLS.contains(&name) {
+        if !DEFERRED_TOOLS.contains(&name) {
             if let Some(t) = build_single_tool(name) {
                 tools.push(t);
             }
         }
-        // Write/Edit は ToolSearch 経由で取得するので初期ロードしない
     }
-    // ToolSearch が含まれていなければ追加
     if !tools.iter().any(|t| t.name == "ToolSearch") {
         tools.push(tool_search_tool());
     }

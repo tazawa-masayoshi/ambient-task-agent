@@ -341,11 +341,6 @@ async fn execute_grep(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
 }
 
 // ============================================================================
-// Helpers
-// ============================================================================
-
-// ============================================================================
-// ============================================================================
 // ToolSearch — Deferred Tool Loading
 // ============================================================================
 
@@ -356,14 +351,10 @@ fn execute_tool_search(input: &serde_json::Value) -> ToolExecutionResult {
     };
 
     match super::tools::get_tool_schema(tool_name) {
-        Some(tool) => {
-            let schema = serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            });
-            ToolExecutionResult::ok(serde_json::to_string_pretty(&schema).unwrap_or_default())
-        }
+        Some(tool) => match serde_json::to_value(&tool) {
+            Ok(v) => ToolExecutionResult::ok(serde_json::to_string_pretty(&v).unwrap_or_default()),
+            Err(e) => ToolExecutionResult::err(format!("Serialization error: {}", e)),
+        },
         None => ToolExecutionResult::err(format!("Tool '{}' not found", tool_name)),
     }
 }
