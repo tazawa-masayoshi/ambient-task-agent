@@ -1,32 +1,46 @@
 use super::types::{ContentBlock, Message, Role};
 
-/// context compaction の閾値（推定トークン数）
-const COMPACTION_THRESHOLD: u64 = 150_000;
+/// Stage 1 (Micro-compact): ツール出力を要約に圧縮
+const MICRO_COMPACT_THRESHOLD: u64 = 120_000;
+/// Stage 3 (Truncate): 古いターンを強制削除
+const HARD_TRUNCATE_THRESHOLD: u64 = 180_000;
 /// 保持する直近ターン数（user + assistant の往復）
 const KEEP_RECENT_TURNS: usize = 6;
 
-/// メッセージ履歴のトークン数を概算し、閾値を超えたら中間ターンを圧縮する。
-/// 最初の user メッセージと直近 N ターンは保持する。
-pub fn maybe_compact_context(messages: &mut [Message]) {
+/// 3段階コンテキスト圧縮（claw-code パターン）
+/// Stage 1: Micro-compact — ツール出力を要約に圧縮（LLM 不要）
+/// Stage 2: Auto-compact — LLM による要約（将来実装）
+/// Stage 3: Truncate — 古いターンを強制削除（最終手段）
+pub fn maybe_compact_context(messages: &mut Vec<Message>) {
     let estimated = estimate_tokens(messages);
-    if estimated < COMPACTION_THRESHOLD {
+
+    if estimated < MICRO_COMPACT_THRESHOLD {
         return;
     }
 
+    // Stage 1: Micro-compact（ツール出力の圧縮）
     tracing::info!(
-        "Context compaction triggered: ~{} tokens (threshold: {})",
+        "Stage 1 (Micro-compact): ~{} tokens (threshold: {})",
         estimated,
-        COMPACTION_THRESHOLD
+        MICRO_COMPACT_THRESHOLD
     );
-
     compact_middle_turns(messages);
+    let after_micro = estimate_tokens(messages);
+    tracing::info!("Stage 1 done: ~{} → ~{} tokens", estimated, after_micro);
 
-    let after = estimate_tokens(messages);
-    tracing::info!(
-        "Context compacted: ~{} → ~{} tokens",
-        estimated,
-        after
+    if after_micro < HARD_TRUNCATE_THRESHOLD {
+        return;
+    }
+
+    // Stage 3: Hard truncate（古いターン削除）
+    tracing::warn!(
+        "Stage 3 (Truncate): ~{} tokens exceeds {} — removing old turns",
+        after_micro,
+        HARD_TRUNCATE_THRESHOLD
     );
+    hard_truncate(messages);
+    let after_truncate = estimate_tokens(messages);
+    tracing::info!("Stage 3 done: ~{} → ~{} tokens", after_micro, after_truncate);
 }
 
 /// 文字数ベースの簡易トークン推定
@@ -183,6 +197,38 @@ fn collect_compaction_stats(messages: &[Message]) -> String {
     }
 
     parts.join("\n")
+}
+
+/// Stage 3: 古いターンを強制削除。最初の user メッセージ + 直近ターンのみ保持。
+fn hard_truncate(messages: &mut Vec<Message>) {
+    if messages.len() <= KEEP_RECENT_TURNS * 2 + 2 {
+        return;
+    }
+
+    let keep_from = messages.len().saturating_sub(KEEP_RECENT_TURNS * 2);
+
+    // 最初の user メッセージ（プロンプト）は必ず保持
+    let first = messages[0].clone();
+    // 圧縮サマリがあれば保持（index 1 に compaction-summary が入っている場合）
+    let has_summary = messages.get(1).is_some_and(|m| {
+        m.content.iter().any(|b| match b {
+            ContentBlock::Text { text } => text.contains("<compaction-summary>"),
+            _ => false,
+        })
+    });
+
+    let mut kept = vec![first];
+    if has_summary {
+        kept.push(messages[1].clone());
+    }
+
+    // 直近ターンを追加
+    kept.extend(messages[keep_from..].iter().cloned());
+
+    let removed = messages.len() - kept.len();
+    tracing::info!("Hard truncate: removed {} messages, kept {}", removed, kept.len());
+
+    *messages = kept;
 }
 
 /// UTF-8 境界を考慮した安全な文字列スライス
