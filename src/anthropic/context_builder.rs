@@ -49,6 +49,7 @@ impl ProjectContext {
 ///
 /// base_system_prompt の末尾に環境情報セクションを追加する。
 /// claw-code の SystemPromptBuilder 相当だが、ops エージェント用に簡略化。
+#[allow(dead_code)] // Phase 2 で ops.rs から呼ぶ
 pub fn build_enriched_system_prompt(
     base_prompt: &str,
     ctx: &ProjectContext,

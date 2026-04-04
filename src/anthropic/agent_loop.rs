@@ -12,18 +12,13 @@ use super::tool_impls::{execute_tool, ToolExecutionContext, ToolExecutionResult}
 use super::types::*;
 
 /// ツール権限レベル（claw-code 原則❶）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionMode {
     /// 読み取り専用（Read, Glob, Grep のみ）
     ReadOnly,
     /// ワークスペース書き込み可（Read, Write, Edit, Glob, Grep, Bash）
+    #[default]
     WorkspaceWrite,
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::WorkspaceWrite
-    }
 }
 
 pub struct AgentLoopConfig {
@@ -199,39 +194,46 @@ pub async fn run_agent_loop(
                     break;
                 }
 
-                // 全ツールを並列実行（builtin / MCP 自動ルーティング）
-                let tool_futures: Vec<_> = tool_calls
-                    .iter()
-                    .map(|(id, name, input)| {
-                        let id = id.clone();
-                        let name = name.clone();
-                        let input = input.clone();
-                        let ctx = &tool_ctx;
-                        let mcp = config.mcp_manager.clone();
-                        let perm = config.permission_mode;
+                // ツールを safe(Read系=並列) / unsafe(Write系=直列) に分類して実行
+                let (safe_calls, unsafe_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|(_, name, _)| is_read_only_tool(name));
+
+                let mut results: Vec<(String, ToolExecutionResult)> = Vec::new();
+
+                // Read 系ツールは並列実行
+                if !safe_calls.is_empty() {
+                    let safe_futures: Vec<_> = safe_calls
+                        .into_iter()
+                        .map(|(id, name, input)| {
+                            let ctx = &tool_ctx;
+                            let mcp = config.mcp_manager.clone();
+                            let perm = config.permission_mode;
+                            async move {
+                                tracing::info!("Executing tool (parallel): {} (id={})", name, id);
+                                let result = dispatch_tool(&name, &input, ctx, mcp.as_deref(), perm).await;
+                                tracing::info!("Tool {} completed: is_error={}, output_len={}", name, result.is_error, result.output.len());
+                                (id, result)
+                            }
+                        })
+                        .collect();
+                    results.extend(futures_util::future::join_all(safe_futures).await);
+                }
+
+                // Write 系ツール + SubAgent は直列実行
+                for (id, name, input) in unsafe_calls {
+                    tracing::info!("Executing tool (serial): {} (id={})", name, id);
+                    let result = if name == "SubAgent" {
                         let model = config.model.clone();
                         let cwd = config.cwd.clone();
                         let timeout = config.timeout_secs;
-                        async move {
-                            tracing::info!("Executing tool: {} (id={})", name, id);
-                            let result = if name == "SubAgent" {
-                                // サブエージェント: 独立した ReadOnly ループを spawn
-                                execute_subagent(client, &input, &model, &cwd, timeout).await
-                            } else {
-                                dispatch_tool(&name, &input, ctx, mcp.as_deref(), perm).await
-                            };
-                            tracing::info!(
-                                "Tool {} completed: is_error={}, output_len={}",
-                                name,
-                                result.is_error,
-                                result.output.len()
-                            );
-                            (id, result)
-                        }
-                    })
-                    .collect();
-
-                let results = futures_util::future::join_all(tool_futures).await;
+                        execute_subagent(client, &input, &model, &cwd, timeout).await
+                    } else {
+                        dispatch_tool(&name, &input, &tool_ctx, config.mcp_manager.as_deref(), config.permission_mode).await
+                    };
+                    tracing::info!("Tool {} completed: is_error={}, output_len={}", name, result.is_error, result.output.len());
+                    results.push((id, result));
+                }
 
                 // ツール結果を user メッセージとして追加
                 let tool_result_blocks: Vec<ContentBlock> = results
@@ -401,7 +403,7 @@ async fn execute_subagent(
         dynamic_context: None,
     };
 
-    match run_agent_loop(client, sub_config, prompt).await {
+    match Box::pin(run_agent_loop(client, sub_config, prompt)).await {
         Ok(result) => {
             tracing::info!(
                 "SubAgent: completed in {} turns, usage: in={} out={}",
@@ -427,6 +429,21 @@ fn check_mcp_safeguard(name: &str, input: &serde_json::Value) -> Option<String> 
         }
     }
     None
+}
+
+/// Read 系（副作用なし）のツールか判定。並列実行可能。
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(name, "Read" | "Glob" | "Grep")
+        || name.starts_with("mcp__") && (
+            name.ends_with("__find_symbol")
+            || name.ends_with("__find_referencing_symbols")
+            || name.ends_with("__get_symbols_overview")
+            || name.ends_with("__list_dir")
+            || name.ends_with("__find_file")
+            || name.ends_with("__search_for_pattern")
+            || name.ends_with("__read_memory")
+            || name.ends_with("__list_memories")
+        )
 }
 
 /// 最後の assistant メッセージからテキストを抽出

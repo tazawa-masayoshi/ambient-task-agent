@@ -138,18 +138,14 @@ fn collect_compaction_stats(messages: &[Message]) -> String {
             Role::Assistant => assistant_count += 1,
         }
         for block in &msg.content {
-            match block {
-                ContentBlock::ToolUse { name, input, .. } => {
+            if let ContentBlock::ToolUse { name, input, .. } = block {
                     *tool_counts.entry(name.clone()).or_default() += 1;
-                    // ファイルパスの抽出
                     if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
                         files_referenced.insert(path.to_string());
                     }
                     if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                         files_referenced.insert(path.to_string());
                     }
-                }
-                _ => {}
             }
         }
     }
