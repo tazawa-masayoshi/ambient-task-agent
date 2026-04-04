@@ -11,6 +11,35 @@ pub fn build_tool_definitions(allowed_tools: &str) -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Deferred tool loading: 初期ロードでは頻出ツールのみフルスキーマを返し、
+/// Write/Edit は ToolSearch 経由でオンデマンド取得させる。
+/// 数千トークンのスキーマを初回プロンプトから省くことでキャッシュヒット率向上。
+#[allow(dead_code)] // backend.rs から呼ぶ予定
+pub fn build_deferred_tool_definitions(allowed_tools: &str) -> Vec<ToolDefinition> {
+    // 常にフルスキーマで返すツール（読み取り系 + 実行系 + メタ）
+    const EAGER_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash", "SubAgent", "ToolSearch"];
+
+    let mut tools = Vec::new();
+    for name in allowed_tools.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if EAGER_TOOLS.contains(&name) {
+            if let Some(t) = build_single_tool(name) {
+                tools.push(t);
+            }
+        }
+        // Write/Edit は ToolSearch 経由で取得するので初期ロードしない
+    }
+    // ToolSearch が含まれていなければ追加
+    if !tools.iter().any(|t| t.name == "ToolSearch") {
+        tools.push(tool_search_tool());
+    }
+    tools
+}
+
+/// ツール名からフルスキーマを返す（ToolSearch ツールの実行用）
+pub fn get_tool_schema(name: &str) -> Option<ToolDefinition> {
+    build_single_tool(name)
+}
+
 fn build_single_tool(name: &str) -> Option<ToolDefinition> {
     match name {
         "Read" => Some(read_tool()),
@@ -20,6 +49,7 @@ fn build_single_tool(name: &str) -> Option<ToolDefinition> {
         "Glob" => Some(glob_tool()),
         "Grep" => Some(grep_tool()),
         "SubAgent" => Some(subagent_tool()),
+        "ToolSearch" => Some(tool_search_tool()),
         other => {
             tracing::warn!("Unknown tool: {}, skipping", other);
             None
@@ -161,6 +191,23 @@ fn grep_tool() -> ToolDefinition {
                 }
             },
             "required": ["pattern"]
+        }),
+    }
+}
+
+fn tool_search_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "ToolSearch".to_string(),
+        description: "Fetch full schema for a deferred tool by name. Use when you need a tool whose schema wasn't loaded initially.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool to fetch schema for (e.g., 'Edit', 'Write')"
+                }
+            },
+            "required": ["tool_name"]
         }),
     }
 }

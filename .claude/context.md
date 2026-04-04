@@ -2,14 +2,14 @@
 
 > セッション間の引き継ぎ情報。学びは MEMORY.md、タスクは TaskList、設定は CLAUDE.md。
 
-### Snapshot (04/03 20:49, end)
+### Snapshot (04/04 11:35, end)
 
 **Intent:** jj git pull
 
 **Next:**
-- jj git push
-- 作業はmacでやろう
-- https://zenn.dev/kinosh/articles/harness-engineering-by-frontend-fsd
+-   効果: トークン節約
+-   A から始めますか？今の join_all を safe/unsafe
+-   に分離するだけで、数十行の変更です。
 
 **Outcomes:** 15 files changed
 

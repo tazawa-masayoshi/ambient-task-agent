@@ -44,6 +44,7 @@ pub async fn execute_tool(
         "Bash" => execute_bash(input, ctx).await,
         "Glob" => execute_glob(input, ctx).await,
         "Grep" => execute_grep(input, ctx).await,
+        "ToolSearch" => execute_tool_search(input),
         _ => ToolExecutionResult::err(format!("Unknown tool: {}", name)),
     }
 }
@@ -342,6 +343,30 @@ async fn execute_grep(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+// ============================================================================
+// ============================================================================
+// ToolSearch — Deferred Tool Loading
+// ============================================================================
+
+fn execute_tool_search(input: &serde_json::Value) -> ToolExecutionResult {
+    let tool_name = match input.get("tool_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolExecutionResult::err("Missing required parameter: tool_name".into()),
+    };
+
+    match super::tools::get_tool_schema(tool_name) {
+        Some(tool) => {
+            let schema = serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            });
+            ToolExecutionResult::ok(serde_json::to_string_pretty(&schema).unwrap_or_default())
+        }
+        None => ToolExecutionResult::err(format!("Tool '{}' not found", tool_name)),
+    }
+}
 
 // ============================================================================
 // Bash Safeguard (inspired by pi-safeguard)
