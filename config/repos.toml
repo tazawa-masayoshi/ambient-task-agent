@@ -2,7 +2,7 @@
 slack_channel = "C09F1T4C6F3"
 repos_base_dir = "/home/ec2-user/amu-tazawa-scripts"
 claude_max_plan_turns = 10
-claude_max_execute_turns = 40
+claude_max_execute_turns = 100
 # claude_timeout_secs = 600
 # claude_max_output_bytes = 100000
 # claude_exec_mode = "normal"

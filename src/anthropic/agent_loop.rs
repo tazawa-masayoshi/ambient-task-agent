@@ -115,12 +115,17 @@ pub async fn run_agent_loop(
     let mut verify_attempts = 0u32;
     const MAX_VERIFY_ATTEMPTS: u32 = 3;
 
+    let mut skip_count = false; // 検証ターン注入時はカウントしない
     loop {
         if turn_count >= config.max_turns {
             tracing::info!("Agent loop: max_turns ({}) reached", config.max_turns);
             break;
         }
-        turn_count += 1;
+        if skip_count {
+            skip_count = false;
+        } else {
+            turn_count += 1;
+        }
 
         // 1. context compaction チェック
         maybe_compact_context(&mut messages);
@@ -283,10 +288,10 @@ pub async fn run_agent_loop(
                             ),
                         }],
                     });
-                    continue; // 検証ターンを実行（失敗ならさらにループ）
+                    skip_count = true;
+                    continue;
                 }
 
-                // OPS_RESULT: failed で検証リトライ回数が残っていればループ継続
                 if last_text.contains("OPS_RESULT: failed") && verify_attempts > 0 && verify_attempts < MAX_VERIFY_ATTEMPTS {
                     verify_attempts += 1;
                     tracing::info!(
@@ -302,6 +307,7 @@ pub async fn run_agent_loop(
                                 .to_string(),
                         }],
                     });
+                    skip_count = true;
                     continue;
                 }
 
