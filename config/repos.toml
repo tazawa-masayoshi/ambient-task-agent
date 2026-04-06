@@ -48,6 +48,7 @@ ops_download_dir = "images"
 key = "send_survey_mail"
 github = "amu-tazawa-scripts/send_survey_mail"
 ops_channel = "amz_結果アンケート自動化"
+ops_monitor = true
 ops_description = "結果アンケートの送信設定追加・サブカテ登録。GASベースのスプレッドシート操作"
 ops_skills = [".claude/commands/ops.md"]
 ops_download_dir = "downloads"

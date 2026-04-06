@@ -384,45 +384,25 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
 
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
         let sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
-        let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
-        let is_admin = admin_user_id.is_some_and(|admin| admin == sender);
-        // @admin ユーザー宛メンションの検出（@bot 以外で admin 宛の依頼）
-        let has_admin_mention = admin_user_id
-            .is_some_and(|admin| text.contains(&format!("<@{}", admin)));
 
         match (thread_ts, has_mention) {
-            // スレッド返信 + @bot メンション → admin のみ ops 即実行
-            (Some(tts), true) if is_admin => {
-                tracing::info!("ops thread mention by admin in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
+            // @bot メンション（トップ or スレッド）→ 即実行
+            (tts, true) => {
+                tracing::info!("ops @bot mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                enqueue_ops_request(state, event, channel, message_ts, tts, text, repo_entry, "ready")?;
             }
-            (Some(_), true) => {
-                tracing::info!("ops thread mention by non-admin {} ignored", sender);
-            }
-            // トップレベル + @bot メンション → ops_monitor のチャンネルのみ即実行
-            (None, true) if repo_entry.ops_monitor => {
-                tracing::info!("ops top-level mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
-            }
-            (None, true) => {
-                tracing::debug!("ops_monitor=false, top-level mention ignored in {}", channel);
-            }
-            // トップレベル + @admin メンション → admin 宛依頼として即実行
-            (None, false) if has_admin_mention => {
-                tracing::info!("ops admin-mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
-            }
-            // トップレベル + メンションなし → 自動分類（admin の投稿は除外）
+            // トップレベル + メンションなし → 自動分類（bot 自身の投稿は除外済み）
             (None, false) => {
-                if repo_entry.ops_monitor && !is_admin {
+                let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
+                let is_admin = admin_user_id.is_some_and(|admin| admin == sender);
+                if !is_admin {
                     enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
                 }
             }
-            // スレッド返信 + メンションなし → 通常は無視（人同士の会話）
-            // Inception モードはターン2へ継続するためエンキュー
+            // スレッド返信 + メンションなし → Inception ターン2 のみ
             (Some(tts), false) => {
                 if repo_entry.ops_mode == crate::repo_config::OpsMode::Inception {
-                    tracing::info!("inception: thread reply enqueued for turn2 in {}", channel);
+                    tracing::info!("inception: thread reply for turn2 in {}", channel);
                     enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
                 }
             }
@@ -982,7 +962,7 @@ async fn handle_asana_url_link(
 
 /// ops リクエストをキューに追加してワーカーを起床
 ///
-/// - status = "pending": 分類が必要（ops_monitor 自動検出）
+/// - status = "pending": 分類が必要（トップレベルメッセージの自動検出）
 /// - status = "ready": 分類不要で即実行（⚡手動トリガー、@メンション、スレッド返信）
 #[allow(clippy::too_many_arguments)]
 fn enqueue_ops_request(
