@@ -161,12 +161,22 @@ pub struct ServerConfig {
 pub fn load_server_config(config_dir: Option<&str>) -> Result<ServerConfig> {
     let env = load_credentials_env();
 
-    let base = config_dir
+    let data_dir = config_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config/ambient-task-agent"));
 
-    let repos_config_path = base.join("repos.toml");
-    let db_path = base.join("agent.db");
+    // repos.toml: cwd/config/repos.toml を優先、なければ ~/.config/ にフォールバック
+    let cwd_config = PathBuf::from("config/repos.toml");
+    let repos_config_path = if cwd_config.exists() {
+        tracing::info!("Using repos config: {}", cwd_config.display());
+        cwd_config
+    } else {
+        let fallback = data_dir.join("repos.toml");
+        tracing::info!("Using repos config (fallback): {}", fallback.display());
+        fallback
+    };
+
+    let db_path = data_dir.join("agent.db");
 
     let asana_webhook_secret = env.get("ASANA_WEBHOOK_SECRET").cloned();
 
