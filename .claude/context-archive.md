@@ -72,3 +72,5 @@
 - [03/27 14:42, end] ユーザーの質問: 今日やるべきタスクの一覧と優先度を教えて
 - [03/30 11:17, end] Implement the following plan:
 - [03/30 14:04, end] Implement the following plan:
+- [03/31 12:32, end] Implement the following plan:
+- [03/31 13:30, end] Anthropic API 直叩きハーネス実装 + Bash safeguard + pi-mono extensions 調査
