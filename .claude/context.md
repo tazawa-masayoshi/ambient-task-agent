@@ -2,31 +2,22 @@
 
 > セッション間の引き継ぎ情報。学びは MEMORY.md、タスクは TaskList、設定は CLAUDE.md。
 
-### Snapshot (04/04 19:54, end)
+### Snapshot (04/06 17:20, end)
 
-**Intent:** jj git pull
+**Intent:** claw-code/Claude Code パターンを参考にエージェントハーネスを強化 + ops の実運用テスト
+
+**Outcomes:**
+- ツール並行安全性: Read系=並列、Write系+SubAgent=直列
+- 3段階コンテキスト圧縮: Micro-compact + Hard Truncate (drain ベース)
+- Deferred Tool Loading: ToolSearch + build_deferred_tool_definitions
+- OAuth refresh 自動回復: 失敗時にファイルから最新トークンを再読み込み
+- ops トリガー簡素化: 6分岐→3分岐（@bot/@admin メンションのみ）
+- 検証ターン強化: 依頼完了確認 + gws 自動化チェック + ターンカウント除外
+- CTA パターン: hikken/send_survey_mail/favorite_pop の .claude/commands/ops/bin/ スクリプト
+- repos.toml 読み込み: cwd/config/ 優先に変更（~/.config/ フォールバック）
+- max_turns=100、max_tokens_per_turn=32000
 
 **Next:**
-- ## Phase 3: Fix Issues
-- Wait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false pos
-- When done, briefly summarize what was fixed (or confirm the code was already clean).
-
-**Outcomes:** 15 files changed
-
-**Changed Files:**
-- `/home/ec2-user/.claude/plans/quiet-knitting-melody.md`
-- `/home/ec2-user/.credentials/ambient-task-agent.env`
-- `/home/ec2-user/amu-tazawa-scripts/crates/claude-auth/Cargo.toml`
-- `/home/ec2-user/amu-tazawa-scripts/crates/claude-auth/src/lib.rs`
-- `/home/ec2-user/amu-tazawa-scripts/crates/slack-socket/Cargo.toml`
-- `/home/ec2-user/amu-tazawa-scripts/crates/slack-socket/src/lib.rs`
-- `/home/ec2-user/amu-tazawa-scripts/favorite_pop/.claude/commands/ops.md`
-- `/home/ec2-user/amu-tazawa-scripts/hikken_schedule/.claude/commands/ops.md`
-- `/home/ec2-user/amu-tazawa-scripts/knowledge-bot/src-rs/main.rs`
-- `/home/ec2-user/amu-tazawa-scripts/send_survey_mail/.claude/commands/ops.md`
-- `/home/ec2-user/masayoshi/ambient-task-agent/.claude/chronicle.md`
-- `/home/ec2-user/masayoshi/ambient-task-agent/.claude/context.md`
-- `/home/ec2-user/masayoshi/ambient-task-agent/.gitignore`
-- `/home/ec2-user/masayoshi/ambient-task-agent/Cargo.toml`
-- `/home/ec2-user/masayoshi/ambient-task-agent/config/repos.toml`
-
+- Serena MCP 導入（rust-analyzer + pylsp インストール）
+- チャンネルフリールーティング（チャンネルマッピング廃止検討）
+- ops スキルの継続改善（依頼ごとにフィードバック）

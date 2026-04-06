@@ -3,6 +3,7 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/06 17:20, end] claw-code パターン実装 + CTA ops スキル + OAuth 自動回復 + ops トリガー簡素化 + 検証ターン強化
 - [04/04 13:10, end] jj git pull
 - [04/04 11:35, end] jj git pull
 - [04/03 20:49, end] jj git pull
