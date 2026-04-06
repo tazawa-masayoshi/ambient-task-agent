@@ -383,7 +383,12 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     let has_mention = !state.bot_user_id.is_empty() && text.contains(&bot_mention);
 
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-        let sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
+        let _sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
+
+        // @admin ユーザー宛メンションの検出
+        let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
+        let has_admin_mention = admin_user_id
+            .is_some_and(|admin| text.contains(&format!("<@{}", admin)));
 
         match (thread_ts, has_mention) {
             // @bot メンション（トップ or スレッド）→ 即実行
@@ -391,14 +396,13 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                 tracing::info!("ops @bot mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, tts, text, repo_entry, "ready")?;
             }
-            // トップレベル + メンションなし → 自動分類（bot 自身の投稿は除外済み）
-            (None, false) => {
-                let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
-                let is_admin = admin_user_id.is_some_and(|admin| admin == sender);
-                if !is_admin {
-                    enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
-                }
+            // トップレベル + @admin メンション → admin 宛の依頼として自動分類
+            (None, false) if has_admin_mention => {
+                tracing::info!("ops @admin mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
             }
+            // トップレベル + メンションなし → 無視（他の人同士の会話）
+            (None, false) => {}
             // スレッド返信 + メンションなし → Inception ターン2 のみ
             (Some(tts), false) => {
                 if repo_entry.ops_mode == crate::repo_config::OpsMode::Inception {
