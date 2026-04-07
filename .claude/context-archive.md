@@ -74,3 +74,7 @@
 - [03/30 14:04, end] Implement the following plan:
 - [03/31 12:32, end] Implement the following plan:
 - [03/31 13:30, end] Anthropic API 直叩きハーネス実装 + Bash safeguard + pi-mono extensions 調査
+- [03/31 14:30, end] pi-mono extensions 調査 + Agent SDK/サブスク検討 + ツール拡張方針決定
+- [03/31 13:30, end] claude -p 脱却 — Anthropic API 直叩き Rust エージェントハーネス実装
+- [03/31 14:29, end] pi-mono extensions 調査 + Zenn 記事レビュー
+- [03/31 21:24, end] jj git pull

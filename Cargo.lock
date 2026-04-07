@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "agent-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18,6 +31,7 @@ dependencies = [
 name = "ambient-task-agent"
 version = "0.2.0"
 dependencies = [
+ "agent-harness",
  "anyhow",
  "async-trait",
  "aws-config",

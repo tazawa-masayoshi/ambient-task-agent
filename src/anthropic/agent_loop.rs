@@ -164,7 +164,7 @@ pub async fn run_agent_loop(
             .await?;
 
         // 4. usage 集計
-        total_usage.add(&response.usage);
+        total_usage.add(&response.usage.to_harness_usage());
 
         tracing::debug!(
             "Agent loop turn {}: stop_reason={:?}, content_blocks={}",

@@ -199,7 +199,7 @@ fn convert_response(resp: claude_auth::MessagesResponse) -> MessagesResponse {
         role: Role::Assistant,
         content,
         stop_reason,
-        usage: Usage {
+        usage: ApiUsage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
             cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,

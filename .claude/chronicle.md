@@ -3,6 +3,9 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/06 19:39, end] jj git pull
+- [04/06 19:12, end] jj git pull
+- [04/06 17:20, end] claw-code/Claude Code パターンを参考にエージェントハーネスを強化 + ops の実運用テスト
 - [04/06 17:20, end] claw-code パターン実装 + CTA ops スキル + OAuth 自動回復 + ops トリガー簡素化 + 検証ターン強化
 - [04/04 13:10, end] jj git pull
 - [04/04 11:35, end] jj git pull
@@ -30,7 +33,3 @@
 - [04/01 18:00, end] -
 - [04/01 14:50, end] Context Rot 検知 + 失敗パターンフィードバック実装、pi-mono 風ハーネス移行の調査・設計
 - [04/01 14:50, end] Context Rot 検知 + 失敗パターンフィードバック実装 + pi-mono風ハーネス移行調査
-- [03/31 21:24, end] jj git pull
-- [03/31 14:29, end] pi-mono extensions 調査 + Zenn 記事レビュー
-- [03/31 14:30, end] pi-mono extensions 調査 + Agent SDK/サブスク検討 + ツール拡張方針決定
-- [03/31 13:30, end] claude -p 脱却 — Anthropic API 直叩き Rust エージェントハーネス実装

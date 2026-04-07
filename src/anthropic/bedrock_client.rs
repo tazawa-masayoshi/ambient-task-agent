@@ -125,7 +125,7 @@ impl BedrockClient {
         let mut stream = output.stream;
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut stop_reason: Option<StopReason> = None;
-        let mut usage = Usage::default();
+        let mut usage = ApiUsage::default();
 
         // 現在のコンテンツブロックの蓄積
         let mut current_text = String::new();
@@ -205,7 +205,7 @@ impl BedrockClient {
                 }
                 br::ConverseStreamOutput::Metadata(e) => {
                     if let Some(u) = e.usage() {
-                        usage = Usage {
+                        usage = ApiUsage {
                             input_tokens: u.input_tokens() as u64,
                             output_tokens: u.output_tokens() as u64,
                             cache_creation_input_tokens: u

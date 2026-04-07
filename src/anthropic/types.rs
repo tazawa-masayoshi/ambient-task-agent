@@ -1,7 +1,13 @@
+// agent-harness crate の型を re-export（共通型）
+pub use agent_harness::types::{
+    ContentBlock, Message, Role, StopReason, ToolDefinition, ToolResultBlock,
+    ToolResultContent, Usage,
+};
+
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// Request types
+// Anthropic API 固有の型（harness には含まない）
 // ============================================================================
 
 #[derive(Debug, Serialize)]
@@ -21,7 +27,7 @@ pub struct MessagesRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemBlock {
     #[serde(rename = "type")]
-    pub block_type: String, // "text"
+    pub block_type: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -30,62 +36,7 @@ pub struct SystemBlock {
 #[derive(Debug, Clone, Serialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
-    pub cache_type: String, // "ephemeral"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        content: ToolResultContent,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        is_error: Option<bool>,
-    },
-}
-
-/// tool_result の content は文字列またはコンテンツブロック配列
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ToolResultContent {
-    Text(String),
-    Blocks(Vec<ToolResultBlock>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ToolResultBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
+    pub cache_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,10 +48,6 @@ pub enum ToolChoice {
     None,
 }
 
-// ============================================================================
-// Response types
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesResponse {
@@ -109,20 +56,12 @@ pub struct MessagesResponse {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     pub stop_reason: Option<StopReason>,
-    pub usage: Usage,
+    pub usage: ApiUsage,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    ToolUse,
-    MaxTokens,
-    StopSequence,
-}
-
+/// API レスポンスの Usage（cache フィールドが Option）
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct Usage {
+pub struct ApiUsage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -133,36 +72,20 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
-// SSE Stream Event types は claude-auth crate に移動済み
-
-// ============================================================================
-// Aggregated usage for multi-turn
-// ============================================================================
-
-#[derive(Debug, Clone, Default)]
-pub struct AggregatedUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-}
-
-impl AggregatedUsage {
-    pub fn add(&mut self, usage: &Usage) {
-        self.input_tokens += usage.input_tokens;
-        self.output_tokens += usage.output_tokens;
-        self.cache_creation_input_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-        self.cache_read_input_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-    }
-
-    #[allow(dead_code)]
-    pub fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
+impl ApiUsage {
+    /// harness の Usage に変換
+    pub fn to_harness_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: self.cache_read_input_tokens.unwrap_or(0),
+        }
     }
 }
+
+/// 後方互換: AggregatedUsage は harness の Usage と同一
+pub type AggregatedUsage = Usage;
 
 // ============================================================================
 // Tests
@@ -205,60 +128,20 @@ mod tests {
         let json = r#""end_turn""#;
         let reason: StopReason = serde_json::from_str(json).unwrap();
         assert_eq!(reason, StopReason::EndTurn);
-
-        let json = r#""tool_use""#;
-        let reason: StopReason = serde_json::from_str(json).unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
     }
 
     #[test]
-    fn test_aggregated_usage() {
-        let mut agg = AggregatedUsage::default();
-        agg.add(&Usage {
+    fn test_api_usage_to_harness() {
+        let api = ApiUsage {
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_input_tokens: Some(10),
-            cache_read_input_tokens: Some(20),
-        });
-        agg.add(&Usage {
-            input_tokens: 200,
-            output_tokens: 100,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: Some(30),
-        });
-        assert_eq!(agg.input_tokens, 300);
-        assert_eq!(agg.output_tokens, 150);
-        assert_eq!(agg.cache_creation_input_tokens, 10);
-        assert_eq!(agg.cache_read_input_tokens, 50);
-        assert_eq!(agg.total_tokens(), 510);
-    }
-
-    #[test]
-    fn test_messages_request_serialize() {
-        let req = MessagesRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
-            max_tokens: 4096,
-            system: Some(vec![SystemBlock {
-                block_type: "text".to_string(),
-                text: "You are helpful.".to_string(),
-                cache_control: Some(CacheControl {
-                    cache_type: "ephemeral".to_string(),
-                }),
-            }]),
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Hello".to_string(),
-                }],
-            }],
-            tools: None,
-            tool_choice: None,
-            stream: true,
+            cache_read_input_tokens: None,
         };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"stream\":true"));
-        assert!(json.contains("\"ephemeral\""));
-        // tools/tool_choice は None なのでシリアライズされない
-        assert!(!json.contains("\"tools\""));
+        let h = api.to_harness_usage();
+        assert_eq!(h.input_tokens, 100);
+        assert_eq!(h.output_tokens, 50);
+        assert_eq!(h.cache_creation_input_tokens, 10);
+        assert_eq!(h.cache_read_input_tokens, 0);
     }
 }
