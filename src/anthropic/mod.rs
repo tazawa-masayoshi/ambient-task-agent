@@ -1,6 +1,7 @@
 pub mod types;
-pub mod client;
 pub mod tools;
+pub mod recovery;
+pub mod hook;
 pub mod tool_impls;
 pub mod backend;
 pub mod mcp;

@@ -491,10 +491,6 @@ async fn cmd_serve(port: u16, config_dir: Option<&str>) -> Result<()> {
         backend: build_agent_backend().await,
     };
 
-    if slack_config.signing_secret.is_none() {
-        tracing::warn!("SLACK_SIGNING_SECRET is not set — HTTP webhook signature verification is disabled. Safe if using Socket Mode only.");
-    }
-
     let app_state = server::http::AppState {
         db: db.clone(),
         repos_config: repos_config.clone(),
@@ -643,24 +639,20 @@ mod bedrock_smoke {
 
 #[cfg(test)]
 mod oauth_smoke {
-    use crate::anthropic::client::AnthropicClient;
-    use crate::anthropic::harness_adapter::AmbientLlmClient;
     use agent_harness::types::*;
+    use claude_auth::{AnthropicClient, AnthropicLlmClient};
 
     #[tokio::test]
     async fn test_oauth_max_plan() {
         if std::env::var("OAUTH_SMOKE").is_err() {
             return;
         }
-        let client = AmbientLlmClient {
-            inner: std::sync::Arc::new(AnthropicClient::from_env().expect("Failed to load OAuth credentials")),
-        };
+        let client = AnthropicLlmClient::new(std::sync::Arc::new(
+            AnthropicClient::from_env().expect("Failed to load OAuth credentials"),
+        ));
         let model = std::env::var("ANTHROPIC_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: "Say hello in one word.".into() }],
-        }];
+        let messages = vec![Message::user_text("Say hello in one word.")];
         let resp = agent_harness::LlmClient::send(&client, &model, 50, None, &messages, None)
             .await.unwrap();
         println!("Stop reason: {:?}", resp.stop_reason);

@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use claude_auth::{AnthropicClient, AnthropicLlmClient};
 
 use crate::claude::{AgentBackend, AgentOutput, AgentRequest, TokenUsage};
 
 use super::bedrock_client::BedrockClient;
-use super::client::AnthropicClient;
 use super::harness_adapter;
-use super::harness_adapter::{AmbientLlmClient, AmbientToolExecutor};
+use super::harness_adapter::AmbientToolExecutor;
 use super::mcp::McpManager;
 use super::tools::build_tool_definitions;
 
@@ -21,7 +21,7 @@ pub struct AnthropicApiBackend {
 impl AnthropicApiBackend {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: Arc::new(AnthropicClient::new(api_key)),
+            client: Arc::new(AnthropicClient::with_api_key(api_key, model.clone())),
             model,
         }
     }
@@ -37,9 +37,7 @@ impl AnthropicApiBackend {
 #[async_trait]
 impl AgentBackend for AnthropicApiBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
-        let llm_client = AmbientLlmClient {
-            inner: self.client.clone(),
-        };
+        let llm_client = AnthropicLlmClient::new(self.client.clone());
         execute_with_harness_generic(&llm_client, &self.model, request).await
     }
 }
@@ -147,19 +145,27 @@ async fn execute_with_harness_generic(
         ),
         retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告には OPS_RESULT マーカーを含めてください。".to_string(),
         max_verify_attempts: 3,
+        recovery_detector: Some(Arc::new(super::recovery::AmbientRecoveryDetector)),
     };
 
     // ToolExecutor
     let executor = AmbientToolExecutor {
         mcp_manager: mcp_manager.clone(),
         timeout_secs: request.timeout_secs.unwrap_or(600),
+        permission_mode: request.permission_mode,
+        hook: Some(Arc::new(super::hook::AmbientHookHandler)),
     };
 
     // harness のコアループ実行
     let timeout_dur = std::time::Duration::from_secs(request.timeout_secs.unwrap_or(600));
     let result = tokio::time::timeout(
         timeout_dur,
-        agent_harness::run_agent_loop(llm_client, &executor, config, &request.prompt),
+        agent_harness::run_agent_loop(
+            llm_client,
+            &executor,
+            config,
+            vec![agent_harness::Message::user_text(&request.prompt)],
+        ),
     )
     .await;
 

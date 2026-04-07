@@ -9,7 +9,7 @@ async-trait = "0.1"
 
 # 共有 crate (amu-tazawa-scripts)
 agent-harness = { path = "../amu-tazawa-scripts/crates/agent-harness" }
-claude-auth = { path = "../amu-tazawa-scripts/crates/claude-auth", features = ["stream"] }
+claude-auth = { path = "../amu-tazawa-scripts/crates/claude-auth", features = ["stream", "harness"] }
 slack-socket = { path = "../amu-tazawa-scripts/crates/slack-socket" }
 slack-mrkdwn = { path = "../amu-tazawa-scripts/crates/slack-mrkdwn" }
 aws-config = { version = "1", features = ["behavior-version-latest"] }

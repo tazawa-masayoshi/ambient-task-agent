@@ -88,6 +88,7 @@ pub async fn classify_new_task_llm(
     let result = crate::claude::ClaudeRunner::new("classify", &prompt)
         .max_turns(1)
         .allowed_tools("")
+        .permission_mode(agent_harness::PermissionMode::ReadOnly)
         .json_schema(schema)
         .log_dir(log_dir)
         .with_context(runner_ctx)

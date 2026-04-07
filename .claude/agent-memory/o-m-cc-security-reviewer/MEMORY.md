@@ -1,13 +1,14 @@
 # Security Reviewer Memory
 
 ## Project Threat Model
-- Rust + Axum Web サーバー、Slack Webhook/Events API、SQLite (rusqlite)、subprocess `claude -p`、Asana API、Google Calendar API (Service Account JWT)
-- 信頼境界: Slack 署名検証 (/webhook/slack, /slack/actions ともに実装済み。ただし signing_secret=None で fail-open)
-- 攻撃面: Slack Interactivity エンドポイント、subprocess コマンド実行、ファイル書き出し、LLM プロンプトへの外部データ埋め込み（Asana/GCal）
+- Rust + Axum Web サーバー、Slack Socket Mode (主) + Webhook routes (条件付き mount)、SQLite (rusqlite)、agent-harness 経由の Anthropic/Bedrock API 直接呼び出し、Asana API、Google Calendar API (Service Account JWT)
+- 信頼境界: Slack 署名検証は **fail-closed 化済み** (2026-04-07) — secret 未設定なら webhook ルート自体が mount されず 404
+- 攻撃面: Slack Socket Mode 経由のイベント、ツール実行 (Bash/Write/Edit)、ファイル書き出し、LLM プロンプトへの外部データ埋め込み（Asana/GCal/Slack ファイル名）
+- EC2 SG `sg-0f6143890dad5fc90`: port 3100 は inbound rule なし → AWS レベルで外部到達不可（depth-in-defense として http.rs の fail-closed 修正済み）
 
 ## Known Patterns
-- `slack_signing_secret` は `Option<String>` — None の場合は署名検証をスキップする実装 (fail-open)
-- `/slack/actions` の署名検証コードは追加済みだが、signing_secret=None 時は fail-open のまま (Warning)
+- **webhook ルートは fail-closed** (http.rs:51-): `slack_signing_secret.is_some()` の場合のみ `/webhook/slack` + `/slack/actions` を mount。`asana_webhook_secret.is_some()` の場合のみ `/webhook/asana` を mount。secret 未設定なら 404 で安全 (2026-04-07 修正済み)
+- 過去の fail-open 状態 (Option<String> + ハンドラ内でスキップ) は解消済み。レビュー時に「signing_secret=None で fail-open」を再指摘しないこと
 - HMAC 比較は `constant_time_eq()` による定数時間比較に修正済み (slack_webhook.rs:127-136) — タイミング攻撃リスク解消済み
 - `Command::new("claude").args(["-p", &prompt, ...])` — args() 経由なのでシェルインジェクションは発生しない
 - プロンプトは stdin 経由で渡す (`cmd.stdin(piped)` + `write_all`) — 引数長制限もなし

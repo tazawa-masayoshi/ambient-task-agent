@@ -48,7 +48,8 @@ impl AppState {
 pub async fn run_server(state: AppState, port: u16) -> Result<()> {
     let shared = Arc::new(state);
 
-    let app = Router::new()
+    // 認証不要の内部ルート（ローカルプロセスから叩かれる前提）
+    let mut app: Router<Arc<AppState>> = Router::new()
         .route("/health", get(health))
         .route("/hooks/event", post(hooks::handle_hook_event))
         .route("/api/sessions", get(api::list_sessions))
@@ -57,11 +58,28 @@ pub async fn run_server(state: AppState, port: u16) -> Result<()> {
         .route("/api/tasks/cache", get(api::tasks_cache))
         .route("/api/tasks/summary", get(api::tasks_summary))
         .route("/api/tasks/validate", get(api::validate_tasks))
-        .route("/api/tasks/{id}/progress", get(api::task_progress))
-        .route("/webhook/asana", post(webhook::handle_asana_webhook))
-        .route("/webhook/slack", post(slack_webhook::handle_slack_webhook))
-        .route("/slack/actions", post(slack_actions::handle_slack_action))
-        .with_state(shared);
+        .route("/api/tasks/{id}/progress", get(api::task_progress));
+
+    // 署名検証可能な webhook のみ mount（fail-closed: secret 未設定なら 404）
+    if shared.slack_signing_secret.is_some() {
+        app = app
+            .route("/webhook/slack", post(slack_webhook::handle_slack_webhook))
+            .route("/slack/actions", post(slack_actions::handle_slack_action));
+        tracing::info!("Slack HTTP webhook routes mounted (signature verification enabled)");
+    } else {
+        tracing::info!(
+            "Slack HTTP webhook routes NOT mounted (SLACK_SIGNING_SECRET unset; using Socket Mode if SLACK_APP_TOKEN is set)"
+        );
+    }
+
+    if shared.asana_webhook_secret.is_some() {
+        app = app.route("/webhook/asana", post(webhook::handle_asana_webhook));
+        tracing::info!("Asana webhook route mounted (signature verification enabled)");
+    } else {
+        tracing::info!("Asana webhook route NOT mounted (ASANA_WEBHOOK_SECRET unset)");
+    }
+
+    let app = app.with_state(shared);
 
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Starting server on {}", addr);

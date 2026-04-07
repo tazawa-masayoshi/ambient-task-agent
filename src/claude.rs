@@ -45,6 +45,10 @@ pub struct AgentRequest {
     /// MCP サーバー設定（AnthropicApiBackend でのみ使用）
     #[allow(dead_code)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Bash 実行時の許可モード。classify/conversing は ReadOnly、ops 実行は DangerFullAccess。
+    /// **デフォルトは DangerFullAccess** — ops が広範な書き込みを必要とするため。
+    /// 新しい呼び出し元で読取り専用にしたい場合は明示的に `.permission_mode(ReadOnly)` を指定すること。
+    pub permission_mode: agent_harness::PermissionMode,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -154,6 +158,8 @@ pub struct ClaudeRunner {
     progress: Option<ProgressCallback>,
     /// MCP サーバー設定
     mcp_servers: Vec<McpServerConfig>,
+    /// Bash 実行時の許可モード
+    permission_mode: agent_harness::PermissionMode,
 }
 
 impl ClaudeRunner {
@@ -179,7 +185,14 @@ impl ClaudeRunner {
             fallback_model: None,
             progress: None,
             mcp_servers: Vec::new(),
+            permission_mode: agent_harness::PermissionMode::default(),
         }
+    }
+
+    /// Bash 許可モードを設定（classify/conversing は ReadOnly、ops は DangerFullAccess）
+    pub fn permission_mode(mut self, mode: agent_harness::PermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
     }
 
     /// ストリーミング進捗コールバックを設定（stream-json モードで実行）
@@ -352,6 +365,7 @@ impl ClaudeRunner {
             fallback_model: self.fallback_model.clone(),
             progress: self.progress.clone(),
             mcp_servers: self.mcp_servers.clone(),
+            permission_mode: self.permission_mode,
         };
 
         let backend = self.backend.as_ref()
