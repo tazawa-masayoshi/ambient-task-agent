@@ -15,6 +15,11 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    /// 内部の claude-auth クライアントへのアクセス
+    pub fn inner_client(&self) -> &claude_auth::AnthropicClient {
+        &self.inner
+    }
+
     /// API キー認証
     pub fn new(api_key: String) -> Self {
         let model = std::env::var("ANTHROPIC_MODEL")
