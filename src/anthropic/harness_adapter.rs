@@ -14,12 +14,16 @@ use super::mcp::{parse_mcp_tool_name, McpManager};
 use super::tool_impls;
 use super::types::*;
 
-/// Bash 系ツール（builtin Bash + MCP の bash_command / execute_command）の判定。
-/// hook / bash_validation / mcp_safeguard で共通利用。
+/// MCP の bash 系ツール (`*__bash_command` / `*__execute_command`) の判定。
+/// builtin `Bash` は含まない。
+fn is_mcp_bash_tool(name: &str) -> bool {
+    name.ends_with("__bash_command") || name.ends_with("__execute_command")
+}
+
+/// Bash 系ツール全般 (builtin Bash + MCP bash 系) の判定。
+/// hook / bash_validation で共通利用。
 pub(crate) fn is_bash_tool(name: &str) -> bool {
-    name == "Bash"
-        || name.ends_with("__bash_command")
-        || name.ends_with("__execute_command")
+    name == "Bash" || is_mcp_bash_tool(name)
 }
 
 // ============================================================================
@@ -272,11 +276,11 @@ impl agent_harness::LlmClient for BedrockLlmClient {
 
 /// MCP bash 系ツール (builtin Bash は対象外: tool_impls 内で別途チェック) に対する
 /// dangerous-command pattern safeguard。
+///
+/// 意図的に builtin Bash は除外: builtin は execute_bash 内で同じ check_dangerous_command
+/// を呼ぶため、ここで2重実行する必要がない。
 fn check_mcp_safeguard(name: &str, input: &serde_json::Value) -> Option<String> {
-    // 意図的に builtin Bash は除外: builtin は execute_bash 内で同じ check_dangerous_command
-    // を呼ぶため、ここで2重実行する必要がない。
-    let is_mcp_bash = name.ends_with("__bash_command") || name.ends_with("__execute_command");
-    if is_mcp_bash {
+    if is_mcp_bash_tool(name) {
         if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
             return tool_impls::check_dangerous_command(cmd).map(|r| r.to_string());
         }
