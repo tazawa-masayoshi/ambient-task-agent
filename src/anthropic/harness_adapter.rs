@@ -2,8 +2,6 @@
 //!
 //! harness の LlmClient / ToolExecutor を ambient-task-agent 用に実装する。
 
-#![allow(dead_code)] // backend.rs から呼ぶ予定
-
 use std::path::Path;
 use std::sync::Arc;
 
@@ -99,7 +97,7 @@ impl AmbientToolExecutor {
 // ============================================================================
 
 pub struct AmbientLlmClient {
-    pub inner: super::client::AnthropicClient,
+    pub inner: Arc<super::client::AnthropicClient>,
 }
 
 #[async_trait]
@@ -260,7 +258,7 @@ impl agent_harness::LlmClient for AmbientLlmClient {
 // ============================================================================
 
 pub struct BedrockLlmClient {
-    pub client: super::bedrock_client::BedrockClient,
+    pub client: Arc<super::bedrock_client::BedrockClient>,
 }
 
 #[async_trait]

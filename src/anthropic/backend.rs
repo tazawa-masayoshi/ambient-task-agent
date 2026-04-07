@@ -14,7 +14,6 @@ use super::tools::build_tool_definitions;
 
 /// Anthropic Messages API を直接叩くバックエンド
 pub struct AnthropicApiBackend {
-    #[allow(dead_code)] // harness 移行中、将来的に削除予定
     client: Arc<AnthropicClient>,
     model: String,
 }
@@ -39,8 +38,7 @@ impl AnthropicApiBackend {
 impl AgentBackend for AnthropicApiBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
         let llm_client = AmbientLlmClient {
-            inner: AnthropicClient::from_env()
-                .unwrap_or_else(|_| AnthropicClient::new(String::new())),
+            inner: self.client.clone(),
         };
         execute_with_harness_generic(&llm_client, &self.model, request).await
     }
@@ -51,7 +49,6 @@ impl AgentBackend for AnthropicApiBackend {
 // ============================================================================
 
 pub struct BedrockBackend {
-    #[allow(dead_code)]
     client: Arc<BedrockClient>,
     model: String,
 }
@@ -70,10 +67,7 @@ impl BedrockBackend {
 impl AgentBackend for BedrockBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
         let llm_client = harness_adapter::BedrockLlmClient {
-            client: BedrockClient::new(
-                &std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-                self.model.clone(),
-            ).await?,
+            client: self.client.clone(),
         };
         execute_with_harness_generic(&llm_client, &self.model, request).await
     }

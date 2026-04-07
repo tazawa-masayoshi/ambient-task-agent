@@ -626,7 +626,7 @@ mod bedrock_smoke {
         let model = std::env::var("BEDROCK_MODEL")
             .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string());
         let client = BedrockLlmClient {
-            client: BedrockClient::new("us-east-1", model.clone()).await.unwrap(),
+            client: std::sync::Arc::new(BedrockClient::new("us-east-1", model.clone()).await.unwrap()),
         };
         let messages = vec![Message {
             role: Role::User,
@@ -653,7 +653,7 @@ mod oauth_smoke {
             return;
         }
         let client = AmbientLlmClient {
-            inner: AnthropicClient::from_env().expect("Failed to load OAuth credentials"),
+            inner: std::sync::Arc::new(AnthropicClient::from_env().expect("Failed to load OAuth credentials")),
         };
         let model = std::env::var("ANTHROPIC_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());

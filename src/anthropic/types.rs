@@ -4,7 +4,7 @@ pub use agent_harness::types::{
     ToolResultContent, Usage,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 // ============================================================================
 // Anthropic API 固有の型（harness には含まない）
@@ -47,44 +47,6 @@ pub enum ToolChoice {
     Auto,
     #[serde(rename = "none")]
     None,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct MessagesResponse {
-    pub id: String,
-    pub model: String,
-    pub role: Role,
-    pub content: Vec<ContentBlock>,
-    pub stop_reason: Option<StopReason>,
-    pub usage: ApiUsage,
-}
-
-/// API レスポンスの Usage（cache フィールドが Option）
-#[derive(Debug, Clone, Default, Deserialize)]
-#[allow(dead_code)]
-pub struct ApiUsage {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub cache_read_input_tokens: Option<u64>,
-}
-
-impl ApiUsage {
-    /// harness の Usage に変換
-    #[allow(dead_code)]
-    pub fn to_harness_usage(&self) -> Usage {
-        Usage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens.unwrap_or(0),
-            cache_read_input_tokens: self.cache_read_input_tokens.unwrap_or(0),
-        }
-    }
 }
 
 /// 後方互換: AggregatedUsage は harness の Usage と同一
@@ -133,18 +95,4 @@ mod tests {
         assert_eq!(reason, StopReason::EndTurn);
     }
 
-    #[test]
-    fn test_api_usage_to_harness() {
-        let api = ApiUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_creation_input_tokens: Some(10),
-            cache_read_input_tokens: None,
-        };
-        let h = api.to_harness_usage();
-        assert_eq!(h.input_tokens, 100);
-        assert_eq!(h.output_tokens, 50);
-        assert_eq!(h.cache_creation_input_tokens, 10);
-        assert_eq!(h.cache_read_input_tokens, 0);
-    }
 }
