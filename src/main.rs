@@ -615,8 +615,8 @@ async fn build_bedrock_backend() -> std::sync::Arc<dyn claude::AgentBackend> {
 #[cfg(test)]
 mod bedrock_smoke {
     use crate::anthropic::bedrock_client::BedrockClient;
-    use crate::anthropic::llm_client::LlmClient;
-    use crate::anthropic::types::*;
+    use crate::anthropic::harness_adapter::BedrockLlmClient;
+    use agent_harness::types::*;
 
     #[tokio::test]
     async fn test_bedrock_converse() {
@@ -625,79 +625,47 @@ mod bedrock_smoke {
         }
         let model = std::env::var("BEDROCK_MODEL")
             .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string());
-        let client = BedrockClient::new("us-east-1", model.clone())
-            .await
-            .unwrap();
-        let req = MessagesRequest {
-            model,
-            max_tokens: 50,
-            system: None,
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Say hello in one word.".into(),
-                }],
-            }],
-            tools: None,
-            tool_choice: None,
-            stream: true,
+        let client = BedrockLlmClient {
+            client: BedrockClient::new("us-east-1", model.clone()).await.unwrap(),
         };
-        let resp = client.send_streaming(req, None).await.unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "Say hello in one word.".into() }],
+        }];
+        let resp = agent_harness::LlmClient::send(&client, &model, 50, None, &messages, None)
+            .await.unwrap();
         println!("Stop reason: {:?}", resp.stop_reason);
-        println!("Content blocks: {}", resp.content.len());
         println!("Content: {:?}", resp.content);
-        assert!(!resp.content.is_empty(), "Response content should not be empty");
-        match &resp.content[0] {
-            ContentBlock::Text { text } => println!("Bedrock response: {}", text),
-            other => println!("Bedrock response: {:?}", other),
-        }
-        println!(
-            "Usage: in={} out={}",
-            resp.usage.input_tokens, resp.usage.output_tokens
-        );
+        assert!(!resp.content.is_empty());
+        println!("Usage: in={} out={}", resp.usage.input_tokens, resp.usage.output_tokens);
     }
 }
 
 #[cfg(test)]
 mod oauth_smoke {
-    use std::sync::Arc;
-
     use crate::anthropic::client::AnthropicClient;
-    use crate::anthropic::llm_client::LlmClient;
-    use crate::anthropic::types::*;
+    use crate::anthropic::harness_adapter::AmbientLlmClient;
+    use agent_harness::types::*;
 
     #[tokio::test]
     async fn test_oauth_max_plan() {
         if std::env::var("OAUTH_SMOKE").is_err() {
             return;
         }
-        let client = AnthropicClient::from_env().expect("Failed to load OAuth credentials");
-        let req = MessagesRequest {
-            model: std::env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
-            max_tokens: 50,
-            system: None,
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Say hello in one word.".into(),
-                }],
-            }],
-            tools: None,
-            tool_choice: None,
-            stream: true,
+        let client = AmbientLlmClient {
+            inner: AnthropicClient::from_env().expect("Failed to load OAuth credentials"),
         };
-        let resp = client.send_streaming(req, None).await.unwrap();
+        let model = std::env::var("ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "Say hello in one word.".into() }],
+        }];
+        let resp = agent_harness::LlmClient::send(&client, &model, 50, None, &messages, None)
+            .await.unwrap();
         println!("Stop reason: {:?}", resp.stop_reason);
         println!("Content: {:?}", resp.content);
-        assert!(!resp.content.is_empty(), "Response should have content");
-        match &resp.content[0] {
-            ContentBlock::Text { text } => println!("OAuth response: {}", text),
-            other => println!("OAuth response: {:?}", other),
-        }
-        println!(
-            "Usage: in={} out={}",
-            resp.usage.input_tokens, resp.usage.output_tokens
-        );
+        assert!(!resp.content.is_empty());
+        println!("Usage: in={} out={}", resp.usage.input_tokens, resp.usage.output_tokens);
     }
 }

@@ -256,6 +256,116 @@ impl agent_harness::LlmClient for AmbientLlmClient {
 }
 
 // ============================================================================
+// LlmClient impl — Bedrock Converse API 経由
+// ============================================================================
+
+pub struct BedrockLlmClient {
+    pub client: super::bedrock_client::BedrockClient,
+}
+
+#[async_trait]
+impl agent_harness::LlmClient for BedrockLlmClient {
+    async fn send(
+        &self,
+        _model: &str,
+        max_tokens: u32,
+        system_prompt: Option<&str>,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<agent_harness::LlmResponse> {
+        use super::bedrock_convert;
+        use super::types::{MessagesRequest, ToolChoice};
+
+        // harness 型 → Bedrock 型に変換して呼び出し
+        let request = MessagesRequest {
+            model: String::new(), // Bedrock は model_id を内部で持つ
+            max_tokens,
+            system: system_prompt.map(|sp| {
+                vec![super::types::SystemBlock {
+                    block_type: "text".to_string(),
+                    text: sp.to_string(),
+                    cache_control: None,
+                }]
+            }),
+            messages: messages.to_vec(),
+            tools: tools.map(|t| t.to_vec()),
+            tool_choice: tools.map(|_| ToolChoice::Auto),
+            stream: false,
+        };
+
+        // Bedrock Converse API 呼び出し
+        let br_messages = bedrock_convert::convert_messages(&request.messages);
+        let br_system = request.system.as_ref().map(|s| bedrock_convert::convert_system_blocks(s));
+        let br_tool_config = bedrock_convert::convert_tools(
+            request.tools.as_deref().unwrap_or(&[]),
+            &request.tool_choice,
+        );
+        let inference_config = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
+            .max_tokens(max_tokens as i32)
+            .build();
+
+        let mut builder = self.client.raw_client()
+            .converse()
+            .model_id(self.client.model_id())
+            .set_messages(Some(br_messages))
+            .inference_config(inference_config);
+
+        if let Some(system) = br_system {
+            for block in system {
+                builder = builder.system(block);
+            }
+        }
+        if let Some(tool_config) = br_tool_config {
+            builder = builder.tool_config(tool_config);
+        }
+
+        let output = builder.send().await
+            .map_err(|e| anyhow::anyhow!("Bedrock Converse failed: {}", e))?;
+
+        // Bedrock レスポンス → harness LlmResponse
+        let br_output = output.output()
+            .ok_or_else(|| anyhow::anyhow!("Bedrock: no output"))?;
+
+        let br_message = match br_output {
+            aws_sdk_bedrockruntime::types::ConverseOutput::Message(m) => m,
+            _ => anyhow::bail!("Bedrock: unexpected output type"),
+        };
+
+        let content: Vec<ContentBlock> = br_message.content().iter().map(|block| {
+            match block {
+                aws_sdk_bedrockruntime::types::ContentBlock::Text(text) => {
+                    ContentBlock::Text { text: text.clone() }
+                }
+                aws_sdk_bedrockruntime::types::ContentBlock::ToolUse(tool) => {
+                    let input = bedrock_convert::document_to_serde_value(tool.input().clone());
+                    ContentBlock::ToolUse {
+                        id: tool.tool_use_id().to_string(),
+                        name: tool.name().to_string(),
+                        input,
+                    }
+                }
+                _ => ContentBlock::Text { text: "[unsupported block]".to_string() },
+            }
+        }).collect();
+
+        let stop_reason = Some(bedrock_convert::map_stop_reason(output.stop_reason()));
+
+        let usage = if let Some(u) = output.usage() {
+            Usage {
+                input_tokens: u.input_tokens() as u64,
+                output_tokens: u.output_tokens() as u64,
+                cache_creation_input_tokens: u.cache_write_input_tokens().map(|v| v as u64).unwrap_or(0),
+                cache_read_input_tokens: u.cache_read_input_tokens().map(|v| v as u64).unwrap_or(0),
+            }
+        } else {
+            Usage::default()
+        };
+
+        Ok(agent_harness::LlmResponse { content, stop_reason, usage })
+    }
+}
+
+// ============================================================================
 // MCP safeguard
 // ============================================================================
 

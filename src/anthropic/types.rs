@@ -41,6 +41,7 @@ pub struct CacheControl {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 pub enum ToolChoice {
     #[serde(rename = "auto")]
     Auto,
@@ -61,6 +62,7 @@ pub struct MessagesResponse {
 
 /// API レスポンスの Usage（cache フィールドが Option）
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct ApiUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -74,6 +76,7 @@ pub struct ApiUsage {
 
 impl ApiUsage {
     /// harness の Usage に変換
+    #[allow(dead_code)]
     pub fn to_harness_usage(&self) -> Usage {
         Usage {
             input_tokens: self.input_tokens,

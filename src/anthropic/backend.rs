@@ -5,7 +5,9 @@ use async_trait::async_trait;
 
 use crate::claude::{AgentBackend, AgentOutput, AgentRequest, TokenUsage};
 
+use super::bedrock_client::BedrockClient;
 use super::client::AnthropicClient;
+use super::harness_adapter;
 use super::harness_adapter::{AmbientLlmClient, AmbientToolExecutor};
 use super::mcp::McpManager;
 use super::tools::build_tool_definitions;
@@ -40,7 +42,7 @@ impl AgentBackend for AnthropicApiBackend {
             inner: AnthropicClient::from_env()
                 .unwrap_or_else(|_| AnthropicClient::new(String::new())),
         };
-        execute_with_harness(&llm_client, &self.model, request).await
+        execute_with_harness_generic(&llm_client, &self.model, request).await
     }
 }
 
@@ -48,9 +50,8 @@ impl AgentBackend for AnthropicApiBackend {
 // Bedrock Converse API バックエンド
 // ============================================================================
 
-use super::bedrock_client::BedrockClient;
-
 pub struct BedrockBackend {
+    #[allow(dead_code)]
     client: Arc<BedrockClient>,
     model: String,
 }
@@ -65,97 +66,16 @@ impl BedrockBackend {
     }
 }
 
-// Bedrock 用の LlmClient impl（harness_adapter に追加するか、ここでラップ）
-// 今は旧 agent_loop を使うフォールバック
 #[async_trait]
 impl AgentBackend for BedrockBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
-        // Bedrock は旧 LlmClient trait 経由で旧 agent_loop を使う（暫定）
-        use super::agent_loop::{run_agent_loop, AgentLoopConfig};
-        use super::llm_client::LlmClient;
-
-        let start = std::time::Instant::now();
-
-        let mcp_manager = if !request.mcp_servers.is_empty() {
-            match McpManager::start(&request.mcp_servers).await {
-                Ok(mgr) if !mgr.is_empty() => Some(Arc::new(mgr)),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::error!("MCP startup failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
+        let llm_client = harness_adapter::BedrockLlmClient {
+            client: BedrockClient::new(
+                &std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+                self.model.clone(),
+            ).await?,
         };
-
-        let tools = resolve_tools(request.allowed_tools.as_deref(), mcp_manager.as_deref()).await;
-        let cwd = request.cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
-        let dynamic_context = if request.json_schema.is_none() {
-            let ctx = super::context_builder::ProjectContext::discover(&cwd);
-            let dynamic = super::context_builder::build_dynamic_context(&ctx, &tools);
-            if dynamic.is_empty() { None } else { Some(dynamic) }
-        } else {
-            None
-        };
-
-        let config = AgentLoopConfig {
-            model: self.model.clone(),
-            max_tokens_per_turn: 32000,
-            max_turns: if request.json_schema.is_some() { 1 } else { request.max_turns },
-            system_prompt: request.system_prompt.clone(),
-            tools,
-            cwd,
-            timeout_secs: request.timeout_secs.unwrap_or(600),
-            json_schema: request.json_schema.clone(),
-            progress: request.progress.clone(),
-            mcp_manager: mcp_manager.clone(),
-            permission_mode: super::agent_loop::PermissionMode::default(),
-            dynamic_context,
-        };
-
-        let timeout_dur = std::time::Duration::from_secs(request.timeout_secs.unwrap_or(600));
-        let client: &dyn LlmClient = self.client.as_ref();
-        let result = tokio::time::timeout(timeout_dur, run_agent_loop(client, config, &request.prompt)).await;
-        let duration = start.elapsed();
-
-        if let Some(ref mgr) = mcp_manager {
-            mgr.shutdown().await;
-        }
-
-        match result {
-            Ok(Ok(loop_result)) => {
-                let usage = TokenUsage {
-                    input_tokens: loop_result.total_usage.input_tokens,
-                    output_tokens: loop_result.total_usage.output_tokens,
-                    cache_creation_input_tokens: loop_result.total_usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: loop_result.total_usage.cache_read_input_tokens,
-                };
-                let cost_usd = calculate_cost(&loop_result.total_usage, &self.model);
-                tracing::info!(
-                    "BedrockBackend: {} turns, in={} out={}, cost=${:.6}",
-                    loop_result.turn_count, usage.input_tokens, usage.output_tokens, cost_usd,
-                );
-                Ok(AgentOutput {
-                    success: true,
-                    stdout: loop_result.final_text,
-                    stderr: String::new(),
-                    duration,
-                    truncated: false,
-                    usage: Some(usage),
-                    cost_usd: Some(cost_usd),
-                    session_id: None,
-                })
-            }
-            Ok(Err(e)) => {
-                tracing::error!("BedrockBackend error: {}", e);
-                Ok(AgentOutput { success: false, stdout: String::new(), stderr: e.to_string(), duration, truncated: false, usage: None, cost_usd: None, session_id: None })
-            }
-            Err(_) => {
-                Ok(AgentOutput { success: false, stdout: String::new(), stderr: format!("Timed out after {}s", timeout_dur.as_secs()), duration, truncated: false, usage: None, cost_usd: None, session_id: None })
-            }
-        }
+        execute_with_harness_generic(&llm_client, &self.model, request).await
     }
 }
 
@@ -163,8 +83,8 @@ impl AgentBackend for BedrockBackend {
 // harness 経由の共通実行（AnthropicApiBackend 用）
 // ============================================================================
 
-async fn execute_with_harness(
-    llm_client: &AmbientLlmClient,
+async fn execute_with_harness_generic(
+    llm_client: &dyn agent_harness::LlmClient,
     model: &str,
     request: AgentRequest,
 ) -> Result<AgentOutput> {
