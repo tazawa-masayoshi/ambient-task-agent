@@ -2,14 +2,14 @@
 
 > セッション間の引き継ぎ情報。学びは MEMORY.md、タスクは TaskList、設定は CLAUDE.md。
 
-### Snapshot (04/06 19:39, end)
+### Snapshot (04/07 11:15, manual)
 
 **Intent:** jj git pull
 
 **Next:**
-- 使いまわせるようにしたい
-- jj git push
-- そしたらここだけを中心に変更を重点的にできるし使いまわせるよね
+-  API 固有型を claude-auth crate に移動
+- 次のセッションに回そう
+- /compactしてやろうか
 
 **Outcomes:** 15 files changed
 

@@ -4,10 +4,13 @@ pub use agent_harness::types::{
     ToolResultContent, Usage,
 };
 
+// claude-auth crate の型を re-export（Anthropic API 固有型）
+pub use claude_auth::{SystemBlock, ToolChoice};
+
 use serde::Serialize;
 
 // ============================================================================
-// Anthropic API 固有の型（harness には含まない）
+// Bedrock 呼び出し用パラメータバンドル（harness 型 + API 型を橋渡し）
 // ============================================================================
 
 #[derive(Debug, Serialize)]
@@ -22,31 +25,6 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     pub stream: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SystemBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CacheControl {
-    #[serde(rename = "type")]
-    pub cache_type: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)]
-pub enum ToolChoice {
-    #[serde(rename = "auto")]
-    Auto,
-    #[serde(rename = "none")]
-    None,
 }
 
 /// 後方互換: AggregatedUsage は harness の Usage と同一

@@ -78,3 +78,4 @@
 - [03/31 13:30, end] claude -p 脱却 — Anthropic API 直叩き Rust エージェントハーネス実装
 - [03/31 14:29, end] pi-mono extensions 調査 + Zenn 記事レビュー
 - [03/31 21:24, end] jj git pull
+- [04/01 14:50, end] Context Rot 検知 + 失敗パターンフィードバック実装 + pi-mono風ハーネス移行調査
