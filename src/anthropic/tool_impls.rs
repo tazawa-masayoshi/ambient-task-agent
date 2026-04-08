@@ -1,13 +1,86 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 const MAX_OUTPUT_BYTES: usize = 100_000;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const MAX_READ_LINES: usize = 2000;
 
+/// Read したファイルの mtime を記録し、Edit/Write 時に外部変更（例: `cargo fmt`
+/// や別プロセスによる書き換え）を検出する。
+///
+/// `clone()` は `Arc` を共有する軽量 copy であり、同じ状態を参照する。
+#[derive(Debug, Default, Clone)]
+pub struct StaleFileTracker {
+    inner: Arc<Mutex<HashMap<PathBuf, SystemTime>>>,
+}
+
+impl StaleFileTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read 後 / 自身の Write 後 に現在の mtime を記録。
+    /// mtime 取得失敗は記録しないが、warn ログを残す（黙殺すると後続の
+    /// stale 検知が fail-open になり保証が崩れるため）。
+    pub async fn record(&self, path: &Path) {
+        match file_mtime(path).await {
+            Ok(mtime) => {
+                let mut map = self.inner.lock().expect("StaleFileTracker mutex poisoned");
+                map.insert(path.to_path_buf(), mtime);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "StaleFileTracker::record failed to stat {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Edit/Write 前チェック。以前 Read していない path は常に Ok（追跡対象外）。
+    /// Read 済みで mtime が一致しなければ Err を返す。
+    pub async fn check_before_write(&self, path: &Path) -> Result<(), String> {
+        let recorded = {
+            let map = self.inner.lock().expect("StaleFileTracker mutex poisoned");
+            map.get(path).copied()
+        };
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        let current = match file_mtime(path).await {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(format!(
+                    "file {} no longer readable after Read: {}. Re-read before editing.",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+        if current != recorded {
+            return Err(format!(
+                "file {} was modified externally since Read (mtime changed). \
+                 Re-read the file before editing to avoid overwriting changes.",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn file_mtime(path: &Path) -> std::io::Result<SystemTime> {
+    tokio::fs::metadata(path).await?.modified()
+}
+
 pub struct ToolExecutionContext {
     pub cwd: PathBuf,
     /// Bash ツールのデフォルトタイムアウト上限
     pub timeout_secs: u64,
+    /// Stale file detection tracker (shared across tool calls in the same executor)
+    pub stale_tracker: StaleFileTracker,
 }
 
 pub struct ToolExecutionResult {
@@ -93,6 +166,8 @@ async fn execute_read(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
         ));
     }
 
+    ctx.stale_tracker.record(&file_path).await;
+
     ToolExecutionResult::ok(truncate_output(result))
 }
 
@@ -113,6 +188,11 @@ async fn execute_write(input: &serde_json::Value, ctx: &ToolExecutionContext) ->
         None => return ToolExecutionResult::err("Missing required parameter: content".into()),
     };
 
+    // 新規ファイルなら tracker には未記録なので check は素通し
+    if let Err(reason) = ctx.stale_tracker.check_before_write(&file_path).await {
+        return ToolExecutionResult::err(reason);
+    }
+
     // 親ディレクトリを作成
     if let Some(parent) = file_path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -125,11 +205,14 @@ async fn execute_write(input: &serde_json::Value, ctx: &ToolExecutionContext) ->
     }
 
     match tokio::fs::write(&file_path, content).await {
-        Ok(()) => ToolExecutionResult::ok(format!(
-            "Successfully wrote {} bytes to {}",
-            content.len(),
-            file_path.display()
-        )),
+        Ok(()) => {
+            ctx.stale_tracker.record(&file_path).await;
+            ToolExecutionResult::ok(format!(
+                "Successfully wrote {} bytes to {}",
+                content.len(),
+                file_path.display()
+            ))
+        }
         Err(e) => ToolExecutionResult::err(format!("Error writing {}: {}", file_path.display(), e)),
     }
 }
@@ -154,6 +237,10 @@ async fn execute_edit(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
         Some(s) => s,
         None => return ToolExecutionResult::err("Missing required parameter: new_string".into()),
     };
+
+    if let Err(reason) = ctx.stale_tracker.check_before_write(&file_path).await {
+        return ToolExecutionResult::err(reason);
+    }
 
     let content = match tokio::fs::read_to_string(&file_path).await {
         Ok(c) => c,
@@ -183,10 +270,13 @@ async fn execute_edit(input: &serde_json::Value, ctx: &ToolExecutionContext) -> 
 
     let new_content = content.replacen(old_string, new_string, 1);
     match tokio::fs::write(&file_path, &new_content).await {
-        Ok(()) => ToolExecutionResult::ok(format!(
-            "Successfully edited {}",
-            file_path.display()
-        )),
+        Ok(()) => {
+            ctx.stale_tracker.record(&file_path).await;
+            ToolExecutionResult::ok(format!(
+                "Successfully edited {}",
+                file_path.display()
+            ))
+        }
         Err(e) => ToolExecutionResult::err(format!("Error writing {}: {}", file_path.display(), e)),
     }
 }
@@ -611,6 +701,7 @@ mod tests {
         ToolExecutionContext {
             cwd: dir.to_path_buf(),
             timeout_secs: 30,
+            stale_tracker: StaleFileTracker::new(),
         }
     }
 
@@ -959,5 +1050,187 @@ mod tests {
         let cwd = Path::new("/home/user/project");
         let path = Path::new("/home/user/project/src/main.rs");
         assert!(check_protected_path(path, cwd).is_none());
+    }
+
+    // ========================================================================
+    // StaleFileTracker: Edit/Write stale detection
+    // ========================================================================
+
+    /// mtime 解像度が低い環境 (macOS/HFS+ は 1 秒) でも確実に差分を出すため sleep。
+    fn bump_mtime() {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    #[tokio::test]
+    async fn stale_detection_allows_read_then_edit() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let ctx = test_ctx(dir.path());
+        let read_result = execute_tool(
+            "Read",
+            &json!({"file_path": file.to_str().unwrap()}),
+            &ctx,
+        )
+        .await;
+        assert!(!read_result.is_error);
+
+        let edit_result = execute_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "world",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!edit_result.is_error, "{}", edit_result.output);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "world\n");
+    }
+
+    #[tokio::test]
+    async fn stale_detection_blocks_edit_after_external_modification() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let ctx = test_ctx(dir.path());
+        let _ = execute_tool(
+            "Read",
+            &json!({"file_path": file.to_str().unwrap()}),
+            &ctx,
+        )
+        .await;
+
+        // `cargo fmt` 等の外部変更をシミュレート
+        bump_mtime();
+        std::fs::write(&file, "EXTERNAL_CHANGE\n").unwrap();
+
+        let edit_result = execute_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "EXTERNAL_CHANGE",
+                "new_string": "whatever",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(edit_result.is_error);
+        assert!(
+            edit_result.output.contains("modified externally"),
+            "got: {}",
+            edit_result.output
+        );
+        // 外部変更は保持される (上書きされない)
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "EXTERNAL_CHANGE\n");
+    }
+
+    #[tokio::test]
+    async fn stale_detection_blocks_write_after_external_modification() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "initial\n").unwrap();
+
+        let ctx = test_ctx(dir.path());
+        let _ = execute_tool(
+            "Read",
+            &json!({"file_path": file.to_str().unwrap()}),
+            &ctx,
+        )
+        .await;
+
+        bump_mtime();
+        std::fs::write(&file, "external\n").unwrap();
+
+        let write_result = execute_tool(
+            "Write",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "content": "from_tool\n",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(write_result.is_error);
+        assert!(write_result.output.contains("modified externally"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external\n");
+    }
+
+    #[tokio::test]
+    async fn stale_detection_allows_edit_without_prior_read() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let ctx = test_ctx(dir.path());
+        let result = execute_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "world",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn stale_detection_updates_tracker_after_write() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "v1\n").unwrap();
+
+        let ctx = test_ctx(dir.path());
+        let _ = execute_tool(
+            "Read",
+            &json!({"file_path": file.to_str().unwrap()}),
+            &ctx,
+        )
+        .await;
+
+        let _ = execute_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "v1",
+                "new_string": "v2",
+            }),
+            &ctx,
+        )
+        .await;
+
+        let result = execute_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "v2",
+                "new_string": "v3",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn stale_detection_allows_write_to_new_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("new.txt");
+        let ctx = test_ctx(dir.path());
+        let result = execute_tool(
+            "Write",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "content": "brand new\n",
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!result.is_error);
     }
 }

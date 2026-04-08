@@ -146,6 +146,8 @@ async fn execute_with_harness_generic(
         retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告には OPS_RESULT マーカーを含めてください。".to_string(),
         max_verify_attempts: 3,
         recovery_detector: Some(Arc::new(super::recovery::AmbientRecoveryDetector)),
+        tool_output_offload_threshold: None,
+        tool_output_offload_dir: None,
     };
 
     // ToolExecutor
@@ -154,6 +156,7 @@ async fn execute_with_harness_generic(
         timeout_secs: request.timeout_secs.unwrap_or(600),
         permission_mode: request.permission_mode,
         hook: Some(Arc::new(super::hook::AmbientHookHandler)),
+        stale_tracker: super::tool_impls::StaleFileTracker::new(),
     };
 
     // harness のコアループ実行

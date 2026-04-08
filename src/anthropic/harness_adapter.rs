@@ -38,6 +38,9 @@ pub struct AmbientToolExecutor {
     pub permission_mode: PermissionMode,
     /// Optional pre-tool-use hook. Runs before bash_validation and MCP safeguard.
     pub hook: Option<SharedToolHook>,
+    /// Stale file detection tracker. Shared across all tool calls so that
+    /// Read → Edit pairs can be validated across the whole execution.
+    pub stale_tracker: tool_impls::StaleFileTracker,
 }
 
 #[async_trait]
@@ -75,6 +78,7 @@ impl agent_harness::ToolExecutor for AmbientToolExecutor {
         let ctx = tool_impls::ToolExecutionContext {
             cwd: cwd.to_path_buf(),
             timeout_secs: self.timeout_secs,
+            stale_tracker: self.stale_tracker.clone(),
         };
         let result = tool_impls::execute_tool(name, input, &ctx).await;
         agent_harness::ToolOutput {
