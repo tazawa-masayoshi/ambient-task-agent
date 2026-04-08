@@ -154,6 +154,11 @@ pub struct RepoEntry {
     pub ops_mode: OpsMode,
     /// ops スコープの説明（コンテンツベースルーティングで使用）
     pub ops_description: Option<String>,
+    /// ContentRouter の few-shot 用依頼例。ここに代表的な依頼文を入れておくと
+    /// LLM 分類が「この調子の文ならこの scope」と判定しやすくなる。
+    /// 各例は 200 文字程度に収めるとプロンプト膨張を防げる。
+    #[serde(default)]
+    pub ops_request_examples: Option<Vec<String>>,
     /// true: 分析後に自動実行 + PR 作成（承認スキップ）
     #[serde(default)]
     pub auto_execute: bool,

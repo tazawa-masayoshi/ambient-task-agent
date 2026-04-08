@@ -396,19 +396,30 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                 tracing::info!("ops @bot mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, tts, text, repo_entry, "ready")?;
             }
-            // トップレベル + @admin メンション → admin 宛の依頼として自動分類
+            // トップレベル + @admin (tazawa-masayoshi) メンション → pending で enqueue
+            // ContentRouter が ops_request_examples を few-shot として参照:
+            //  - 該当 scope あり → 自動実行
+            //  - スコープ外（雑談・確認依頼など）→ mark_ops_skipped で安全に無視
             (None, false) if has_admin_mention => {
-                tracing::info!("ops @admin mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
+                tracing::info!(
+                    "ops @admin mention in {}: {}",
+                    channel,
+                    crate::claude::truncate_str(text, 100)
+                );
                 enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
             }
             // トップレベル + メンションなし → 無視（他の人同士の会話）
             (None, false) => {}
-            // スレッド返信 + メンションなし → Inception ターン2 のみ
+            // スレッド返信 + メンションなし → 常に拾う（bot リプライへの返信は絶対対応）
+            // repo_key がチャンネルから直接設定されるので ContentRouter は key 直マッチ、
+            // LLM 分類スキップで即実行できる。
             (Some(tts), false) => {
-                if repo_entry.ops_mode == crate::repo_config::OpsMode::Inception {
-                    tracing::info!("inception: thread reply for turn2 in {}", channel);
-                    enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
-                }
+                tracing::info!(
+                    "ops thread reply in {}: {}",
+                    channel,
+                    crate::claude::truncate_str(text, 100)
+                );
+                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
             }
         }
         return Ok(());

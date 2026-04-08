@@ -96,22 +96,36 @@ impl<'a> ContentRouter<'a> {
             .enumerate()
             .map(|(i, (_, entry))| {
                 let desc = entry.ops_description.as_deref().unwrap_or(&entry.key);
-                format!("{}. {}", i + 1, desc)
+                let mut block = format!("{}. **{}**\n   説明: {}", i + 1, entry.key, desc);
+                if let Some(examples) = &entry.ops_request_examples {
+                    if !examples.is_empty() {
+                        block.push_str("\n   依頼例:");
+                        for ex in examples.iter().take(3) {
+                            // 1 例 200 文字でクランプして prompt 膨張を防ぐ
+                            let truncated: String = ex.chars().take(200).collect();
+                            // 改行を ' / ' に圧縮して 1 行で表示
+                            let oneliner = truncated.replace('\n', " / ");
+                            block.push_str(&format!("\n   - 「{}」", oneliner));
+                        }
+                    }
+                }
+                block
             })
             .collect();
 
         tracing::info!(
-            "ContentRouter: classifying across {} scopes: [{}]",
-            ops_entries.len(),
-            scopes.join(", ")
+            "ContentRouter: classifying across {} scopes",
+            ops_entries.len()
         );
 
         let prompt = format!(
-            "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\n\
+            "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\
+             各スコープの「依頼例」と文体・トピック・使用語彙が近いものを選んでください。\n\
+             どのスコープの依頼例とも明確に異なる場合（雑談・確認依頼・障害報告など）は 0 にしてください。\n\n\
              ## 作業スコープ一覧\n{}\n\n\
              ## メッセージ\n{}\n\n\
-             該当するスコープの番号を scope フィールドに返してください。どれにも該当しない場合は 0 にしてください。",
-            scopes.join("\n"),
+             該当するスコープの番号を scope フィールドに返してください。",
+            scopes.join("\n\n"),
             item.message_text
         );
 

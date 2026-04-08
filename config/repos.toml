@@ -41,6 +41,20 @@ github = "amu-tazawa-scripts/hikken_schedule"
 ops_channel = "必見自動化"
 ops_monitor = true
 ops_description = "必見パチ/スロの「▼サブカテ追加」「▼クローズ対応」指示のみ。障害報告・確認依頼・雑談はスコープ外"
+ops_request_examples = [
+    """お疲れ様です！新企画が追加となりましたのでサブカテ追加と必見自動化のご対応よろしくお願い致します。
+イベント管理No.269：オリジナル取材
+▼サブカテ追加
+推し活リサーチ
+エヌワン東西団結取材
+スロット増台店舗潜入取材""",
+    "▼クローズ対応 イベント管理No.156 期間終了分のクローズをお願いします",
+    """▼サブカテ追加お願いします
+管理No.351 大和の神
+- 天照大御神
+- 須佐之男命
+- 月読命""",
+]
 ops_skills = [".claude/commands/ops.md"]
 ops_download_dir = "images"
 
@@ -50,6 +64,17 @@ github = "amu-tazawa-scripts/send_survey_mail"
 ops_channel = "amz_結果アンケート自動化"
 ops_monitor = true
 ops_description = "結果アンケートの送信設定追加・サブカテ登録。GASベースのスプレッドシート操作"
+ops_request_examples = [
+    """アンケート変更希望案件
+イベント管理NO: 269
+イベント商材名: オリジナル取材
+追加サブカテゴリ: 推し活リサーチ
+事後レポートオプション: 必要
+データ抽出: 空白
+レポート: 要""",
+    "新規サブカテゴリ追加お願いします。管理No.351 大和の神 → 天照大御神/須佐之男命/月読命",
+    "アンケート設定変更 No.123 テンプレートURL更新",
+]
 ops_skills = [".claude/commands/ops.md"]
 ops_download_dir = "downloads"
 
@@ -60,6 +85,14 @@ ops_channel = "amz_企画チーム_自動化支援"
 ops_monitor = true
 ops_mode = "plan"
 ops_description = "favorite_popの新規取材タイプ追加。YAML設定・テンプレート作成の定型作業"
+ops_request_examples = [
+    """新規取材タイプ追加お願いします
+取材名: 推し活リサーチ
+カテゴリ: オリジナル取材
+テンプレート: 既存の○○取材と同じ""",
+    "favorite_pop に新しい取材タイプ「東の極」を追加してください",
+    "新規取材 yaml 追加 — 管理No.269 ジャグリーグ取材",
+]
 ops_skills = [".claude/commands/ops.md"]
 
 [[repo]]
@@ -69,6 +102,11 @@ ops_channel = "amz_企画チーム_自動化支援"
 ops_monitor = true
 ops_mode = "plan"
 ops_description = "上記スコープに該当しない汎用依頼。amu-tazawa-scripts モノリポ全体を対象とした調査・分析・作業計画"
+ops_request_examples = [
+    "○○のスクリプトのバグ調査お願いします。エラーログは別添",
+    "新しい自動化スクリプトを作りたい。要件: ●●を毎日 ●● して Slack に通知",
+    "既存の ●●_pickup を改修して △△ にも対応させたい",
+]
 
 # ── 自己改善（self-improvement）──────────────
 [[repo]]
