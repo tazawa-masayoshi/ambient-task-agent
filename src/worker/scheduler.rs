@@ -1631,6 +1631,34 @@ async fn run_self_improvement(
     Ok(())
 }
 
+// ============================================================================
+// Context Rot Scan
+// ============================================================================
+
+async fn run_context_rot_scan(
+    _job: &ScheduledJob,
+    ctx: &mut SchedulerContext,
+) -> Result<()> {
+    let alerts = super::context_rot::scan_all_repos(&ctx.repos_config, &ctx.db);
+
+    if alerts.is_empty() {
+        tracing::info!("context_rot_scan: no stale skills detected");
+        return Ok(());
+    }
+
+    for alert in &alerts {
+        let msg = super::context_rot::format_rot_alert(alert);
+        if let Err(e) = ctx.slack.post_message(&alert.ops_channel, &msg).await {
+            tracing::warn!("Failed to send context rot notification: {}", e);
+        } else {
+            ctx.db.insert_context_rot_notification(&alert.repo_key).ok();
+        }
+    }
+
+    tracing::info!("context_rot_scan: {} alerts sent", alerts.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1887,32 +1915,4 @@ mod tests {
         assert!(timeline.contains("大きなタスク"));
         assert!(allocated_list.is_empty());
     }
-}
-
-// ============================================================================
-// Context Rot Scan
-// ============================================================================
-
-async fn run_context_rot_scan(
-    _job: &ScheduledJob,
-    ctx: &mut SchedulerContext,
-) -> Result<()> {
-    let alerts = super::context_rot::scan_all_repos(&ctx.repos_config, &ctx.db);
-
-    if alerts.is_empty() {
-        tracing::info!("context_rot_scan: no stale skills detected");
-        return Ok(());
-    }
-
-    for alert in &alerts {
-        let msg = super::context_rot::format_rot_alert(alert);
-        if let Err(e) = ctx.slack.post_message(&alert.ops_channel, &msg).await {
-            tracing::warn!("Failed to send context rot notification: {}", e);
-        } else {
-            ctx.db.insert_context_rot_notification(&alert.repo_key).ok();
-        }
-    }
-
-    tracing::info!("context_rot_scan: {} alerts sent", alerts.len());
-    Ok(())
 }

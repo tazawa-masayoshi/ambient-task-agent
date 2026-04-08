@@ -3,6 +3,7 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/07 11:15, manual] jj git pull
 - [04/06 19:39, end] jj git pull
 - [04/06 19:39, end] jj git pull
 - [04/06 19:12, end] jj git pull
@@ -32,4 +33,3 @@
 - [04/02 11:02, end] jj git pull
 - [04/02 09:01, end] -
 - [04/01 18:00, end] -
-- [04/01 14:50, end] Context Rot 検知 + 失敗パターンフィードバック実装、pi-mono 風ハーネス移行の調査・設計

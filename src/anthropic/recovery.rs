@@ -198,8 +198,8 @@ mod tests {
         messages.push(user_tool_result("non-fast-forward error in git push"));
         // Pad with 6 unrelated messages so the window doesn't reach the failure
         for i in 0..6 {
-            messages.push(Message::assistant_text(&format!("ack {i}")));
-            messages.push(Message::user_text(&format!("ok {i}")));
+            messages.push(Message::assistant_text(format!("ack {i}")));
+            messages.push(Message::user_text(format!("ok {i}")));
         }
         let detector = AmbientRecoveryDetector;
         // Window is 5 messages, the git failure is 12 messages back → not detected
