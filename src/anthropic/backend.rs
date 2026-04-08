@@ -140,10 +140,28 @@ async fn execute_with_harness_generic(
              - `git push` が成功しているか（必要なら実行）\n\
              - clasp push 等のデプロイが必要なら実行済みか\n\
              \n\
-             問題があれば修正してください。最終報告には OPS_RESULT マーカーを含めてください。"
+             ## 最終報告の形式（重要・必ず守る）\n\
+             報告は以下の **2 セクション構成** にしてください:\n\
+             \n\
+             ### 実施内容\n\
+             実際に追加・変更・実行した項目を **ID と名前を明示して箇条書き** してください。\n\
+             例:\n\
+             - `269_173`: 推し活リサーチ を image_mappings.yaml に追加\n\
+             - `images/269_173.png` を配置\n\
+             - 03-constants.js の EXPECTED_PATTERNS[269] に \"D\" 追加\n\
+             - git push 済み (commit: abc1234)\n\
+             - スプレッドシート行追加 (gid=612606300, 行=42)\n\
+             \n\
+             **禁止表現**: 「全て完了」「6 件追加済み」「全項目 ✅」など抽象的な表現。\n\
+             ユーザーが後から個別に検証できる粒度で、必ず固有名詞・ID・コミットハッシュ・ファイル名を入れる。\n\
+             \n\
+             ### 確認結果\n\
+             上記の検証チェックを ✅ / ⚠️ / ❌ で1〜2行で。\n\
+             \n\
+             最終行に OPS_RESULT: completed (または failed) を出力してください。"
                 .to_string(),
         ),
-        retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告には OPS_RESULT マーカーを含めてください。".to_string(),
+        retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告は『実施内容』(ID + 名前を明示) と『確認結果』の2セクション構成で、最終行に OPS_RESULT マーカーを含めてください。".to_string(),
         max_verify_attempts: 3,
         recovery_detector: Some(Arc::new(super::recovery::AmbientRecoveryDetector)),
         tool_output_offload_threshold: None,
