@@ -410,16 +410,17 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             }
             // トップレベル + メンションなし → 無視（他の人同士の会話）
             (None, false) => {}
-            // スレッド返信 + メンションなし → 常に拾う（bot リプライへの返信は絶対対応）
-            // repo_key がチャンネルから直接設定されるので ContentRouter は key 直マッチ、
-            // LLM 分類スキップで即実行できる。
+            // スレッド返信 + メンションなし → pending で enqueue
+            // ContentRouter が few-shot 分類で actionable 判定し、会話の締めくくり
+            //（「対応済みです」「ありがとう」「お疲れ様」等）や関係ない雑談は 0 → skip される。
+            // bot との対話的やり取り（「リストください」「修正して」等）は scope にマッチして実行される。
             (Some(tts), false) => {
                 tracing::info!(
                     "ops thread reply in {}: {}",
                     channel,
                     crate::claude::truncate_str(text, 100)
                 );
-                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
+                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "pending")?;
             }
         }
         return Ok(());

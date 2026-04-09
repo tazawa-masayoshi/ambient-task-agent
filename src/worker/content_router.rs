@@ -33,19 +33,28 @@ impl<'a> ContentRouter<'a> {
 
     /// メッセージ内容からスコープ + MCP サーバー群を決定
     pub async fn route(&self, item: &OpsQueueItem) -> Result<Option<RouteResult>> {
-        // 1. repo_key で直接マッチ
-        if let Some(entry) = self.repos_config.find_repo_by_key(&item.repo_key) {
-            tracing::info!(
-                "ContentRouter: key-matched to scope: {} ({})",
-                entry.key,
-                entry.ops_description.as_deref().unwrap_or("no description")
-            );
-            let repo_path = self.repos_config.repo_local_path(entry);
-            let mcp_configs = mcp_config::build_mcp_configs(entry, &repo_path);
-            return Ok(Some(RouteResult {
-                repo_entry: entry.clone(),
-                mcp_configs,
-            }));
+        // 1. repo_key で直接マッチ（ready ステータスのみ）
+        //
+        // pending ステータスの場合は直接マッチをスキップして必ず LLM 分類に回す。
+        // 理由: pending は「自動拾い」（@admin メンション or スレッド返信）で enqueue
+        // されたもので、会話締め (「対応済み」「ありがとう」) や雑談が混ざる可能性が
+        // あるため、few-shot examples ベースで actionable 判定する必要がある。
+        // ready は @bot メンション / ⚡ リアクション等で明示的にトリガーされたものなので
+        // 直接マッチで信頼していい。
+        if item.status != "pending" {
+            if let Some(entry) = self.repos_config.find_repo_by_key(&item.repo_key) {
+                tracing::info!(
+                    "ContentRouter: key-matched to scope: {} ({})",
+                    entry.key,
+                    entry.ops_description.as_deref().unwrap_or("no description")
+                );
+                let repo_path = self.repos_config.repo_local_path(entry);
+                let mcp_configs = mcp_config::build_mcp_configs(entry, &repo_path);
+                return Ok(Some(RouteResult {
+                    repo_entry: entry.clone(),
+                    mcp_configs,
+                }));
+            }
         }
 
         // 2. コンテンツベースルーティング（LLM スコープ判定）
@@ -121,10 +130,22 @@ impl<'a> ContentRouter<'a> {
         let prompt = format!(
             "以下のSlackメッセージがどの作業スコープに該当するか判定してください。\n\
              各スコープの「依頼例」と文体・トピック・使用語彙が近いものを選んでください。\n\
-             どのスコープの依頼例とも明確に異なる場合（雑談・確認依頼・障害報告など）は 0 にしてください。\n\n\
+             \n\
+             ## 0 (out-of-scope) を返すべきパターン\n\
+             以下のような「作業依頼ではないメッセージ」は必ず 0 を返すこと:\n\
+             - 会話の締めくくり: 「対応済みです」「ありがとうございます」「お疲れ様でした」「了解しました」「確認しました」\n\
+             - 報告のみ: 「A さんに連絡済み」「共有しました」「完了報告です」\n\
+             - 質問・確認依頼: 「どうなってますか？」「進捗教えてください」「これで合ってますか？」\n\
+             - 雑談・挨拶・絵文字のみ: 「お疲れ様です」「👍」「🙏」\n\
+             - 他者間のやり取り: 特定の人宛のメッセージで作業指示でないもの\n\
+             \n\
+             ## スコープ 1〜N を返すべきパターン\n\
+             各スコープの「依頼例」と同じ文体・構造の **作業依頼** のみ。\n\
+             \n\
              ## 作業スコープ一覧\n{}\n\n\
              ## メッセージ\n{}\n\n\
-             該当するスコープの番号を scope フィールドに返してください。",
+             該当するスコープの番号を scope フィールドに返してください。\n\
+             作業依頼ではない会話・報告・確認は 0 を返してください。",
             scopes.join("\n\n"),
             item.message_text
         );
