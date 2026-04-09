@@ -8,10 +8,20 @@
 
 ## 手順
 
-1. **リモート最新を取得**
+1. **残骸チェック & 隔離 → 最新取得 → 新しい change 作成**
    ```bash
-   jj git fetch && jj rebase -d main@origin 2>/dev/null || true
+   # 前の ops の残骸があれば wip として commit して隔離
+   if jj status 2>&1 | grep -q "Working copy changes"; then
+     jj describe -m "wip: stale work before hikken ops $(date +%s)"
+     jj new
+   fi
+
+   # リモート最新取得 & 新しい @ を main@origin の子に rebase
+   jj git fetch
+   jj rebase -r @ -d main@origin 2>/dev/null || true
    ```
+
+   これで `@` は空の change で main@origin の直接の子。他の作業の残骸が混ざらない。
 
 2. **Slack メッセージから作業内容を抽出**
    - 「▼サブカテ追加」→ 追加作業
@@ -39,12 +49,20 @@
 
 5. **コミット & プッシュ**（全エントリ編集後に1回だけ）
    ```bash
-   jj describe -m "feat: サブカテ追加 {イベント名の要約}"
+   # 編集した change に description を付ける
+   jj describe -m "feat(hikken_schedule): サブカテ追加 {イベント名の要約}"
    # クローズの場合:
-   jj describe -m "feat: サブカテクローズ {イベント名の要約}"
+   # jj describe -m "feat(hikken_schedule): サブカテクローズ {イベント名の要約}"
+
+   # push 直前にもう1度 fetch & rebase（並列 ops による remote 進行に対する race 対策）
+   jj git fetch
+   jj rebase -r @ -d main@origin 2>/dev/null || true
+
    jj bookmark set main -r @
    jj git push
    ```
+
+   **注意:** `jj status` で変更対象が `hikken_schedule/` 配下だけになっていることを必ず確認してから describe すること。他プロジェクト（knowledge-bot, crates/, psp_ocr 等）の変更が混ざっていたら異常。その場合は描写せずに報告して中断する。
 
 ## 出力フォーマット
 

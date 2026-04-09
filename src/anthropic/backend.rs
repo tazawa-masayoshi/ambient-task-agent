@@ -126,8 +126,8 @@ async fn execute_with_harness_generic(
         timeout_secs: request.timeout_secs.unwrap_or(600),
         completion_marker: "OPS_RESULT: completed".to_string(),
         failure_marker: "OPS_RESULT: failed".to_string(),
-        verify_prompt: Some(
-            "作業完了前の最終確認を行ってください（検証 {n}/{max}）:\n\
+        verify_prompt: Some(format!(
+            "作業完了前の最終確認を行ってください（検証 {{n}}/{{max}}）:\n\
              \n\
              ## 依頼内容の完了確認\n\
              - 元の依頼で求められた作業を全て実行したか？\n\
@@ -141,11 +141,29 @@ async fn execute_with_harness_generic(
              - clasp push 等のデプロイが必要なら実行済みか\n\
              \n\
              ## 最終報告の形式（重要・必ず守る）\n\
-             報告は以下の **2 セクション構成** にしてください:\n\
+             **依頼者には非エンジニアが含まれるので、技術詳細と人間向けサマリを分けて書く**。\n\
+             報告は以下の **3 セクション構成** にしてください:\n\
              \n\
-             ### 実施内容\n\
-             実際に追加・変更・実行した項目を **ID と名前を明示して箇条書き** してください。\n\
-             例:\n\
+             ### 📋 依頼者向けサマリ\n\
+             依頼者（非エンジニア含む）が一目で状況を理解できる言葉で 2〜5 行。\n\
+             \n\
+             {slack_rules}\n\
+             \n\
+             **書く内容**:\n\
+             - 何が追加・変更されたか（固有名詞で）\n\
+             - いつから使えるか（即時 / 次回送信 / 翌営業日 等）\n\
+             - どこで確認できるか（必要なら）\n\
+             \n\
+             **良い例**:\n\
+             『オリジナル取材にサブカテ「ゾンビ狩り取材」を追加しました。\n\
+             アンケート自動送信システムとスプレッドシート両方に登録済みで、次回の送信から有効です。』\n\
+             \n\
+             **悪い例（技術詳細が混ざっている）**:\n\
+             『行139に追加、gid=930606752、テンプレートID=1iSV7...』\n\
+             \n\
+             ### 🔧 実施内容（技術詳細）\n\
+             エンジニアが後から監査・再現できるレベルで具体的に書く。\n\
+             実際に追加・変更・実行した項目を **ID と名前を明示して箇条書き**:\n\
              - `269_173`: 推し活リサーチ を image_mappings.yaml に追加\n\
              - `images/269_173.png` を配置\n\
              - 03-constants.js の EXPECTED_PATTERNS[269] に \"D\" 追加\n\
@@ -155,13 +173,13 @@ async fn execute_with_harness_generic(
              **禁止表現**: 「全て完了」「6 件追加済み」「全項目 ✅」など抽象的な表現。\n\
              ユーザーが後から個別に検証できる粒度で、必ず固有名詞・ID・コミットハッシュ・ファイル名を入れる。\n\
              \n\
-             ### 確認結果\n\
-             上記の検証チェックを ✅ / ⚠️ / ❌ で1〜2行で。\n\
+             ### ✅ 確認結果\n\
+             検証チェックを ✅ / ⚠️ / ❌ で 1〜2 行の短い箇条書きで。\n\
              \n\
-             最終行に OPS_RESULT: completed (または failed) を出力してください。"
-                .to_string(),
-        ),
-        retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告は『実施内容』(ID + 名前を明示) と『確認結果』の2セクション構成で、最終行に OPS_RESULT マーカーを含めてください。".to_string(),
+             最終行に OPS_RESULT: completed (または failed) を出力してください。",
+            slack_rules = agent_harness::SLACK_FORMAT_RULES,
+        )),
+        retry_prompt: "検証で問題が見つかりました。修正して再度確認してください。\n最終報告は『📋 依頼者向けサマリ』『🔧 実施内容（技術詳細）』『✅ 確認結果』の3セクション構成で、最終行に OPS_RESULT マーカーを含めてください。".to_string(),
         max_verify_attempts: 3,
         recovery_detector: Some(Arc::new(super::recovery::AmbientRecoveryDetector)),
         tool_output_offload_threshold: None,
