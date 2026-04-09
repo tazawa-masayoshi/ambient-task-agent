@@ -87,6 +87,37 @@ impl SlackClient {
     }
 
     /// Block Kit メッセージを更新
+    /// メッセージを削除（chat.delete）。bot 自身が投稿したメッセージのみ削除可能。
+    pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+        });
+
+        let resp = self
+            .client
+            .post("https://slack.com/api/chat.delete")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Slack chat.delete request failed")?;
+
+        let status = resp.status();
+        let data: SlackResponse = resp.json().await.context("Failed to parse Slack response")?;
+
+        if !data.ok {
+            anyhow::bail!(
+                "Slack chat.delete error ({}): {}",
+                status,
+                data.error.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
+        Ok(())
+    }
+
     /// テキストのみでメッセージを上書き更新
     pub async fn update_text(&self, channel: &str, ts: &str, text: &str) -> Result<()> {
         let converted_text = markdown_to_mrkdwn(text);

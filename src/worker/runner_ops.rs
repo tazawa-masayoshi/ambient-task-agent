@@ -481,20 +481,25 @@ impl Worker {
             }
         }
 
-        // 対応不要は :gear: 処理中... メッセージを上書きして完了（別 reply なし）
-        // これにより会話締め (「対応済みです」等) で bot が発火しても Slack に
-        // 新しいメッセージが増えず、処理中マーカーが「対応不要で終了」に変わるだけ。
+        // 対応不要は :gear: 処理中... メッセージを削除して完全 silent にする。
+        // 会話締め (「対応済みです」「ありがとう」等) で bot が発火しても、
+        // Slack UI には一切痕跡を残さない。ログは journalctl に残る。
+        //
+        // 権限エラー等で delete が失敗した場合は update_text で "対応不要" 1 行に
+        // 上書きしてフォールバック（静音性を維持）。
         if is_no_action {
-            let brief = format!("{} *対応不要*{}（スレッドの会話に作業対象なし）", emoji, admin_mention);
             if let Some(ts) = processing_msg_ts {
-                if let Err(e) = slack.update_text(&item.channel, ts, &brief).await {
-                    tracing::warn!("Failed to update processing message for no_action: {}", e);
-                    // fallback: 通常の reply として投稿
-                    slack.reply_thread(&item.channel, reply_ts, &brief).await.ok();
+                if let Err(e) = slack.delete_message(&item.channel, ts).await {
+                    tracing::warn!(
+                        "Failed to delete processing message for no_action ({}), falling back to update",
+                        e
+                    );
+                    let brief = format!(
+                        "{} *対応不要*{}（スレッドの会話に作業対象なし）",
+                        emoji, admin_mention
+                    );
+                    slack.update_text(&item.channel, ts, &brief).await.ok();
                 }
-            } else {
-                // processing_msg_ts が取れなかった場合は通常投稿
-                slack.reply_thread(&item.channel, reply_ts, &brief).await.ok();
             }
             self.db.resolve_ops(item.id).ok();
         } else {
