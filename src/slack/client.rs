@@ -87,6 +87,39 @@ impl SlackClient {
     }
 
     /// Block Kit メッセージを更新
+    /// テキストのみでメッセージを上書き更新
+    pub async fn update_text(&self, channel: &str, ts: &str, text: &str) -> Result<()> {
+        let converted_text = markdown_to_mrkdwn(text);
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "text": converted_text,
+        });
+
+        let resp = self
+            .client
+            .post("https://slack.com/api/chat.update")
+            .header("Authorization", format!("Bearer {}", self.config.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Slack chat.update request failed")?;
+
+        let status = resp.status();
+        let data: SlackResponse = resp.json().await.context("Failed to parse Slack response")?;
+
+        if !data.ok {
+            anyhow::bail!(
+                "Slack chat.update error ({}): {}",
+                status,
+                data.error.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
+        Ok(())
+    }
+
     pub async fn update_blocks(
         &self,
         channel: &str,

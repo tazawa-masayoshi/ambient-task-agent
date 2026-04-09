@@ -73,7 +73,11 @@ impl Worker {
 
         let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
         let slack = self.slack.clone();
-        slack.reply_thread(&item.channel, reply_ts, ":gear: 処理中...").await.ok();
+        // :gear: の ts を保持して、no_action 時に update でクリーンアップできるようにする
+        let processing_msg_ts = slack
+            .reply_thread(&item.channel, reply_ts, ":gear: 処理中...")
+            .await
+            .ok();
 
         let exec_result = self.prepare_ops_execution(&item, &repo_entry).await?;
 
@@ -94,7 +98,14 @@ impl Worker {
                     tracing::warn!("Failed to save ops context (assistant): {}", e);
                 }
 
-                self.post_ops_result(&item, &output, exec_result.exec_mode, reply_ts, &admin_mention).await?;
+                self.post_ops_result(
+                    &item,
+                    &output,
+                    exec_result.exec_mode,
+                    reply_ts,
+                    &admin_mention,
+                    processing_msg_ts.as_deref(),
+                ).await?;
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -331,6 +342,9 @@ impl Worker {
     }
 
     /// 実行成功時の Slack 投稿: Inception Turn1/Turn2 / Execute / Plan。
+    ///
+    /// `processing_msg_ts`: `:gear: 処理中...` メッセージの ts。no_action 時に
+    /// このメッセージを update で上書きして、別途 reply を投稿しない形にする。
     async fn post_ops_result(
         self: &Arc<Self>,
         item: &OpsQueueItem,
@@ -338,6 +352,7 @@ impl Worker {
         exec_mode: OpsExecMode,
         reply_ts: &str,
         admin_mention: &str,
+        processing_msg_ts: Option<&str>,
     ) -> Result<()> {
         let slack = self.slack.clone();
 
@@ -466,10 +481,21 @@ impl Worker {
             }
         }
 
-        // 対応不要はボタンなしで即解決、それ以外は完了/タスク化ボタン付き
+        // 対応不要は :gear: 処理中... メッセージを上書きして完了（別 reply なし）
+        // これにより会話締め (「対応済みです」等) で bot が発火しても Slack に
+        // 新しいメッセージが増えず、処理中マーカーが「対応不要で終了」に変わるだけ。
         if is_no_action {
-            let msg = format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated);
-            slack.reply_thread(&item.channel, reply_ts, &msg).await.ok();
+            let brief = format!("{} *対応不要*{}（スレッドの会話に作業対象なし）", emoji, admin_mention);
+            if let Some(ts) = processing_msg_ts {
+                if let Err(e) = slack.update_text(&item.channel, ts, &brief).await {
+                    tracing::warn!("Failed to update processing message for no_action: {}", e);
+                    // fallback: 通常の reply として投稿
+                    slack.reply_thread(&item.channel, reply_ts, &brief).await.ok();
+                }
+            } else {
+                // processing_msg_ts が取れなかった場合は通常投稿
+                slack.reply_thread(&item.channel, reply_ts, &brief).await.ok();
+            }
             self.db.resolve_ops(item.id).ok();
         } else {
             let blocks = serde_json::json!([

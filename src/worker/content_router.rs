@@ -33,28 +33,19 @@ impl<'a> ContentRouter<'a> {
 
     /// メッセージ内容からスコープ + MCP サーバー群を決定
     pub async fn route(&self, item: &OpsQueueItem) -> Result<Option<RouteResult>> {
-        // 1. repo_key で直接マッチ（ready ステータスのみ）
-        //
-        // pending ステータスの場合は直接マッチをスキップして必ず LLM 分類に回す。
-        // 理由: pending は「自動拾い」（@admin メンション or スレッド返信）で enqueue
-        // されたもので、会話締め (「対応済み」「ありがとう」) や雑談が混ざる可能性が
-        // あるため、few-shot examples ベースで actionable 判定する必要がある。
-        // ready は @bot メンション / ⚡ リアクション等で明示的にトリガーされたものなので
-        // 直接マッチで信頼していい。
-        if item.status != "pending" {
-            if let Some(entry) = self.repos_config.find_repo_by_key(&item.repo_key) {
-                tracing::info!(
-                    "ContentRouter: key-matched to scope: {} ({})",
-                    entry.key,
-                    entry.ops_description.as_deref().unwrap_or("no description")
-                );
-                let repo_path = self.repos_config.repo_local_path(entry);
-                let mcp_configs = mcp_config::build_mcp_configs(entry, &repo_path);
-                return Ok(Some(RouteResult {
-                    repo_entry: entry.clone(),
-                    mcp_configs,
-                }));
-            }
+        // 1. repo_key で直接マッチ（status 問わず fast path）
+        if let Some(entry) = self.repos_config.find_repo_by_key(&item.repo_key) {
+            tracing::info!(
+                "ContentRouter: key-matched to scope: {} ({})",
+                entry.key,
+                entry.ops_description.as_deref().unwrap_or("no description")
+            );
+            let repo_path = self.repos_config.repo_local_path(entry);
+            let mcp_configs = mcp_config::build_mcp_configs(entry, &repo_path);
+            return Ok(Some(RouteResult {
+                repo_entry: entry.clone(),
+                mcp_configs,
+            }));
         }
 
         // 2. コンテンツベースルーティング（LLM スコープ判定）

@@ -390,37 +390,39 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
         let has_admin_mention = admin_user_id
             .is_some_and(|admin| text.contains(&format!("<@{}", admin)));
 
+        // シンプルな 4 ルール:
+        //  - @bot メンション → 即実行
+        //  - ⚡ スタンプ → 即実行 (reaction_added handler 側)
+        //  - スレッド返信 → 即実行 (ops が動いているスレッドへの返信は常に対象)
+        //  - @admin メンション (tazawa-masayoshi) → 即実行 (admin 宛の明示的依頼)
+        //  - その他 → 無視
+        //
+        // 会話締め (「対応済みです」「ありがとう」等) で ops が走っても、
+        // agent が OPS_RESULT: no_action を返したら runner_ops 側で Slack 出力を
+        // 抑制するので spam にならない。LLM 分類フィルタは採用しない (シンプルさ優先)。
         match (thread_ts, has_mention) {
-            // @bot メンション（トップ or スレッド）→ 即実行
             (tts, true) => {
                 tracing::info!("ops @bot mention in {}: {}", channel, crate::claude::truncate_str(text, 100));
                 enqueue_ops_request(state, event, channel, message_ts, tts, text, repo_entry, "ready")?;
             }
-            // トップレベル + @admin (tazawa-masayoshi) メンション → pending で enqueue
-            // ContentRouter が ops_request_examples を few-shot として参照:
-            //  - 該当 scope あり → 自動実行
-            //  - スコープ外（雑談・確認依頼など）→ mark_ops_skipped で安全に無視
             (None, false) if has_admin_mention => {
                 tracing::info!(
                     "ops @admin mention in {}: {}",
                     channel,
                     crate::claude::truncate_str(text, 100)
                 );
-                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "pending")?;
+                enqueue_ops_request(state, event, channel, message_ts, None, text, repo_entry, "ready")?;
             }
-            // トップレベル + メンションなし → 無視（他の人同士の会話）
-            (None, false) => {}
-            // スレッド返信 + メンションなし → pending で enqueue
-            // ContentRouter が few-shot 分類で actionable 判定し、会話の締めくくり
-            //（「対応済みです」「ありがとう」「お疲れ様」等）や関係ない雑談は 0 → skip される。
-            // bot との対話的やり取り（「リストください」「修正して」等）は scope にマッチして実行される。
+            (None, false) => {
+                // トップレベル + メンションなし → 無視（他の人同士の会話）
+            }
             (Some(tts), false) => {
                 tracing::info!(
                     "ops thread reply in {}: {}",
                     channel,
                     crate::claude::truncate_str(text, 100)
                 );
-                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "pending")?;
+                enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
             }
         }
         return Ok(());
