@@ -327,6 +327,24 @@ impl Worker {
             }
         };
 
+        // 提案承認済みフラグ: 前回 proposal → 承認 → 再キューされた場合、
+        // 「承認済みなので実行せよ」という追加指示を注入する
+        let is_proposal_approved = item.error_message.as_deref() == Some("proposal approved");
+        let proposal_override = if is_proposal_approved {
+            Some("\n\n## 提案承認済み\n前回この依頼に対して提案を出し、管理者が承認しました。\
+                  今回は提案ではなく **実際に実行** してください。`OPS_RESULT: completed` で完了すること。")
+        } else {
+            None
+        };
+
+        // failure_context と proposal_override を結合
+        let combined_context = match (&failure_context, &proposal_override) {
+            (Some(f), Some(p)) => Some(format!("{}{}", f, p)),
+            (Some(f), None) => Some(f.clone()),
+            (None, Some(p)) => Some(p.to_string()),
+            (None, None) => None,
+        };
+
         // MCP サーバー設定の動的構築
         let mcp_configs = crate::anthropic::mcp_config::build_mcp_configs(repo_entry, &repo_path);
 
@@ -334,7 +352,7 @@ impl Worker {
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
             exec_mode, None,
-            failure_context.as_deref(),
+            combined_context.as_deref(),
             mcp_configs,
         ).await;
 
@@ -429,7 +447,10 @@ impl Worker {
         // OPS_RESULT マーカーで判定: 最終非空行のみ検査（本文中の誤検知を防止）。
         // フォールバック: マーカーがない場合のみ、先頭200文字のキーワード検索。
         let last_line = output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-        let is_no_action = if last_line.contains("OPS_RESULT: no_action") {
+        let is_proposal = last_line.contains("OPS_RESULT: proposal");
+        let is_no_action = if is_proposal {
+            false
+        } else if last_line.contains("OPS_RESULT: no_action") {
             true
         } else if last_line.contains("OPS_RESULT: completed") || last_line.contains("OPS_RESULT: failed") {
             false
@@ -442,6 +463,8 @@ impl Worker {
         };
         let emoji = if is_no_action {
             ":information_source:"
+        } else if is_proposal {
+            ":bulb:"
         } else if is_plan_only {
             ":memo:"
         } else {
@@ -449,6 +472,8 @@ impl Worker {
         };
         let label = if is_no_action {
             "対応不要"
+        } else if is_proposal {
+            "提案"
         } else if is_plan_only {
             "分析完了"
         } else {
@@ -461,6 +486,8 @@ impl Worker {
         let is_failed = last_line.contains("OPS_RESULT: failed");
         let outcome = if is_no_action {
             "no_action"
+        } else if is_proposal {
+            "proposal"
         } else if is_failed {
             "failed"
         } else {
@@ -502,6 +529,51 @@ impl Worker {
                 }
             }
             self.db.resolve_ops(item.id).ok();
+        } else if is_proposal {
+            // 提案モード: 実行せず提案のみ → 承認ボタンで実行可能
+            let blocks = serde_json::json!([
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{1f680} 承認して実行" },
+                            "style": "primary",
+                            "action_id": "ops_approve_proposal",
+                            "value": item.id.to_string()
+                        },
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                            "action_id": "ops_escalate",
+                            "value": item.id.to_string()
+                        },
+                        {
+                            "type": "button",
+                            "text": { "type": "plain_text", "text": "\u{274c} 却下" },
+                            "action_id": "ops_resolve",
+                            "value": item.id.to_string()
+                        }
+                    ]
+                }
+            ]);
+            let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);
+            match slack.post_blocks(&item.channel, reply_ts, &blocks, &fallback).await {
+                Ok(ts) => {
+                    self.db.set_ops_notify_ts(item.id, &ts).ok();
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to post ops blocks: {}", e);
+                    slack.reply_thread(&item.channel, reply_ts, &fallback).await.ok();
+                }
+            }
         } else {
             let blocks = serde_json::json!([
                 {

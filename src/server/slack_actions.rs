@@ -201,6 +201,10 @@ async fn process_action(
     if action_id == "ops_escalate" {
         return process_ops_escalate(state, action_value, channel, message_ts, thread_ts).await;
     }
+    if action_id == "ops_approve_proposal" {
+        return process_ops_approve_proposal(state, action_value, channel, message_ts, thread_ts)
+            .await;
+    }
     // Inception モード 承認ゲート（admin 権限チェック）
     if action_id.starts_with("ops_inception_") {
         if let Some(admin) = state.repos_config.defaults.ops_admin_user.as_deref() {
@@ -499,6 +503,39 @@ async fn process_ops_resolve(
             .ok();
     }
 
+    Ok(())
+}
+
+/// ops_approve_proposal ボタンの処理: 提案を承認してキューに再投入 → 自動実行
+async fn process_ops_approve_proposal(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+    _thread_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    // done → ready に戻して再実行
+    state.db.requeue_ops_for_execution(ops_id)?;
+    tracing::info!("ops item {} proposal approved, requeued for execution", ops_id);
+
+    // ボタンを「承認済み」ラベルに置き換え
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let blocks = serde_json::json!([{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":rocket: *提案承認 — 実行中...*"
+            }
+        }]);
+        slack.update_blocks(channel, msg_ts, &blocks, "提案承認 — 実行中").await.ok();
+    }
+
+    state.wake_worker();
     Ok(())
 }
 

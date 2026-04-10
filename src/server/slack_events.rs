@@ -383,10 +383,11 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
     let has_mention = !state.bot_user_id.is_empty() && text.contains(&bot_mention);
 
     if let Some(repo_entry) = state.repos_config.find_repo_by_ops_channel(channel) {
-        let _sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
+        let sender = event.get("user").and_then(|u| u.as_str()).unwrap_or_default();
 
         // @admin ユーザー宛メンションの検出
         let admin_user_id = state.repos_config.defaults.ops_admin_user.as_deref();
+        let is_admin = admin_user_id.is_some_and(|admin| sender == admin);
         let has_admin_mention = admin_user_id
             .is_some_and(|admin| text.contains(&format!("<@{}", admin)));
 
@@ -416,13 +417,17 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
             (None, false) => {
                 // トップレベル + メンションなし → 無視（他の人同士の会話）
             }
-            (Some(tts), false) => {
+            (Some(tts), false) if !is_admin => {
                 tracing::info!(
                     "ops thread reply in {}: {}",
                     channel,
                     crate::claude::truncate_str(text, 100)
                 );
                 enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
+            }
+            (Some(_), false) => {
+                // admin のスレッド返信 → 無視（admin が自分で対応報告するケース）
+                tracing::debug!("ops thread reply from admin in {}: ignored", channel);
             }
         }
         return Ok(());

@@ -3,6 +3,13 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/10 16:25, end] jj git pull
+- [04/10 16:22, end] jj git pull
+- [04/10 16:20, end] jj git pull
+- [04/10 13:35, end] jj git pull
+- [04/10 10:09, auto] jj git pull
+- [04/10 02:19, end] jj git pull
+- [04/09 18:04, end] jj git pull
 - [04/09 10:47, end] jj git pull
 - [04/08 21:57, end] jj git pull
 - [04/08 18:31, manual] jj pull → conflict 解決
@@ -26,10 +33,3 @@
 - [04/02 14:24, end] 0c
 - [04/02 14:24, end] 0c
 - [04/02 14:23, end] jj git pull
-- [04/02 14:20, end] jj git pull
-- [04/02 14:17, end] jj git pull
-- [04/02 13:56, end] jj git pull
-- [04/02 13:54, end] jj git pull
-- [04/02 13:51, end] jj git pull
-- [04/02 13:49, end] jj git pull
-- [04/02 11:02, end] jj git pull

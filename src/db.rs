@@ -1053,7 +1053,7 @@ impl Db {
                AND repo_key NOT IN (SELECT DISTINCT repo_key FROM ops_queue WHERE status = 'processing') \
                ORDER BY created_at ASC LIMIT 1 \
              ) \
-             RETURNING id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count",
+             RETURNING id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count, error_message",
             [],
             |row| {
                 Ok(OpsQueueItem {
@@ -1066,6 +1066,7 @@ impl Db {
                     event_json: row.get(6)?,
                     status: row.get(7)?,
                     retry_count: row.get(8)?,
+                    error_message: row.get(9)?,
                 })
             },
         );
@@ -1312,7 +1313,7 @@ impl Db {
     pub fn get_ops_item(&self, id: i64) -> Result<Option<OpsQueueItem>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count \
+            "SELECT id, channel, message_ts, thread_ts, repo_key, message_text, event_json, status, retry_count, error_message \
              FROM ops_queue WHERE id = ?1",
             params![id],
             |row| {
@@ -1326,6 +1327,7 @@ impl Db {
                     event_json: row.get(6)?,
                     status: row.get(7)?,
                     retry_count: row.get(8)?,
+                    error_message: row.get(9)?,
                 })
             },
         );
@@ -1588,6 +1590,18 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// 提案承認: done → ready に戻して再実行させる
+    pub fn requeue_ops_for_execution(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET status = 'ready', retry_count = 0, outcome = NULL, \
+             done_at = NULL, error_message = 'proposal approved', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1610,6 +1624,7 @@ pub struct OpsQueueItem {
     pub event_json: String,
     pub status: String,
     pub retry_count: i64,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
