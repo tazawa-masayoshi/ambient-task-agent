@@ -5,6 +5,7 @@ pub mod context;
 pub mod executor;
 pub mod ops;
 pub mod priority;
+pub mod prompt_evolution;
 pub mod ratchet;
 pub mod runner;
 mod runner_ci;
