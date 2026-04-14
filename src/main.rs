@@ -100,9 +100,9 @@ enum Commands {
 enum PromptEvolutionAction {
     /// 提案一覧を表示
     List {
-        /// status で絞り込み（pending/approved/rejected/postponed）
-        #[arg(long)]
-        status: Option<String>,
+        /// status で絞り込み (pending/approved/rejected/postponed)
+        #[arg(long, value_enum)]
+        status: Option<db::ProposalStatus>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
@@ -153,7 +153,7 @@ fn cmd_prompt_evolution(action: PromptEvolutionAction) -> Result<()> {
 
     match action {
         PromptEvolutionAction::List { status, limit, json } => {
-            let items = db.list_prompt_evolution_proposals(status.as_deref(), limit)?;
+            let items = db.list_prompt_evolution_proposals(status, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else if items.is_empty() {
@@ -197,12 +197,12 @@ fn cmd_prompt_evolution(action: PromptEvolutionAction) -> Result<()> {
         }
         PromptEvolutionAction::Approve { id } => {
             db.guard_prompt_evolution_mutable(id)?;
-            db.update_prompt_evolution_status(id, "approved")?;
+            db.update_prompt_evolution_status(id, db::ProposalStatus::Approved)?;
             println!("proposal #{id} → approved (次 ops 実行から新 prompt が反映されます)");
         }
         PromptEvolutionAction::Reject { id } => {
             db.guard_prompt_evolution_mutable(id)?;
-            db.update_prompt_evolution_status(id, "rejected")?;
+            db.update_prompt_evolution_status(id, db::ProposalStatus::Rejected)?;
             println!("proposal #{id} → rejected");
         }
         PromptEvolutionAction::Postpone { id } => {

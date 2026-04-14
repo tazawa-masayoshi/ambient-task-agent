@@ -1352,50 +1352,46 @@ impl Db {
     #[allow(dead_code)]
     pub fn list_prompt_evolution_proposals(
         &self,
-        status: Option<&str>,
+        status: Option<ProposalStatus>,
         limit: usize,
     ) -> Result<Vec<PromptEvolutionProposal>> {
         let conn = self.conn.lock().unwrap();
-        let (sql, use_status) = match status {
-            Some(_) => (
-                "SELECT id, repo_key, created_at, best_prompt, best_score, \
-                        best_rationale, score_rationale, candidates_json, \
-                        status, decided_at, reminded_at \
-                 FROM prompt_evolution_proposals \
-                 WHERE status = ?1 \
-                 ORDER BY created_at DESC, id DESC LIMIT ?2",
-                true,
-            ),
-            None => (
-                "SELECT id, repo_key, created_at, best_prompt, best_score, \
-                        best_rationale, score_rationale, candidates_json, \
-                        status, decided_at, reminded_at \
-                 FROM prompt_evolution_proposals \
-                 ORDER BY created_at DESC, id DESC LIMIT ?1",
-                false,
-            ),
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = if use_status {
-            stmt.query_map(
-                params![status.unwrap(), limit as i64],
-                row_to_prompt_evolution_proposal,
-            )?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map(params![limit as i64], row_to_prompt_evolution_proposal)?
+        let rows = match status {
+            Some(s) => conn
+                .prepare(
+                    "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                            best_rationale, score_rationale, candidates_json, \
+                            status, decided_at, reminded_at \
+                     FROM prompt_evolution_proposals \
+                     WHERE status = ?1 \
+                     ORDER BY created_at DESC, id DESC LIMIT ?2",
+                )?
+                .query_map(
+                    params![s.as_db_str(), limit as i64],
+                    row_to_prompt_evolution_proposal,
+                )?
                 .filter_map(|r| r.ok())
-                .collect()
+                .collect(),
+            None => conn
+                .prepare(
+                    "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                            best_rationale, score_rationale, candidates_json, \
+                            status, decided_at, reminded_at \
+                     FROM prompt_evolution_proposals \
+                     ORDER BY created_at DESC, id DESC LIMIT ?1",
+                )?
+                .query_map(params![limit as i64], row_to_prompt_evolution_proposal)?
+                .filter_map(|r| r.ok())
+                .collect(),
         };
         Ok(rows)
     }
 
-    /// 提案を取得し、approved/rejected 済みでないことを確認してから返す。
+    /// 提案を取得し、final (approved/rejected) でないことを確認してから返す。
     /// 採用/却下/postpone のガード用途（Slack ハンドラと CLI で共有）。
     ///
     /// - not found → Err
-    /// - status が approved/rejected → Err
+    /// - status が final (approved/rejected) → Err
     /// - それ以外 (pending/postponed) → Ok(proposal)
     #[allow(dead_code)]
     pub fn guard_prompt_evolution_mutable(
@@ -1405,7 +1401,7 @@ impl Db {
         let p = self
             .get_prompt_evolution_proposal(id)?
             .ok_or_else(|| anyhow::anyhow!("proposal #{id} not found"))?;
-        if p.status == "approved" || p.status == "rejected" {
+        if p.status.is_final() {
             anyhow::bail!("proposal #{id} is already {}, cannot modify", p.status);
         }
         Ok(p)
@@ -1435,13 +1431,17 @@ impl Db {
 
     /// 提案の status を更新（承認 / 却下）。decided_at を同時にセット。
     #[allow(dead_code)]
-    pub fn update_prompt_evolution_status(&self, id: i64, status: &str) -> Result<()> {
+    pub fn update_prompt_evolution_status(
+        &self,
+        id: i64,
+        status: ProposalStatus,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE prompt_evolution_proposals \
              SET status = ?1, decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
              WHERE id = ?2",
-            params![status, id],
+            params![status.as_db_str(), id],
         )?;
         Ok(())
     }
@@ -1878,6 +1878,65 @@ pub struct FailurePattern {
     pub created_at: String,
 }
 
+/// prompt_evolution の状態遷移 enum。DB には lowercase 文字列で保存する。
+///
+/// 遷移図:
+/// ```text
+/// Pending ──approve──> Approved (final)
+///     │
+///     ├──reject──> Rejected (final)
+///     │
+///     └──postpone──> Postponed ──remind──> (reminded_at 更新、Postponed 維持)
+///                        │
+///                        ├──approve──> Approved
+///                        └──reject──> Rejected
+/// ```
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Postponed,
+}
+
+impl ProposalStatus {
+    /// DB カラムに書き込む lowercase 文字列。
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Postponed => "postponed",
+        }
+    }
+
+    /// DB から読み出した文字列から復元。未知値は Err。
+    pub fn from_db_str(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "postponed" => Ok(Self::Postponed),
+            other => anyhow::bail!("Unknown ProposalStatus in DB: {other}"),
+        }
+    }
+
+    /// 採用/却下で final 状態 → 再操作不可。
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Approved | Self::Rejected)
+    }
+}
+
+impl std::fmt::Display for ProposalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_db_str())
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)]
 pub struct PromptEvolutionProposal {
@@ -1889,7 +1948,7 @@ pub struct PromptEvolutionProposal {
     pub best_rationale: Option<String>,
     pub score_rationale: Option<String>,
     pub candidates_json: String,
-    pub status: String,
+    pub status: ProposalStatus,
     pub decided_at: Option<String>,
     pub reminded_at: Option<String>,
 }
@@ -1897,6 +1956,14 @@ pub struct PromptEvolutionProposal {
 fn row_to_prompt_evolution_proposal(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<PromptEvolutionProposal> {
+    let status_str: String = row.get(8)?;
+    let status = ProposalStatus::from_db_str(&status_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+        )
+    })?;
     Ok(PromptEvolutionProposal {
         id: row.get(0)?,
         repo_key: row.get(1)?,
@@ -1906,7 +1973,7 @@ fn row_to_prompt_evolution_proposal(
         best_rationale: row.get(5)?,
         score_rationale: row.get(6)?,
         candidates_json: row.get(7)?,
-        status: row.get(8)?,
+        status,
         decided_at: row.get(9)?,
         reminded_at: row.get(10)?,
     })
@@ -2056,7 +2123,7 @@ mod tests {
         assert_eq!(last.id, id2);
         assert_eq!(last.best_prompt, "candidate prompt B");
         assert!((last.best_score - 91.0).abs() < 0.001);
-        assert_eq!(last.status, "pending");
+        assert_eq!(last.status, ProposalStatus::Pending);
 
         // 別 repo は独立
         let none = db.get_last_prompt_evolution_proposal("repo2").unwrap();
@@ -2075,8 +2142,8 @@ mod tests {
         let id3 = db
             .insert_prompt_evolution_proposal("r1", "P3", 70.0, None, None, "[]")
             .unwrap();
-        db.update_prompt_evolution_status(id2, "approved").unwrap();
-        db.update_prompt_evolution_status(id3, "rejected").unwrap();
+        db.update_prompt_evolution_status(id2, ProposalStatus::Approved).unwrap();
+        db.update_prompt_evolution_status(id3, ProposalStatus::Rejected).unwrap();
 
         // 全部
         let all = db.list_prompt_evolution_proposals(None, 10).unwrap();
@@ -2086,13 +2153,13 @@ mod tests {
 
         // status フィルタ
         let pending = db
-            .list_prompt_evolution_proposals(Some("pending"), 10)
+            .list_prompt_evolution_proposals(Some(ProposalStatus::Pending), 10)
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, id1);
 
         let approved = db
-            .list_prompt_evolution_proposals(Some("approved"), 10)
+            .list_prompt_evolution_proposals(Some(ProposalStatus::Approved), 10)
             .unwrap();
         assert_eq!(approved.len(), 1);
         assert_eq!(approved[0].id, id2);
@@ -2115,7 +2182,7 @@ mod tests {
         assert!(db.get_approved_prompt_for_repo("r1").unwrap().is_none());
 
         // 承認すると返る
-        db.update_prompt_evolution_status(id1, "approved").unwrap();
+        db.update_prompt_evolution_status(id1, ProposalStatus::Approved).unwrap();
         assert_eq!(
             db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
             Some("P1")
@@ -2125,7 +2192,7 @@ mod tests {
         let id2 = db
             .insert_prompt_evolution_proposal("r1", "P2", 90.0, None, None, "[]")
             .unwrap();
-        db.update_prompt_evolution_status(id2, "approved").unwrap();
+        db.update_prompt_evolution_status(id2, ProposalStatus::Approved).unwrap();
         assert_eq!(
             db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
             Some("P2")
@@ -2135,7 +2202,7 @@ mod tests {
         let id3 = db
             .insert_prompt_evolution_proposal("r1", "P3", 95.0, None, None, "[]")
             .unwrap();
-        db.update_prompt_evolution_status(id3, "rejected").unwrap();
+        db.update_prompt_evolution_status(id3, ProposalStatus::Rejected).unwrap();
         assert_eq!(
             db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
             Some("P2")
@@ -2154,13 +2221,13 @@ mod tests {
 
         // 取得
         let p = db.get_prompt_evolution_proposal(id).unwrap().unwrap();
-        assert_eq!(p.status, "pending");
+        assert_eq!(p.status, ProposalStatus::Pending);
         assert!(p.decided_at.is_none());
 
         // 承認
-        db.update_prompt_evolution_status(id, "approved").unwrap();
+        db.update_prompt_evolution_status(id, ProposalStatus::Approved).unwrap();
         let p = db.get_prompt_evolution_proposal(id).unwrap().unwrap();
-        assert_eq!(p.status, "approved");
+        assert_eq!(p.status, ProposalStatus::Approved);
         assert!(p.decided_at.is_some());
 
         // postpone
@@ -2169,7 +2236,7 @@ mod tests {
             .unwrap();
         db.postpone_prompt_evolution_proposal(id2).unwrap();
         let p2 = db.get_prompt_evolution_proposal(id2).unwrap().unwrap();
-        assert_eq!(p2.status, "postponed");
+        assert_eq!(p2.status, ProposalStatus::Postponed);
         assert!(p2.reminded_at.is_some());
 
         // 存在しない id

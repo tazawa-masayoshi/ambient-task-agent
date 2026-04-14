@@ -910,21 +910,22 @@ async fn process_prompt_evolution_action(
         }
     };
 
+    use crate::db::ProposalStatus;
     let (new_status, headline) = match action_id {
-        "prompt_evolution_approve" => ("approved", ":white_check_mark: *採用*"),
-        "prompt_evolution_reject" => ("rejected", ":x: *却下*"),
-        "prompt_evolution_postpone" => ("postponed", ":hourglass: *後で (3 日後に再通知)*"),
+        "prompt_evolution_approve" => (ProposalStatus::Approved, ":white_check_mark: *採用*"),
+        "prompt_evolution_reject" => (ProposalStatus::Rejected, ":x: *却下*"),
+        "prompt_evolution_postpone" => {
+            (ProposalStatus::Postponed, ":hourglass: *後で (3 日後に再通知)*")
+        }
         other => {
             tracing::warn!("prompt_evolution: unknown action_id {}", other);
             return Ok(());
         }
     };
 
-    // DB 更新（postpone と approve/reject で SQL が違う）
-    let db_result = if new_status == "postponed" {
-        state.db.postpone_prompt_evolution_proposal(proposal_id)
-    } else {
-        state.db.update_prompt_evolution_status(proposal_id, new_status)
+    let db_result = match new_status {
+        ProposalStatus::Postponed => state.db.postpone_prompt_evolution_proposal(proposal_id),
+        other => state.db.update_prompt_evolution_status(proposal_id, other),
     };
     if let Err(e) = db_result {
         tracing::warn!("prompt_evolution: DB update failed: {}", e);
@@ -945,8 +946,8 @@ async fn process_prompt_evolution_action(
                         proposal.id,
                         proposal.best_score,
                         match new_status {
-                            "approved" => "次回以降の ops 実行時にこの prompt が system_prompt として使われます。",
-                            "rejected" => "提案は却下されました。",
+                            ProposalStatus::Approved => "次回以降の ops 実行時にこの prompt が system_prompt として使われます。",
+                            ProposalStatus::Rejected => "提案は却下されました。",
                             _ => "3 日後に再通知します。",
                         }
                     )
