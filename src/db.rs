@@ -1391,6 +1391,26 @@ impl Db {
         Ok(rows)
     }
 
+    /// 提案を取得し、approved/rejected 済みでないことを確認してから返す。
+    /// 採用/却下/postpone のガード用途（Slack ハンドラと CLI で共有）。
+    ///
+    /// - not found → Err
+    /// - status が approved/rejected → Err
+    /// - それ以外 (pending/postponed) → Ok(proposal)
+    #[allow(dead_code)]
+    pub fn guard_prompt_evolution_mutable(
+        &self,
+        id: i64,
+    ) -> Result<PromptEvolutionProposal> {
+        let p = self
+            .get_prompt_evolution_proposal(id)?
+            .ok_or_else(|| anyhow::anyhow!("proposal #{id} not found"))?;
+        if p.status == "approved" || p.status == "rejected" {
+            anyhow::bail!("proposal #{id} is already {}, cannot modify", p.status);
+        }
+        Ok(p)
+    }
+
     /// 指定 id の提案を取得。
     #[allow(dead_code)]
     pub fn get_prompt_evolution_proposal(

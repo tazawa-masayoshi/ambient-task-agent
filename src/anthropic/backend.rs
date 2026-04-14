@@ -64,7 +64,14 @@ fn resolve_model_for_purpose(
     };
     match std::env::var(env_key) {
         Ok(v) if !v.trim().is_empty() => v,
-        _ => base.to_string(),
+        Ok(_) => {
+            // typo / シェル側で空になってる等の事故を可視化
+            tracing::warn!(
+                "{env_key} is set but empty/whitespace; falling back to base model"
+            );
+            base.to_string()
+        }
+        Err(_) => base.to_string(),
     }
 }
 
@@ -364,23 +371,41 @@ mod tests {
 
     // ---- resolve_model_for_purpose ---------------------------------------
 
-    // 環境変数を触るテストは serial に実行する必要があるため、
-    // 1 つの test 関数に全ケースをまとめる（Rust test は並列実行なので
-    // テストごとに env 設定/解除を分けると干渉する）。
+    /// パニック発生時でも env を clean up するための RAII ガード。
+    /// Rust のテストは並列実行されるので、他テストに env を残すと flaky になる。
+    struct EnvGuard {
+        keys: &'static [&'static str],
+    }
+
+    impl EnvGuard {
+        fn new(keys: &'static [&'static str]) -> Self {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { keys }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in self.keys {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    // 環境変数を触るテストは serial に実行する必要があるため 1 関数にまとめる。
     #[test]
     fn resolve_model_for_purpose_env_and_fallback() {
         use crate::claude::RequestPurpose;
 
-        let base = "claude-sonnet-base";
-
-        // 全環境変数を一旦クリア
-        for k in [
+        let _guard = EnvGuard::new(&[
             "ANTHROPIC_MODEL_CLASSIFY",
             "ANTHROPIC_MODEL_CONVERSING",
             "ANTHROPIC_MODEL_OPS",
-        ] {
-            std::env::remove_var(k);
-        }
+        ]);
+
+        let base = "claude-sonnet-base";
 
         // 未設定 → base
         assert_eq!(
@@ -434,15 +459,7 @@ mod tests {
             resolve_model_for_purpose(base, RequestPurpose::Conversing),
             base
         );
-
-        // 後片付け
-        for k in [
-            "ANTHROPIC_MODEL_CLASSIFY",
-            "ANTHROPIC_MODEL_CONVERSING",
-            "ANTHROPIC_MODEL_OPS",
-        ] {
-            std::env::remove_var(k);
-        }
+        // _guard が scope 抜けると env が自動 clean up される
     }
 
     #[test]

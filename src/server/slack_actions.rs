@@ -900,23 +900,15 @@ async fn process_prompt_evolution_action(
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid proposal_id: {}", action_value))?;
 
-    let proposal = match state.db.get_prompt_evolution_proposal(proposal_id)? {
-        Some(p) => p,
-        None => {
-            tracing::warn!("prompt_evolution action: proposal {} not found", proposal_id);
+    // guard_prompt_evolution_mutable: not-found / already-decided をまとめて検査。
+    // Slack は silent idempotency なので Err は警告 log + return Ok で吸収する。
+    let proposal = match state.db.guard_prompt_evolution_mutable(proposal_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::info!("prompt_evolution action ignored: {e}");
             return Ok(());
         }
     };
-
-    // 既に decided 済みは二重反応させない
-    if proposal.status == "approved" || proposal.status == "rejected" {
-        tracing::info!(
-            "prompt_evolution action: proposal {} already {}, ignoring",
-            proposal_id,
-            proposal.status
-        );
-        return Ok(());
-    }
 
     let (new_status, headline) = match action_id {
         "prompt_evolution_approve" => ("approved", ":white_check_mark: *採用*"),

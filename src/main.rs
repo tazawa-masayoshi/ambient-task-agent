@@ -196,34 +196,20 @@ fn cmd_prompt_evolution(action: PromptEvolutionAction) -> Result<()> {
             }
         }
         PromptEvolutionAction::Approve { id } => {
-            ensure_pending_or_postponed(&db, id)?;
+            db.guard_prompt_evolution_mutable(id)?;
             db.update_prompt_evolution_status(id, "approved")?;
             println!("proposal #{id} → approved (次 ops 実行から新 prompt が反映されます)");
         }
         PromptEvolutionAction::Reject { id } => {
-            ensure_pending_or_postponed(&db, id)?;
+            db.guard_prompt_evolution_mutable(id)?;
             db.update_prompt_evolution_status(id, "rejected")?;
             println!("proposal #{id} → rejected");
         }
         PromptEvolutionAction::Postpone { id } => {
-            ensure_pending_or_postponed(&db, id)?;
+            db.guard_prompt_evolution_mutable(id)?;
             db.postpone_prompt_evolution_proposal(id)?;
             println!("proposal #{id} → postponed (3 日後に再通知)");
         }
-    }
-    Ok(())
-}
-
-/// 既に approved/rejected 済みの提案に対する再操作を弾く（Slack ハンドラと同じガード）。
-fn ensure_pending_or_postponed(db: &db::Db, id: i64) -> Result<()> {
-    let p = db
-        .get_prompt_evolution_proposal(id)?
-        .ok_or_else(|| anyhow::anyhow!("proposal #{id} not found"))?;
-    if p.status == "approved" || p.status == "rejected" {
-        anyhow::bail!(
-            "proposal #{id} is already {}, cannot modify",
-            p.status
-        );
     }
     Ok(())
 }
