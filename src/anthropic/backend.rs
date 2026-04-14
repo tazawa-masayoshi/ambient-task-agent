@@ -38,9 +38,61 @@ impl AnthropicApiBackend {
 impl AgentBackend for AnthropicApiBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
         let llm_client = AnthropicLlmClient::new(self.client.clone());
-        let model = resolve_model_for_purpose(&self.model, request.purpose);
-        execute_with_harness_generic(&llm_client, &model, request).await
+        let primary_model = resolve_model_for_purpose(&self.model, request.purpose);
+        let fallback_model = resolve_fallback_model(&request, request.purpose);
+
+        // fallback がある場合のみ retry 用に request を clone して保持する。
+        let retry_request = fallback_model.as_ref().map(|_| request.clone());
+
+        match execute_with_harness_generic(&llm_client, &primary_model, request).await {
+            Ok(out) => Ok(out),
+            Err(e) if is_overloaded_error(&e) => {
+                let Some(retry_req) = retry_request else {
+                    return Err(e);
+                };
+                let Some(fb) = fallback_model else {
+                    return Err(e);
+                };
+                tracing::warn!(
+                    "primary model {primary_model} overloaded; falling back to {fb} ({e:#})"
+                );
+                execute_with_harness_generic(&llm_client, &fb, retry_req).await
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// `request.fallback_model` が明示指定されていればそれ、
+/// そうでなければ purpose 別の環境変数 (`ANTHROPIC_MODEL_OPS_FALLBACK` 等) を参照。
+///
+/// Classify / Conversing は軽量モデルで動いているので fallback は原則不要
+/// (空なら None が返る)。OpsExecute はサブスク枠消費が重いので特に効く。
+fn resolve_fallback_model(
+    request: &AgentRequest,
+    purpose: crate::claude::RequestPurpose,
+) -> Option<String> {
+    if let Some(ref m) = request.fallback_model {
+        if !m.trim().is_empty() {
+            return Some(m.clone());
+        }
+    }
+    let env_key = match purpose {
+        crate::claude::RequestPurpose::OpsExecute => "ANTHROPIC_MODEL_OPS_FALLBACK",
+        crate::claude::RequestPurpose::Classify => "ANTHROPIC_MODEL_CLASSIFY_FALLBACK",
+        crate::claude::RequestPurpose::Conversing => "ANTHROPIC_MODEL_CONVERSING_FALLBACK",
+        crate::claude::RequestPurpose::Generic => return None,
+    };
+    std::env::var(env_key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// 529 (overloaded) や "overloaded" 文言を error chain から検出する。
+/// primary model の容量枯渇時のみ fallback させる判定。
+fn is_overloaded_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("529") || msg.contains("overloaded") || msg.contains("Overloaded")
 }
 
 /// purpose に応じて model を解決。環境変数 override 優先、未設定なら `base`。
@@ -460,6 +512,98 @@ mod tests {
             base
         );
         // _guard が scope 抜けると env が自動 clean up される
+    }
+
+    #[test]
+    fn is_overloaded_error_matches_common_patterns() {
+        assert!(is_overloaded_error(&anyhow::anyhow!("HTTP 529 overloaded")));
+        assert!(is_overloaded_error(&anyhow::anyhow!(
+            "Anthropic stream error: overloaded_error - Overloaded"
+        )));
+        assert!(is_overloaded_error(&anyhow::anyhow!("status: 529")));
+        assert!(!is_overloaded_error(&anyhow::anyhow!("timeout")));
+        assert!(!is_overloaded_error(&anyhow::anyhow!("HTTP 500")));
+    }
+
+    // env を触る fallback テストは並列実行で干渉するので 1 関数に統合する。
+    #[test]
+    fn resolve_fallback_model_all_cases() {
+        use crate::claude::RequestPurpose;
+
+        let _guard = EnvGuard::new(&[
+            "ANTHROPIC_MODEL_OPS_FALLBACK",
+            "ANTHROPIC_MODEL_CLASSIFY_FALLBACK",
+            "ANTHROPIC_MODEL_CONVERSING_FALLBACK",
+        ]);
+
+        // 1. request field が設定されていれば env より優先
+        std::env::set_var("ANTHROPIC_MODEL_OPS_FALLBACK", "env-fallback");
+        let req = make_test_request(Some("request-fallback".to_string()));
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::OpsExecute),
+            Some("request-fallback".to_string())
+        );
+
+        // 2. request field が None の時は env をチェック
+        std::env::set_var("ANTHROPIC_MODEL_OPS_FALLBACK", "sonnet-fallback");
+        std::env::set_var("ANTHROPIC_MODEL_CLASSIFY_FALLBACK", "haiku-fallback");
+        let req = make_test_request(None);
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::OpsExecute),
+            Some("sonnet-fallback".to_string())
+        );
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::Classify),
+            Some("haiku-fallback".to_string())
+        );
+
+        // 3. Generic は env を読まない
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::Generic),
+            None
+        );
+
+        // 4. request field が空文字 → env へフォールバック
+        let req_empty = make_test_request(Some(String::new()));
+        assert_eq!(
+            resolve_fallback_model(&req_empty, RequestPurpose::OpsExecute),
+            Some("sonnet-fallback".to_string())
+        );
+
+        // 5. env が空白のみ → None
+        std::env::set_var("ANTHROPIC_MODEL_OPS_FALLBACK", "   ");
+        let req = make_test_request(None);
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::OpsExecute),
+            None
+        );
+
+        // 6. 未設定の purpose → None
+        std::env::remove_var("ANTHROPIC_MODEL_CONVERSING_FALLBACK");
+        assert_eq!(
+            resolve_fallback_model(&req, RequestPurpose::Conversing),
+            None
+        );
+    }
+
+    fn make_test_request(fallback_model: Option<String>) -> AgentRequest {
+        AgentRequest {
+            prompt: String::new(),
+            system_prompt: None,
+            max_turns: 1,
+            allowed_tools: None,
+            cwd: None,
+            env: vec![],
+            timeout_secs: None,
+            max_output_bytes: None,
+            resume_session_id: None,
+            json_schema: None,
+            fallback_model,
+            progress: None,
+            mcp_servers: vec![],
+            permission_mode: agent_harness::PermissionMode::default(),
+            purpose: crate::claude::RequestPurpose::Generic,
+        }
     }
 
     #[test]

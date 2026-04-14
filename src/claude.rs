@@ -58,6 +58,7 @@ impl RequestPurpose {
 }
 
 #[allow(dead_code)] // CLI 廃止後の一部フィールドは MCP 移行で再利用予定
+#[derive(Clone)]
 pub struct AgentRequest {
     pub prompt: String,
     pub system_prompt: Option<String>,
