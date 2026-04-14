@@ -128,6 +128,7 @@ async fn execute_job(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<(
         "self_improvement" => run_self_improvement(job, ctx).await,
         "context_rot_scan" => run_context_rot_scan(job, ctx).await,
         "prompt_evolution" => run_prompt_evolution(job, ctx).await,
+        "prompt_evolution_reminder" => run_prompt_evolution_reminder(job, ctx).await,
         other => {
             tracing::warn!("Unknown job type: {}", other);
             Ok(())
@@ -1814,6 +1815,88 @@ async fn run_prompt_evolution(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
 
     tracing::info!(
         "prompt_evolution: finished ({notified} proposals sent to {notify_user})"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Prompt Evolution Reminder (Phase 2 Step 2b — re-notify postponed proposals)
+// ============================================================================
+
+async fn run_prompt_evolution_reminder(
+    _job: &ScheduledJob,
+    ctx: &mut SchedulerContext,
+) -> Result<()> {
+    let notify_user = match std::env::var("PROMPT_EVOLUTION_NOTIFY_USER") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()),
+    };
+    let reminder_days: i64 = std::env::var("PROMPT_EVOLUTION_REMINDER_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+
+    let due = ctx
+        .db
+        .get_postponed_proposals_due_for_reminder(reminder_days)
+        .unwrap_or_default();
+    if due.is_empty() {
+        tracing::info!("prompt_evolution_reminder: no due postponed proposals");
+        return Ok(());
+    }
+
+    let mut sent = 0;
+    for proposal in &due {
+        // candidates_json から EvolutionResult を再構築して既存の Block Kit builder に渡す
+        let candidates: Vec<super::prompt_evolution::PromptCandidate> =
+            serde_json::from_str(&proposal.candidates_json).unwrap_or_default();
+        let best_index = candidates
+            .iter()
+            .position(|c| c.prompt == proposal.best_prompt)
+            .unwrap_or(0);
+        let result = super::prompt_evolution::EvolutionResult {
+            candidates,
+            best_index,
+            raw_generation: String::new(),
+        };
+
+        let blocks = super::prompt_evolution::build_proposal_blocks(
+            &result,
+            &proposal.repo_key,
+            proposal.id,
+        );
+        let fallback =
+            super::prompt_evolution::format_evolution_proposal(&result, &proposal.repo_key);
+        let reminder_text = format!(":bell: リマインド: {fallback}");
+        if let Err(e) = ctx
+            .slack
+            .post_blocks_to_channel(&notify_user, &blocks, &reminder_text)
+            .await
+        {
+            tracing::warn!(
+                "prompt_evolution_reminder: DM failed for proposal {}: {e}",
+                proposal.id
+            );
+            continue;
+        }
+
+        // reminded_at を更新（postpone API を再利用 — status 'postponed' のまま、
+        // reminded_at を現在時刻に更新するので次のリマインドは reminder_days 後）
+        if let Err(e) = ctx
+            .db
+            .postpone_prompt_evolution_proposal(proposal.id)
+        {
+            tracing::warn!(
+                "prompt_evolution_reminder: reminded_at update failed for {}: {e}",
+                proposal.id
+            );
+        }
+        sent += 1;
+    }
+
+    tracing::info!(
+        "prompt_evolution_reminder: {sent}/{} reminders sent",
+        due.len()
     );
     Ok(())
 }

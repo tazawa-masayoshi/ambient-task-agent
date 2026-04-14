@@ -336,6 +336,7 @@ pub async fn execute_ops(
     progress: Option<crate::claude::ProgressCallback>,
     failure_context: Option<&str>,
     mcp_servers: Vec<McpServerConfig>,
+    system_prompt_override: Option<&str>,
 ) -> Result<String> {
     let skill_content = read_ops_skills(repo_path, skill_paths);
 
@@ -361,12 +362,25 @@ pub async fn execute_ops(
         }
     };
 
-    // システムプロンプト構築
+    // システムプロンプト構築。
+    // prompt_evolution で承認済み override があれば、soul + skills + rules の組み立てを
+    // 丸ごとスキップしてそれを使う。failure_context と同じく末尾に追加される。
     let failure_section = failure_context.unwrap_or("");
-    let mut system_prompt = if skill_content.is_empty() {
-        format!("{}\n\n{}", base_soul, rules)
-    } else {
-        format!("{}\n\n## 作業手順\n{}\n\n{}", base_soul, skill_content, rules)
+    let mut system_prompt = match system_prompt_override {
+        Some(s) if !s.is_empty() => {
+            tracing::info!(
+                "execute_ops: using approved system_prompt_override ({} chars)",
+                s.len()
+            );
+            s.to_string()
+        }
+        _ => {
+            if skill_content.is_empty() {
+                format!("{}\n\n{}", base_soul, rules)
+            } else {
+                format!("{}\n\n## 作業手順\n{}\n\n{}", base_soul, skill_content, rules)
+            }
+        }
     };
     if !failure_section.is_empty() {
         system_prompt.push_str(failure_section);

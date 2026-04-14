@@ -1330,6 +1330,24 @@ impl Db {
         }
     }
 
+    /// repo_key の最新 approved 提案の best_prompt を返す。
+    /// 未承認なら None。ops 実行時に system_prompt を override する用途。
+    #[allow(dead_code)]
+    pub fn get_approved_prompt_for_repo(&self, repo_key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT best_prompt FROM prompt_evolution_proposals \
+             WHERE repo_key = ?1 AND status = 'approved' \
+             ORDER BY decided_at DESC, id DESC LIMIT 1",
+        )?;
+        let result = stmt.query_row(params![repo_key], |row| row.get::<_, String>(0));
+        match result {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// 指定 id の提案を取得。
     #[allow(dead_code)]
     pub fn get_prompt_evolution_proposal(
@@ -1366,6 +1384,7 @@ impl Db {
     }
 
     /// 提案を postpone 状態にして reminded_at を打つ。status は 'postponed'。
+    /// リマインド再送時も同じ API を使う（reminded_at が今の時刻に更新される）。
     #[allow(dead_code)]
     pub fn postpone_prompt_evolution_proposal(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1376,6 +1395,28 @@ impl Db {
             params![id],
         )?;
         Ok(())
+    }
+
+    /// postpone 状態で `reminded_at` が N 日以上前の proposal を返す（再通知対象）。
+    #[allow(dead_code)]
+    pub fn get_postponed_proposals_due_for_reminder(
+        &self,
+        days: i64,
+    ) -> Result<Vec<PromptEvolutionProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let threshold = format!("-{days} days");
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                    best_rationale, score_rationale, candidates_json, \
+                    status, decided_at, reminded_at \
+             FROM prompt_evolution_proposals \
+             WHERE status = 'postponed' \
+               AND reminded_at IS NOT NULL \
+               AND reminded_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1) \
+             ORDER BY reminded_at ASC",
+        )?;
+        let rows = stmt.query_map(params![threshold], row_to_prompt_evolution_proposal)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// repo_key の直近 N 件の (message_text, outcome) を取得。
@@ -1960,6 +2001,49 @@ mod tests {
     }
 
     #[test]
+    fn test_get_approved_prompt_for_repo() {
+        let db = test_db();
+        // 承認なし → None
+        assert!(db.get_approved_prompt_for_repo("r1").unwrap().is_none());
+
+        // pending のまま → None
+        let id1 = db
+            .insert_prompt_evolution_proposal("r1", "P1", 80.0, None, None, "[]")
+            .unwrap();
+        assert!(db.get_approved_prompt_for_repo("r1").unwrap().is_none());
+
+        // 承認すると返る
+        db.update_prompt_evolution_status(id1, "approved").unwrap();
+        assert_eq!(
+            db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
+            Some("P1")
+        );
+
+        // 別の承認が来ると最新が返る
+        let id2 = db
+            .insert_prompt_evolution_proposal("r1", "P2", 90.0, None, None, "[]")
+            .unwrap();
+        db.update_prompt_evolution_status(id2, "approved").unwrap();
+        assert_eq!(
+            db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
+            Some("P2")
+        );
+
+        // rejected は対象外
+        let id3 = db
+            .insert_prompt_evolution_proposal("r1", "P3", 95.0, None, None, "[]")
+            .unwrap();
+        db.update_prompt_evolution_status(id3, "rejected").unwrap();
+        assert_eq!(
+            db.get_approved_prompt_for_repo("r1").unwrap().as_deref(),
+            Some("P2")
+        );
+
+        // 別 repo は独立
+        assert!(db.get_approved_prompt_for_repo("r2").unwrap().is_none());
+    }
+
+    #[test]
     fn test_prompt_evolution_status_transitions() {
         let db = test_db();
         let id = db
@@ -1988,6 +2072,58 @@ mod tests {
 
         // 存在しない id
         assert!(db.get_prompt_evolution_proposal(9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_postponed_proposals_due_for_reminder() {
+        let db = test_db();
+        let id_new = db
+            .insert_prompt_evolution_proposal("r1", "P1", 80.0, None, None, "[]")
+            .unwrap();
+        db.postpone_prompt_evolution_proposal(id_new).unwrap();
+        // 即座の呼び出しでは 0 件（0 日未満は含まない）
+        let due0 = db.get_postponed_proposals_due_for_reminder(1).unwrap();
+        assert!(due0.is_empty());
+
+        // reminded_at を 5 日前に強制的に書き換え
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_evolution_proposals \
+                 SET reminded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 days') \
+                 WHERE id = ?1",
+                params![id_new],
+            )
+            .unwrap();
+        }
+
+        // 3 日以上前の条件で 1 件
+        let due = db.get_postponed_proposals_due_for_reminder(3).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id_new);
+
+        // 7 日以上前の条件では 0 件（5 日前なので条件を満たさない）
+        let due7 = db.get_postponed_proposals_due_for_reminder(7).unwrap();
+        assert!(due7.is_empty());
+
+        // approved/rejected は含まない
+        let id_app = db
+            .insert_prompt_evolution_proposal("r1", "P2", 80.0, None, None, "[]")
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_evolution_proposals \
+                 SET status = 'approved', \
+                     reminded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 days') \
+                 WHERE id = ?1",
+                params![id_app],
+            )
+            .unwrap();
+        }
+        let due_all = db.get_postponed_proposals_due_for_reminder(3).unwrap();
+        assert_eq!(due_all.len(), 1);
+        assert_eq!(due_all[0].id, id_new);
     }
 
     #[test]

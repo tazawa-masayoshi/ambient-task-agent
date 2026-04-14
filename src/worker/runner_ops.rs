@@ -348,12 +348,21 @@ impl Worker {
         // MCP サーバー設定の動的構築
         let mcp_configs = crate::anthropic::mcp_config::build_mcp_configs(repo_entry, &repo_path);
 
+        // prompt_evolution で承認済みの prompt があれば override として渡す。
+        // 未承認なら None で、従来の soul + skills + rules 構築が使われる。
+        let approved_prompt = self
+            .db
+            .get_approved_prompt_for_repo(&item.repo_key)
+            .ok()
+            .flatten();
+
         let output = super::ops::execute_ops(
             &req, &repo_path, &ops_skills, &soul,
             max_turns, Some(&log_dir), &self.runner_ctx, &history, dl_dir_ref,
             exec_mode, None,
             combined_context.as_deref(),
             mcp_configs,
+            approved_prompt.as_deref(),
         ).await;
 
         Ok(OpsExecutionResult { output, exec_mode })

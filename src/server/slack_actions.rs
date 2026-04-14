@@ -953,7 +953,7 @@ async fn process_prompt_evolution_action(
                         proposal.id,
                         proposal.best_score,
                         match new_status {
-                            "approved" => "Step 2b で backend.rs の prompt 差し替えが入ります。現状は DB 記録のみ。",
+                            "approved" => "次回以降の ops 実行時にこの prompt が system_prompt として使われます。",
                             "rejected" => "提案は却下されました。",
                             _ => "3 日後に再通知します。",
                         }
