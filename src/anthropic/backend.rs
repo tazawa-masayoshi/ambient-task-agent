@@ -190,6 +190,7 @@ async fn execute_with_harness_generic(
         recovery_detector: Some(Arc::new(super::recovery::AmbientRecoveryDetector)),
         tool_output_offload_threshold: None,
         tool_output_offload_dir: None,
+        recent_actions_limit: None,
     };
 
     // ToolExecutor
