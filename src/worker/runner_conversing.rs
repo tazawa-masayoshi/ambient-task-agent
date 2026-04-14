@@ -113,7 +113,7 @@ impl Worker {
         let base_dir = &self.repos_config.defaults.repos_base_dir;
         let soul = context::merged_soul(base_dir, Some(&repo_path));
 
-        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
+        let result = match crate::claude::ClaudeRunner::new("conversing", &prompt)
             .system_prompt(&soul)
             .max_turns(3)
             .cwd(&repo_path)
@@ -121,7 +121,14 @@ impl Worker {
             .log_dir(&log_dir)
             .with_context(&self.runner_ctx)
             .run()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.persist_conversing_partial(&e, channel, &thread_ts, repo_key).await;
+                return Err(e);
+            }
+        };
 
         let output = result.stdout;
 
@@ -184,7 +191,7 @@ impl Worker {
         let soul = context::merged_soul(base_dir, Some(&repo_path));
         let log_dir = self.log_dir();
 
-        let result = crate::claude::ClaudeRunner::new("conversing", &prompt)
+        let result = match crate::claude::ClaudeRunner::new("conversing", &prompt)
             .system_prompt(&soul)
             .max_turns(3)
             .cwd(&repo_path)
@@ -192,7 +199,14 @@ impl Worker {
             .log_dir(&log_dir)
             .with_context(&self.runner_ctx)
             .run()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.persist_conversing_partial(&e, channel, thread_ts, repo_key).await;
+                return Err(e);
+            }
+        };
 
         let output = result.stdout;
 
@@ -215,5 +229,49 @@ impl Worker {
             &format!(":speech_balloon: {}", truncated)).await?;
 
         Ok(())
+    }
+
+    /// SSE 中断等で LLM 応答が途中で切れた場合のリカバリ。
+    ///
+    /// claude_auth::InterruptedStreamError を downcast して partial text を取り、
+    /// ops_context に「[⚠️ 応答が途中で中断されました]」注記付きで assistant 発話
+    /// として保存する。次回 continue_conversing_task が走った時に history として
+    /// 自然に含まれる。partial が無ければ no-op。
+    ///
+    /// EC2 再起動 / network reset 等で LLM への request が途中で落ちても、
+    /// ユーザーには「一応何か返信があった」状態を保つため。
+    async fn persist_conversing_partial(
+        &self,
+        err: &anyhow::Error,
+        channel: &str,
+        thread_ts: &str,
+        repo_key: &str,
+    ) {
+        let Some(partial) = crate::claude::try_extract_interrupted_partial(err) else {
+            return;
+        };
+        let annotated = format!("{partial}\n\n[⚠️ 応答が途中で中断されました]");
+        if let Err(e) = self
+            .db
+            .append_ops_context(channel, thread_ts, repo_key, "assistant", &annotated)
+        {
+            tracing::warn!("Failed to persist interrupted partial response: {e}");
+        } else {
+            tracing::info!(
+                "conversing: persisted partial response ({} chars) after interruption",
+                partial.len()
+            );
+        }
+        if let Err(e) = self
+            .slack
+            .reply_thread(
+                channel,
+                thread_ts,
+                ":warning: 応答が途中で中断されました。続きが必要な場合は再度メッセージを送ってください。",
+            )
+            .await
+        {
+            tracing::warn!("Failed to notify interruption to Slack: {e}");
+        }
     }
 }

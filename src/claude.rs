@@ -485,6 +485,34 @@ pub(crate) fn truncate_str(s: &str, max_len: usize) -> &str {
     }
 }
 
+/// `anyhow::Error` から `claude_auth::InterruptedStreamError` を downcast し、
+/// partial response に含まれる text content を結合して返す。
+///
+/// SSE ストリームが途中で切れた場合のリカバリ用途。EC2 再起動等で LLM 応答の
+/// 途中で中断された場合、`run_agent_loop` からは interrupted error が伝播する。
+/// 呼び出し側はこのヘルパーで partial text を取り出して DB の履歴に退避できる。
+///
+/// - partial に text block が無い / 空なら `None`
+/// - InterruptedStreamError でなければ `None`
+pub fn try_extract_interrupted_partial(err: &anyhow::Error) -> Option<String> {
+    let interrupted = err.downcast_ref::<claude_auth::InterruptedStreamError>()?;
+    let joined = interrupted
+        .partial
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            claude_auth::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
 async fn write_log(log_dir: &Path, log: &ExecutionLog) -> Result<()> {
     tokio::fs::create_dir_all(log_dir).await?;
 
@@ -527,5 +555,88 @@ async fn rotate_logs(log_dir: &Path, max_files: usize) {
         if let Err(e) = tokio::fs::remove_file(&path).await {
             tracing::warn!("Failed to remove old log file {}: {}", path.display(), e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_auth::{ContentBlock, InterruptedStreamError, MessagesResponse, Usage};
+
+    fn make_partial_err(blocks: Vec<ContentBlock>) -> anyhow::Error {
+        anyhow::Error::new(InterruptedStreamError {
+            partial: MessagesResponse {
+                id: "msg_x".into(),
+                model: "claude".into(),
+                content: blocks,
+                stop_reason: Some("interrupted".into()),
+                usage: Usage::default(),
+            },
+            bytes_received: 42,
+            source: anyhow::anyhow!("network reset"),
+        })
+    }
+
+    #[test]
+    fn extracts_text_from_partial() {
+        let err = make_partial_err(vec![ContentBlock::Text {
+            text: "partial answer".into(),
+        }]);
+        assert_eq!(
+            try_extract_interrupted_partial(&err),
+            Some("partial answer".to_string())
+        );
+    }
+
+    #[test]
+    fn joins_multiple_text_blocks() {
+        let err = make_partial_err(vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ]);
+        assert_eq!(
+            try_extract_interrupted_partial(&err),
+            Some("first\nsecond".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_non_text_blocks() {
+        let err = make_partial_err(vec![
+            ContentBlock::Text { text: "keep".into() },
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+        ]);
+        assert_eq!(
+            try_extract_interrupted_partial(&err),
+            Some("keep".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_content_returns_none() {
+        let err = make_partial_err(vec![]);
+        assert!(try_extract_interrupted_partial(&err).is_none());
+    }
+
+    #[test]
+    fn whitespace_only_returns_none() {
+        let err = make_partial_err(vec![ContentBlock::Text {
+            text: "   \n\t  ".into(),
+        }]);
+        assert!(try_extract_interrupted_partial(&err).is_none());
+    }
+
+    #[test]
+    fn non_interrupted_error_returns_none() {
+        let err = anyhow::anyhow!("something else");
+        assert!(try_extract_interrupted_partial(&err).is_none());
     }
 }
