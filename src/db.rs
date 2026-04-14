@@ -1330,6 +1330,54 @@ impl Db {
         }
     }
 
+    /// 指定 id の提案を取得。
+    #[allow(dead_code)]
+    pub fn get_prompt_evolution_proposal(
+        &self,
+        id: i64,
+    ) -> Result<Option<PromptEvolutionProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                    best_rationale, score_rationale, candidates_json, \
+                    status, decided_at, reminded_at \
+             FROM prompt_evolution_proposals \
+             WHERE id = ?1",
+        )?;
+        let result = stmt.query_row(params![id], row_to_prompt_evolution_proposal);
+        match result {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 提案の status を更新（承認 / 却下）。decided_at を同時にセット。
+    #[allow(dead_code)]
+    pub fn update_prompt_evolution_status(&self, id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE prompt_evolution_proposals \
+             SET status = ?1, decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    /// 提案を postpone 状態にして reminded_at を打つ。status は 'postponed'。
+    #[allow(dead_code)]
+    pub fn postpone_prompt_evolution_proposal(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE prompt_evolution_proposals \
+             SET status = 'postponed', reminded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// repo_key の直近 N 件の (message_text, outcome) を取得。
     /// prompt_evolution の ExecutionSample 構築に使う。
     /// updated_at が同一値の場合は id 降順で tie-break（テスト再現性のため）。
@@ -1909,6 +1957,37 @@ mod tests {
         // 別 repo は独立
         let none = db.get_last_prompt_evolution_proposal("repo2").unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_prompt_evolution_status_transitions() {
+        let db = test_db();
+        let id = db
+            .insert_prompt_evolution_proposal("r1", "P", 80.0, None, None, "[]")
+            .unwrap();
+
+        // 取得
+        let p = db.get_prompt_evolution_proposal(id).unwrap().unwrap();
+        assert_eq!(p.status, "pending");
+        assert!(p.decided_at.is_none());
+
+        // 承認
+        db.update_prompt_evolution_status(id, "approved").unwrap();
+        let p = db.get_prompt_evolution_proposal(id).unwrap().unwrap();
+        assert_eq!(p.status, "approved");
+        assert!(p.decided_at.is_some());
+
+        // postpone
+        let id2 = db
+            .insert_prompt_evolution_proposal("r2", "P", 80.0, None, None, "[]")
+            .unwrap();
+        db.postpone_prompt_evolution_proposal(id2).unwrap();
+        let p2 = db.get_prompt_evolution_proposal(id2).unwrap().unwrap();
+        assert_eq!(p2.status, "postponed");
+        assert!(p2.reminded_at.is_some());
+
+        // 存在しない id
+        assert!(db.get_prompt_evolution_proposal(9999).unwrap().is_none());
     }
 
     #[test]

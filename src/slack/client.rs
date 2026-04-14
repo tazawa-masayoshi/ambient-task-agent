@@ -45,6 +45,16 @@ impl SlackClient {
         self.send_message(channel, text, Some(thread_ts)).await
     }
 
+    /// Block Kit ブロック付きでチャンネル/DM にトップレベル投稿（スレッド返信ではない）
+    pub async fn post_blocks_to_channel(
+        &self,
+        channel: &str,
+        blocks: &serde_json::Value,
+        text: &str,
+    ) -> Result<String> {
+        self.send_blocks(channel, None, blocks, text).await
+    }
+
     /// Block Kit ブロック付きでスレッドに投稿
     pub async fn post_blocks(
         &self,
@@ -53,14 +63,26 @@ impl SlackClient {
         blocks: &serde_json::Value,
         text: &str,
     ) -> Result<String> {
+        self.send_blocks(channel, Some(thread_ts), blocks, text).await
+    }
+
+    async fn send_blocks(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        blocks: &serde_json::Value,
+        text: &str,
+    ) -> Result<String> {
         let converted_text = markdown_to_mrkdwn(text);
         let converted_blocks = convert_blocks_text(blocks);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "channel": channel,
-            "thread_ts": thread_ts,
             "blocks": converted_blocks,
             "text": converted_text,
         });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
 
         let resp = self
             .client

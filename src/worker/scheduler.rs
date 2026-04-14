@@ -1777,27 +1777,35 @@ async fn run_prompt_evolution(job: &ScheduledJob, ctx: &mut SchedulerContext) ->
         }
 
         let candidates_json = serde_json::to_string(&result.candidates).unwrap_or_default();
-        let insert_result = ctx.db.insert_prompt_evolution_proposal(
+        let proposal_id = match ctx.db.insert_prompt_evolution_proposal(
             repo_key,
             &best.prompt,
             best.score,
             Some(&best.rationale),
             Some(&best.score_rationale),
             &candidates_json,
-        );
-        match insert_result {
-            Ok(id) => tracing::info!(
-                "prompt_evolution: saved proposal id={id} for {repo_key} (score {:.1})",
-                best.score
-            ),
+        ) {
+            Ok(id) => {
+                tracing::info!(
+                    "prompt_evolution: saved proposal id={id} for {repo_key} (score {:.1})",
+                    best.score
+                );
+                id
+            }
             Err(e) => {
                 tracing::warn!("prompt_evolution: DB insert failed for {repo_key}: {e}");
                 continue;
             }
-        }
+        };
 
-        let msg = super::prompt_evolution::format_evolution_proposal(&result, repo_key);
-        if let Err(e) = ctx.slack.post_message(&notify_user, &msg).await {
+        let blocks =
+            super::prompt_evolution::build_proposal_blocks(&result, repo_key, proposal_id);
+        let fallback_text = super::prompt_evolution::format_evolution_proposal(&result, repo_key);
+        if let Err(e) = ctx
+            .slack
+            .post_blocks_to_channel(&notify_user, &blocks, &fallback_text)
+            .await
+        {
             tracing::warn!("prompt_evolution: DM failed: {e}");
         } else {
             notified += 1;

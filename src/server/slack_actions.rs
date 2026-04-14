@@ -239,6 +239,21 @@ async fn process_action(
         return process_ops_inception_asana(state, action_value, channel, message_ts).await;
     }
 
+    // Prompt Evolution 承認フロー（Phase 2 Step 2a）
+    if action_id == "prompt_evolution_approve"
+        || action_id == "prompt_evolution_reject"
+        || action_id == "prompt_evolution_postpone"
+    {
+        return process_prompt_evolution_action(
+            state,
+            action_id,
+            action_value,
+            channel,
+            message_ts,
+        )
+        .await;
+    }
+
     let task_id: i64 = action_value
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid task_id: {}", action_value))?;
@@ -867,5 +882,94 @@ async fn process_ops_inception_cancel(
             .ok();
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// Prompt Evolution (Phase 2 Step 2a)
+// ============================================================================
+
+async fn process_prompt_evolution_action(
+    state: &AppState,
+    action_id: &str,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let proposal_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid proposal_id: {}", action_value))?;
+
+    let proposal = match state.db.get_prompt_evolution_proposal(proposal_id)? {
+        Some(p) => p,
+        None => {
+            tracing::warn!("prompt_evolution action: proposal {} not found", proposal_id);
+            return Ok(());
+        }
+    };
+
+    // 既に decided 済みは二重反応させない
+    if proposal.status == "approved" || proposal.status == "rejected" {
+        tracing::info!(
+            "prompt_evolution action: proposal {} already {}, ignoring",
+            proposal_id,
+            proposal.status
+        );
+        return Ok(());
+    }
+
+    let (new_status, headline) = match action_id {
+        "prompt_evolution_approve" => ("approved", ":white_check_mark: *採用*"),
+        "prompt_evolution_reject" => ("rejected", ":x: *却下*"),
+        "prompt_evolution_postpone" => ("postponed", ":hourglass: *後で (3 日後に再通知)*"),
+        other => {
+            tracing::warn!("prompt_evolution: unknown action_id {}", other);
+            return Ok(());
+        }
+    };
+
+    // DB 更新（postpone と approve/reject で SQL が違う）
+    let db_result = if new_status == "postponed" {
+        state.db.postpone_prompt_evolution_proposal(proposal_id)
+    } else {
+        state.db.update_prompt_evolution_status(proposal_id, new_status)
+    };
+    if let Err(e) = db_result {
+        tracing::warn!("prompt_evolution: DB update failed: {}", e);
+        return Ok(());
+    }
+
+    // メッセージ本文をボタンなしに差し替え
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!(
+                        "{headline}\nrepo: `{}` / proposal #{} (score {:.1})\n\n_{}_",
+                        proposal.repo_key,
+                        proposal.id,
+                        proposal.best_score,
+                        match new_status {
+                            "approved" => "Step 2b で backend.rs の prompt 差し替えが入ります。現状は DB 記録のみ。",
+                            "rejected" => "提案は却下されました。",
+                            _ => "3 日後に再通知します。",
+                        }
+                    )
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, headline)
+            .await
+            .ok();
+    }
+
+    tracing::info!(
+        "prompt_evolution: proposal {} → {}",
+        proposal_id, new_status
+    );
     Ok(())
 }

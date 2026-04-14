@@ -183,7 +183,108 @@ pub async fn run_evolution(
     })
 }
 
-/// Slack 通知用フォーマット。diff は出さない（Phase 2 で実装）。
+/// Slack Block Kit メッセージ。採用 / 却下 / 後で の 3 ボタン付き。
+/// `proposal_id` は DB の `prompt_evolution_proposals.id`。ボタンの action_value に入れる。
+///
+/// action_id:
+/// - `prompt_evolution_approve`
+/// - `prompt_evolution_reject`
+/// - `prompt_evolution_postpone`
+pub fn build_proposal_blocks(
+    result: &EvolutionResult,
+    repo_key: &str,
+    proposal_id: i64,
+) -> serde_json::Value {
+    let best = result.best();
+    let value = proposal_id.to_string();
+
+    // 候補 prompt の先頭プレビュー（Slack の text block は 3000 文字制限）
+    let prompt_preview = preview_text(&best.prompt, 1800);
+    let others_text: String = result
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != result.best_index)
+        .map(|(i, c)| format!("• 候補{} (score {:.1}): {}", i + 1, c.score, c.rationale))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    serde_json::json!([
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": format!("✨ Prompt Evolution 提案 [{repo_key}]")
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(
+                    "*採用候補* (score *{:.1}*)\n*改善理由:* {}\n*採点理由:* {}",
+                    best.score, best.rationale, best.score_rationale
+                )
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("*候補 prompt (先頭 {} 文字):*\n```\n{}\n```",
+                    prompt_preview.chars().count(), prompt_preview)
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": if others_text.is_empty() {
+                    "*他の候補:* なし".to_string()
+                } else {
+                    format!("*他の候補:*\n{others_text}")
+                }
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "prompt_evolution_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "prompt_evolution_approve",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "採用"},
+                    "value": value.clone()
+                },
+                {
+                    "type": "button",
+                    "action_id": "prompt_evolution_postpone",
+                    "text": {"type": "plain_text", "text": "後で (3 日後に再通知)"},
+                    "value": value.clone()
+                },
+                {
+                    "type": "button",
+                    "action_id": "prompt_evolution_reject",
+                    "style": "danger",
+                    "text": {"type": "plain_text", "text": "却下"},
+                    "value": value
+                }
+            ]
+        }
+    ])
+}
+
+fn preview_text(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let take: String = s.chars().take(max_chars).collect();
+    format!("{take}\n...[truncated: {} more chars]", count - max_chars)
+}
+
+/// Slack 通知用フォーマット（プレーンテキスト / Block Kit 未対応 path 用）。
 pub fn format_evolution_proposal(result: &EvolutionResult, repo_key: &str) -> String {
     let best = result.best();
     let others: Vec<String> = result
@@ -504,6 +605,78 @@ mod tests {
         // Scorer call: only failure sample
         assert!(!calls[1].contains("success req"));
         assert!(calls[1].contains("fail req"));
+    }
+
+    #[test]
+    fn build_proposal_blocks_has_three_buttons_with_proposal_id() {
+        let result = EvolutionResult {
+            candidates: vec![
+                PromptCandidate {
+                    prompt: "A".into(),
+                    rationale: "ra".into(),
+                    score: 40.0,
+                    score_rationale: "weak".into(),
+                },
+                PromptCandidate {
+                    prompt: "B".into(),
+                    rationale: "rb".into(),
+                    score: 85.0,
+                    score_rationale: "strong".into(),
+                },
+            ],
+            best_index: 1,
+            raw_generation: String::new(),
+        };
+        let blocks = build_proposal_blocks(&result, "myrepo", 42);
+        let arr = blocks.as_array().expect("should be array");
+
+        // header + section(best) + section(preview) + section(others) + actions = 5 blocks
+        assert_eq!(arr.len(), 5);
+
+        let actions = arr.last().unwrap();
+        assert_eq!(actions["type"], "actions");
+        let els = actions["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 3);
+
+        let ids: Vec<&str> = els.iter().map(|e| e["action_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"prompt_evolution_approve"));
+        assert!(ids.contains(&"prompt_evolution_reject"));
+        assert!(ids.contains(&"prompt_evolution_postpone"));
+
+        // 全ボタンの value に proposal_id 42 が入っている
+        for el in els {
+            assert_eq!(el["value"].as_str().unwrap(), "42");
+        }
+    }
+
+    #[test]
+    fn build_proposal_blocks_truncates_long_prompt() {
+        let long_prompt = "x".repeat(5000);
+        let result = EvolutionResult {
+            candidates: vec![PromptCandidate {
+                prompt: long_prompt,
+                rationale: "r".into(),
+                score: 80.0,
+                score_rationale: "ok".into(),
+            }],
+            best_index: 0,
+            raw_generation: String::new(),
+        };
+        let blocks = build_proposal_blocks(&result, "r", 1);
+        let s = serde_json::to_string(&blocks).unwrap();
+        assert!(s.contains("truncated"));
+    }
+
+    #[test]
+    fn preview_text_short_passthrough() {
+        assert_eq!(preview_text("short", 100), "short");
+    }
+
+    #[test]
+    fn preview_text_long_truncates_with_marker() {
+        let out = preview_text("あ".repeat(200).as_str(), 50);
+        assert!(out.contains("...[truncated:"));
+        assert!(out.chars().count() > 50);  // marker 分ある
     }
 
     #[test]
