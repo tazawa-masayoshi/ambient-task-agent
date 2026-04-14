@@ -27,6 +27,36 @@ pub enum ProgressEvent {
     ToolUse(String),
 }
 
+/// LLM 呼び出しの用途種別。model routing に使う。
+///
+/// `Classify` / `Conversing` は軽いタスクなので Haiku 級、`OpsExecute` は
+/// Sonnet/Opus 級、のようにモデルを分けてコスト（Claude Max の 5 時間窓消費）
+/// を抑える。環境変数 `ANTHROPIC_MODEL_{CLASSIFY,CONVERSING,OPS}` で override。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestPurpose {
+    Classify,
+    Conversing,
+    OpsExecute,
+    /// scheduler ジョブや手動 run など、分類不能 / 通常モデルで十分なケース。
+    /// base `ANTHROPIC_MODEL` がそのまま使われる。
+    #[default]
+    Generic,
+}
+
+impl RequestPurpose {
+    /// ClaudeRunner の `module` 文字列から purpose を推定。
+    /// 未知の module は `Generic`。
+    #[must_use]
+    pub fn from_module(module: &str) -> Self {
+        match module {
+            "classify" | "route" | "dm_format" => Self::Classify,
+            "conversing" => Self::Conversing,
+            "ops" | "ops_summary" | "executor" => Self::OpsExecute,
+            _ => Self::Generic,
+        }
+    }
+}
+
 #[allow(dead_code)] // CLI 廃止後の一部フィールドは MCP 移行で再利用予定
 pub struct AgentRequest {
     pub prompt: String,
@@ -49,6 +79,8 @@ pub struct AgentRequest {
     /// **デフォルトは DangerFullAccess** — ops が広範な書き込みを必要とするため。
     /// 新しい呼び出し元で読取り専用にしたい場合は明示的に `.permission_mode(ReadOnly)` を指定すること。
     pub permission_mode: agent_harness::PermissionMode,
+    /// 用途種別。backend で model routing に使う。
+    pub purpose: RequestPurpose,
 }
 
 /// LLM バックエンドから返るレスポンス
@@ -366,6 +398,7 @@ impl ClaudeRunner {
             progress: self.progress.clone(),
             mcp_servers: self.mcp_servers.clone(),
             permission_mode: self.permission_mode,
+            purpose: RequestPurpose::from_module(&self.module),
         };
 
         let backend = self.backend.as_ref()

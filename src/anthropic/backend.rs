@@ -38,7 +38,33 @@ impl AnthropicApiBackend {
 impl AgentBackend for AnthropicApiBackend {
     async fn execute(&self, request: AgentRequest) -> Result<AgentOutput> {
         let llm_client = AnthropicLlmClient::new(self.client.clone());
-        execute_with_harness_generic(&llm_client, &self.model, request).await
+        let model = resolve_model_for_purpose(&self.model, request.purpose);
+        execute_with_harness_generic(&llm_client, &model, request).await
+    }
+}
+
+/// purpose に応じて model を解決。環境変数 override 優先、未設定なら `base`。
+///
+/// 環境変数:
+/// - `ANTHROPIC_MODEL_CLASSIFY` (Classify)
+/// - `ANTHROPIC_MODEL_CONVERSING` (Conversing)
+/// - `ANTHROPIC_MODEL_OPS` (OpsExecute)
+/// - Generic は常に `base` (`ANTHROPIC_MODEL`) を返す
+///
+/// 空文字列 / 未設定は「未指定」扱いで base にフォールバック。
+fn resolve_model_for_purpose(
+    base: &str,
+    purpose: crate::claude::RequestPurpose,
+) -> String {
+    let env_key = match purpose {
+        crate::claude::RequestPurpose::Classify => "ANTHROPIC_MODEL_CLASSIFY",
+        crate::claude::RequestPurpose::Conversing => "ANTHROPIC_MODEL_CONVERSING",
+        crate::claude::RequestPurpose::OpsExecute => "ANTHROPIC_MODEL_OPS",
+        crate::claude::RequestPurpose::Generic => return base.to_string(),
+    };
+    match std::env::var(env_key) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => base.to_string(),
     }
 }
 
@@ -334,5 +360,106 @@ mod tests {
         };
         let cost = calculate_cost(&usage, "claude-opus-4-20250514");
         assert!((cost - 3.4875).abs() < 0.01);
+    }
+
+    // ---- resolve_model_for_purpose ---------------------------------------
+
+    // 環境変数を触るテストは serial に実行する必要があるため、
+    // 1 つの test 関数に全ケースをまとめる（Rust test は並列実行なので
+    // テストごとに env 設定/解除を分けると干渉する）。
+    #[test]
+    fn resolve_model_for_purpose_env_and_fallback() {
+        use crate::claude::RequestPurpose;
+
+        let base = "claude-sonnet-base";
+
+        // 全環境変数を一旦クリア
+        for k in [
+            "ANTHROPIC_MODEL_CLASSIFY",
+            "ANTHROPIC_MODEL_CONVERSING",
+            "ANTHROPIC_MODEL_OPS",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        // 未設定 → base
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Classify),
+            base
+        );
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Conversing),
+            base
+        );
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::OpsExecute),
+            base
+        );
+        // Generic は常に base (環境変数参照しない)
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Generic),
+            base
+        );
+
+        // 設定あり → env 値
+        std::env::set_var("ANTHROPIC_MODEL_CLASSIFY", "haiku-test");
+        std::env::set_var("ANTHROPIC_MODEL_CONVERSING", "haiku-test");
+        std::env::set_var("ANTHROPIC_MODEL_OPS", "opus-test");
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Classify),
+            "haiku-test"
+        );
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Conversing),
+            "haiku-test"
+        );
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::OpsExecute),
+            "opus-test"
+        );
+        // Generic は env に引きずられない
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Generic),
+            base
+        );
+
+        // 空文字列 → base にフォールバック
+        std::env::set_var("ANTHROPIC_MODEL_CLASSIFY", "");
+        std::env::set_var("ANTHROPIC_MODEL_CONVERSING", "   ");
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Classify),
+            base
+        );
+        assert_eq!(
+            resolve_model_for_purpose(base, RequestPurpose::Conversing),
+            base
+        );
+
+        // 後片付け
+        for k in [
+            "ANTHROPIC_MODEL_CLASSIFY",
+            "ANTHROPIC_MODEL_CONVERSING",
+            "ANTHROPIC_MODEL_OPS",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn request_purpose_from_module_mapping() {
+        use crate::claude::RequestPurpose;
+        assert_eq!(RequestPurpose::from_module("classify"), RequestPurpose::Classify);
+        assert_eq!(RequestPurpose::from_module("route"), RequestPurpose::Classify);
+        assert_eq!(RequestPurpose::from_module("dm_format"), RequestPurpose::Classify);
+        assert_eq!(RequestPurpose::from_module("conversing"), RequestPurpose::Conversing);
+        assert_eq!(RequestPurpose::from_module("ops"), RequestPurpose::OpsExecute);
+        assert_eq!(RequestPurpose::from_module("ops_summary"), RequestPurpose::OpsExecute);
+        assert_eq!(RequestPurpose::from_module("executor"), RequestPurpose::OpsExecute);
+        // 未知の module は Generic
+        assert_eq!(
+            RequestPurpose::from_module("scheduler:morning_briefing"),
+            RequestPurpose::Generic
+        );
+        assert_eq!(RequestPurpose::from_module("unknown"), RequestPurpose::Generic);
     }
 }
