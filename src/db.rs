@@ -1348,6 +1348,49 @@ impl Db {
         }
     }
 
+    /// 提案一覧を取得。`status` 指定で絞り込み、`created_at DESC, id DESC` 順。
+    #[allow(dead_code)]
+    pub fn list_prompt_evolution_proposals(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PromptEvolutionProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, use_status) = match status {
+            Some(_) => (
+                "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                        best_rationale, score_rationale, candidates_json, \
+                        status, decided_at, reminded_at \
+                 FROM prompt_evolution_proposals \
+                 WHERE status = ?1 \
+                 ORDER BY created_at DESC, id DESC LIMIT ?2",
+                true,
+            ),
+            None => (
+                "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                        best_rationale, score_rationale, candidates_json, \
+                        status, decided_at, reminded_at \
+                 FROM prompt_evolution_proposals \
+                 ORDER BY created_at DESC, id DESC LIMIT ?1",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if use_status {
+            stmt.query_map(
+                params![status.unwrap(), limit as i64],
+                row_to_prompt_evolution_proposal,
+            )?
+            .filter_map(|r| r.ok())
+            .collect()
+        } else {
+            stmt.query_map(params![limit as i64], row_to_prompt_evolution_proposal)?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        Ok(rows)
+    }
+
     /// 指定 id の提案を取得。
     #[allow(dead_code)]
     pub fn get_prompt_evolution_proposal(
@@ -1815,7 +1858,7 @@ pub struct FailurePattern {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)]
 pub struct PromptEvolutionProposal {
     pub id: i64,
@@ -1998,6 +2041,45 @@ mod tests {
         // 別 repo は独立
         let none = db.get_last_prompt_evolution_proposal("repo2").unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_list_prompt_evolution_proposals() {
+        let db = test_db();
+        let id1 = db
+            .insert_prompt_evolution_proposal("r1", "P1", 80.0, None, None, "[]")
+            .unwrap();
+        let id2 = db
+            .insert_prompt_evolution_proposal("r2", "P2", 85.0, None, None, "[]")
+            .unwrap();
+        let id3 = db
+            .insert_prompt_evolution_proposal("r1", "P3", 70.0, None, None, "[]")
+            .unwrap();
+        db.update_prompt_evolution_status(id2, "approved").unwrap();
+        db.update_prompt_evolution_status(id3, "rejected").unwrap();
+
+        // 全部
+        let all = db.list_prompt_evolution_proposals(None, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        // 新しい方が先頭 (id DESC tie-break)
+        assert_eq!(all[0].id, id3);
+
+        // status フィルタ
+        let pending = db
+            .list_prompt_evolution_proposals(Some("pending"), 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id1);
+
+        let approved = db
+            .list_prompt_evolution_proposals(Some("approved"), 10)
+            .unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].id, id2);
+
+        // limit
+        let two = db.list_prompt_evolution_proposals(None, 2).unwrap();
+        assert_eq!(two.len(), 2);
     }
 
     #[test]

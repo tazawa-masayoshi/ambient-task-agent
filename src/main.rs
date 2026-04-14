@@ -89,6 +89,37 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// prompt_evolution 提案の CLI 操作（Slack ボタンの等価代替）
+    PromptEvolution {
+        #[command(subcommand)]
+        action: PromptEvolutionAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromptEvolutionAction {
+    /// 提案一覧を表示
+    List {
+        /// status で絞り込み（pending/approved/rejected/postponed）
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 指定 id の提案詳細を表示
+    Show {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 提案を採用（DB status を approved に更新 → 次 ops 実行で反映）
+    Approve { id: i64 },
+    /// 提案を却下
+    Reject { id: i64 },
+    /// 提案を先送り（3 日後にリマインダー）
+    Postpone { id: i64 },
 }
 
 #[tokio::main]
@@ -106,8 +137,94 @@ async fn main() -> Result<()> {
         Commands::Current => cmd_current()?,
         Commands::Serve { port, config_dir } => cmd_serve(port, config_dir.as_deref()).await?,
         Commands::Task { id, start, done } => cmd_task(id, start, done)?,
+        Commands::PromptEvolution { action } => cmd_prompt_evolution(action)?,
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// Prompt Evolution CLI (Phase 2: structured / AI-friendly CLI)
+// ============================================================================
+
+fn cmd_prompt_evolution(action: PromptEvolutionAction) -> Result<()> {
+    let server_config = load_server_config(None)?;
+    let db = db::Db::open(&server_config.db_path)?;
+
+    match action {
+        PromptEvolutionAction::List { status, limit, json } => {
+            let items = db.list_prompt_evolution_proposals(status.as_deref(), limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if items.is_empty() {
+                println!("(no proposals)");
+            } else {
+                for p in &items {
+                    println!(
+                        "#{:<4} [{}] repo={} score={:.1} created={}",
+                        p.id, p.status, p.repo_key, p.best_score, p.created_at
+                    );
+                }
+                println!("\n({} proposals)", items.len());
+            }
+        }
+        PromptEvolutionAction::Show { id, json } => {
+            let proposal = db
+                .get_prompt_evolution_proposal(id)?
+                .ok_or_else(|| anyhow::anyhow!("proposal #{id} not found"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&proposal)?);
+            } else {
+                println!("id:         #{}", proposal.id);
+                println!("repo:       {}", proposal.repo_key);
+                println!("status:     {}", proposal.status);
+                println!("score:      {:.1}", proposal.best_score);
+                println!("created:    {}", proposal.created_at);
+                if let Some(ref d) = proposal.decided_at {
+                    println!("decided:    {d}");
+                }
+                if let Some(ref r) = proposal.reminded_at {
+                    println!("reminded:   {r}");
+                }
+                if let Some(ref r) = proposal.best_rationale {
+                    println!("\n--- rationale ---\n{r}");
+                }
+                if let Some(ref r) = proposal.score_rationale {
+                    println!("\n--- score_rationale ---\n{r}");
+                }
+                println!("\n--- best_prompt ---\n{}", proposal.best_prompt);
+            }
+        }
+        PromptEvolutionAction::Approve { id } => {
+            ensure_pending_or_postponed(&db, id)?;
+            db.update_prompt_evolution_status(id, "approved")?;
+            println!("proposal #{id} → approved (次 ops 実行から新 prompt が反映されます)");
+        }
+        PromptEvolutionAction::Reject { id } => {
+            ensure_pending_or_postponed(&db, id)?;
+            db.update_prompt_evolution_status(id, "rejected")?;
+            println!("proposal #{id} → rejected");
+        }
+        PromptEvolutionAction::Postpone { id } => {
+            ensure_pending_or_postponed(&db, id)?;
+            db.postpone_prompt_evolution_proposal(id)?;
+            println!("proposal #{id} → postponed (3 日後に再通知)");
+        }
+    }
+    Ok(())
+}
+
+/// 既に approved/rejected 済みの提案に対する再操作を弾く（Slack ハンドラと同じガード）。
+fn ensure_pending_or_postponed(db: &db::Db, id: i64) -> Result<()> {
+    let p = db
+        .get_prompt_evolution_proposal(id)?
+        .ok_or_else(|| anyhow::anyhow!("proposal #{id} not found"))?;
+    if p.status == "approved" || p.status == "rejected" {
+        anyhow::bail!(
+            "proposal #{id} is already {}, cannot modify",
+            p.status
+        );
+    }
     Ok(())
 }
 
