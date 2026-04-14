@@ -3,6 +3,7 @@
 > context.md のスナップショットを1行に圧縮して蓄積。直近30件を保持。
 > 超過分は .claude/context-archive.md に退避（VCS で参照可能）。
 
+- [04/10 22:53, end] C03BM9QNX5L  ここのチャンネル自動で対応できていないよ
 - [04/10 16:25, end] jj git pull
 - [04/10 16:22, end] jj git pull
 - [04/10 16:20, end] jj git pull
@@ -32,4 +33,3 @@
 - [04/02 17:18, end] 共有 crate 統合 + Phase 0-1 MCP 移行（CLI 廃止 + resolve_tools + McpConfigBuilder）
 - [04/02 14:24, end] 0c
 - [04/02 14:24, end] 0c
-- [04/02 14:23, end] jj git pull
