@@ -127,6 +127,7 @@ async fn execute_job(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<(
         "weekly_pm_review" => run_weekly_pm_review(job, ctx).await,
         "self_improvement" => run_self_improvement(job, ctx).await,
         "context_rot_scan" => run_context_rot_scan(job, ctx).await,
+        "prompt_evolution" => run_prompt_evolution(job, ctx).await,
         other => {
             tracing::warn!("Unknown job type: {}", other);
             Ok(())
@@ -1656,6 +1657,156 @@ async fn run_context_rot_scan(
     }
 
     tracing::info!("context_rot_scan: {} alerts sent", alerts.len());
+    Ok(())
+}
+
+// ============================================================================
+// Prompt Evolution (Phase 2 Step 1 — notify only, no auto-apply)
+// ============================================================================
+
+async fn run_prompt_evolution(job: &ScheduledJob, ctx: &mut SchedulerContext) -> Result<()> {
+    // 通知先が未設定ならジョブ自体を skip（事故防止）
+    let notify_user = match std::env::var("PROMPT_EVOLUTION_NOTIFY_USER") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::info!(
+                "prompt_evolution: PROMPT_EVOLUTION_NOTIFY_USER not set, skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    let min_score: f64 = std::env::var("PROMPT_EVOLUTION_MIN_SCORE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(70.0);
+    let min_samples: usize = std::env::var("PROMPT_EVOLUTION_MIN_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let sample_limit: usize = std::env::var("PROMPT_EVOLUTION_SAMPLE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-opus-4-5-20251001".to_string());
+
+    // LLM クライアントを build（AnthropicClient::from_env で OAuth / API Key 自動判定）
+    let anthropic_client = match claude_auth::AnthropicClient::from_env() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            tracing::warn!(
+                "prompt_evolution: AnthropicClient::from_env failed ({e:#}); skipping"
+            );
+            return Ok(());
+        }
+    };
+    let llm = claude_auth::AnthropicLlmClient::new(anthropic_client);
+
+    let mut notified = 0;
+    for (_idx, repo) in ctx.repos_config.get_all_ops_entries() {
+        let repo_key = &repo.key;
+
+        // 7 日以内に提案済みなら重複通知を避けて skip
+        if let Ok(Some(last)) = ctx.db.get_last_prompt_evolution_proposal(repo_key) {
+            if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&last.created_at) {
+                let days = (Utc::now() - created.with_timezone(&Utc)).num_days();
+                if days < 7 {
+                    tracing::info!(
+                        "prompt_evolution: {} already has a proposal from {} days ago, skip",
+                        repo_key,
+                        days
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // sample 取得（最低件数未満なら skip）
+        let raw_samples = ctx
+            .db
+            .get_recent_ops_samples_for_evolution(repo_key, sample_limit)
+            .unwrap_or_default();
+        if raw_samples.len() < min_samples {
+            tracing::info!(
+                "prompt_evolution: {} has {} samples (need {}), skip",
+                repo_key,
+                raw_samples.len(),
+                min_samples
+            );
+            continue;
+        }
+
+        let samples: Vec<super::prompt_evolution::ExecutionSample> = raw_samples
+            .into_iter()
+            .map(|(request, outcome)| super::prompt_evolution::ExecutionSample {
+                request,
+                outcome,
+                failure_summary: String::new(),
+            })
+            .collect();
+
+        // job.prompt_template を「現 system_prompt」として扱う。運用上 repos.toml に記載しておく。
+        let current_prompt = job.prompt_template.as_str();
+        let result = match super::prompt_evolution::run_evolution(
+            &llm,
+            &model,
+            current_prompt,
+            &samples,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "prompt_evolution: run_evolution failed for {repo_key}: {e:#}"
+                );
+                continue;
+            }
+        };
+
+        let best = result.best();
+        if best.score < min_score {
+            tracing::info!(
+                "prompt_evolution: {} best score {:.1} < {:.1}, skip",
+                repo_key,
+                best.score,
+                min_score
+            );
+            continue;
+        }
+
+        let candidates_json = serde_json::to_string(&result.candidates).unwrap_or_default();
+        let insert_result = ctx.db.insert_prompt_evolution_proposal(
+            repo_key,
+            &best.prompt,
+            best.score,
+            Some(&best.rationale),
+            Some(&best.score_rationale),
+            &candidates_json,
+        );
+        match insert_result {
+            Ok(id) => tracing::info!(
+                "prompt_evolution: saved proposal id={id} for {repo_key} (score {:.1})",
+                best.score
+            ),
+            Err(e) => {
+                tracing::warn!("prompt_evolution: DB insert failed for {repo_key}: {e}");
+                continue;
+            }
+        }
+
+        let msg = super::prompt_evolution::format_evolution_proposal(&result, repo_key);
+        if let Err(e) = ctx.slack.post_message(&notify_user, &msg).await {
+            tracing::warn!("prompt_evolution: DM failed: {e}");
+        } else {
+            notified += 1;
+        }
+    }
+
+    tracing::info!(
+        "prompt_evolution: finished ({notified} proposals sent to {notify_user})"
+    );
     Ok(())
 }
 

@@ -318,6 +318,24 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_context_rot_notifications_repo
                 ON context_rot_notifications(repo_key, notified_at);
+
+            CREATE TABLE IF NOT EXISTS prompt_evolution_proposals (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_key         TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                best_prompt      TEXT NOT NULL,
+                best_score       REAL NOT NULL,
+                best_rationale   TEXT,
+                score_rationale  TEXT,
+                candidates_json  TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                decided_at       TEXT,
+                reminded_at      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_evolution_proposals_repo
+                ON prompt_evolution_proposals(repo_key, created_at);
+            CREATE INDEX IF NOT EXISTS idx_prompt_evolution_proposals_status
+                ON prompt_evolution_proposals(status);
             ",
         )?;
 
@@ -1259,6 +1277,80 @@ impl Db {
         Ok(())
     }
 
+    // ── Prompt Evolution Proposals ─────────────────
+
+    /// prompt_evolution 提案を保存。
+    #[allow(dead_code)]
+    pub fn insert_prompt_evolution_proposal(
+        &self,
+        repo_key: &str,
+        best_prompt: &str,
+        best_score: f64,
+        best_rationale: Option<&str>,
+        score_rationale: Option<&str>,
+        candidates_json: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO prompt_evolution_proposals \
+             (repo_key, best_prompt, best_score, best_rationale, score_rationale, candidates_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                repo_key,
+                best_prompt,
+                best_score,
+                best_rationale,
+                score_rationale,
+                candidates_json
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// repo_key の直近提案（status 問わず）を取得。重複通知の抑制に使う。
+    #[allow(dead_code)]
+    pub fn get_last_prompt_evolution_proposal(
+        &self,
+        repo_key: &str,
+    ) -> Result<Option<PromptEvolutionProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_key, created_at, best_prompt, best_score, \
+                    best_rationale, score_rationale, candidates_json, \
+                    status, decided_at, reminded_at \
+             FROM prompt_evolution_proposals \
+             WHERE repo_key = ?1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let result = stmt.query_row(params![repo_key], row_to_prompt_evolution_proposal);
+        match result {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// repo_key の直近 N 件の (message_text, outcome) を取得。
+    /// prompt_evolution の ExecutionSample 構築に使う。
+    /// updated_at が同一値の場合は id 降順で tie-break（テスト再現性のため）。
+    #[allow(dead_code)]
+    pub fn get_recent_ops_samples_for_evolution(
+        &self,
+        repo_key: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT message_text, outcome FROM ops_queue \
+             WHERE repo_key = ?1 AND outcome IS NOT NULL \
+             ORDER BY updated_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![repo_key, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// フォローアップが必要な ops アイテムを取得
     /// （done + resolved_at IS NULL + done_at が指定時間以上経過）
     pub fn get_ops_needing_followup(&self) -> Result<Vec<OpsFollowupItem>> {
@@ -1636,6 +1728,40 @@ pub struct FailurePattern {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
+pub struct PromptEvolutionProposal {
+    pub id: i64,
+    pub repo_key: String,
+    pub created_at: String,
+    pub best_prompt: String,
+    pub best_score: f64,
+    pub best_rationale: Option<String>,
+    pub score_rationale: Option<String>,
+    pub candidates_json: String,
+    pub status: String,
+    pub decided_at: Option<String>,
+    pub reminded_at: Option<String>,
+}
+
+fn row_to_prompt_evolution_proposal(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PromptEvolutionProposal> {
+    Ok(PromptEvolutionProposal {
+        id: row.get(0)?,
+        repo_key: row.get(1)?,
+        created_at: row.get(2)?,
+        best_prompt: row.get(3)?,
+        best_score: row.get(4)?,
+        best_rationale: row.get(5)?,
+        score_rationale: row.get(6)?,
+        candidates_json: row.get(7)?,
+        status: row.get(8)?,
+        decided_at: row.get(9)?,
+        reminded_at: row.get(10)?,
+    })
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OpsFollowupItem {
     pub id: i64,
     pub channel: String,
@@ -1745,5 +1871,76 @@ mod tests {
         let outcomes2 = db.get_recent_ops_outcomes_by_repo("repo2", 10).unwrap();
         assert_eq!(outcomes2.len(), 1);
         assert_eq!(outcomes2[0], "no_action");
+    }
+
+    #[test]
+    fn test_prompt_evolution_proposal_insert_and_get_last() {
+        let db = test_db();
+        let id1 = db
+            .insert_prompt_evolution_proposal(
+                "repo1",
+                "candidate prompt A",
+                82.5,
+                Some("clearer instructions"),
+                Some("covers most failures"),
+                r#"[{"prompt":"A","rationale":"r"}]"#,
+            )
+            .unwrap();
+        assert!(id1 > 0);
+
+        let id2 = db
+            .insert_prompt_evolution_proposal(
+                "repo1",
+                "candidate prompt B",
+                91.0,
+                None,
+                None,
+                "[]",
+            )
+            .unwrap();
+        assert!(id2 > id1);
+
+        let last = db.get_last_prompt_evolution_proposal("repo1").unwrap().unwrap();
+        assert_eq!(last.id, id2);
+        assert_eq!(last.best_prompt, "candidate prompt B");
+        assert!((last.best_score - 91.0).abs() < 0.001);
+        assert_eq!(last.status, "pending");
+
+        // 別 repo は独立
+        let none = db.get_last_prompt_evolution_proposal("repo2").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_get_recent_ops_samples_for_evolution() {
+        let db = test_db();
+        let conn = db.conn.lock().unwrap();
+        for (i, (repo, outcome, msg)) in [
+            ("r1", "completed", "do X"),
+            ("r1", "failed", "do Y"),
+            ("r1", "no_action", "noise"),
+            ("r2", "completed", "other"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO ops_queue (channel, message_ts, repo_key, message_text, status, outcome) \
+                 VALUES ('ch', ?1, ?2, ?3, 'done', ?4)",
+                params![format!("ts_{}", i), repo, msg, outcome],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let samples = db.get_recent_ops_samples_for_evolution("r1", 10).unwrap();
+        assert_eq!(samples.len(), 3);
+        // 降順 (最後に insert したものが先頭)
+        assert_eq!(samples[0].0, "noise");
+        assert_eq!(samples[0].1, "no_action");
+
+        let samples2 = db.get_recent_ops_samples_for_evolution("r2", 10).unwrap();
+        assert_eq!(samples2.len(), 1);
+        assert_eq!(samples2[0].0, "other");
     }
 }
