@@ -74,8 +74,15 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
                 match slack.fetch_message(channel, message_ts).await {
                     Ok(msg) => {
                         let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or_default();
-                        tracing::info!("⚡ ops manual trigger in {}: {}", channel, crate::claude::truncate_str(text, 100));
-                        enqueue_ops_request(state, &msg, channel, message_ts, None, text, repo_entry, "ready")?;
+                        // スレッドコンテキスト判定:
+                        //  - msg.thread_ts 明示 → それを使う（返信 or 親の明示）
+                        //  - reply_count > 0 → 親メッセージなので ts 自体が thread_ts
+                        //  - いずれも無ければ単独メッセージ
+                        let msg_thread_ts = msg.get("thread_ts").and_then(|t| t.as_str());
+                        let has_replies = msg.get("reply_count").and_then(|c| c.as_u64()).unwrap_or(0) > 0;
+                        let thread_ts = msg_thread_ts.or_else(|| if has_replies { Some(message_ts.as_str()) } else { None });
+                        tracing::info!("⚡ ops manual trigger in {} (thread_ts={:?}): {}", channel, thread_ts, crate::claude::truncate_str(text, 100));
+                        enqueue_ops_request(state, &msg, channel, message_ts, thread_ts, text, repo_entry, "ready")?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch message for ⚡ ops: {}", e);

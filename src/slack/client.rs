@@ -271,6 +271,13 @@ impl SlackClient {
 
     /// conversations.history でメッセージ1件を取得（リアクション→ops 用）
     pub async fn fetch_message(&self, channel: &str, ts: &str) -> Result<serde_json::Value> {
+        // conversations.history は thread reply を返さない（top-level のみ）。
+        // そのため `latest=ts` で query すると、thread reply の ts を渡した場合に
+        // **スレッド親が返ってきてしまう**（要求 ts ≠ 返り ts の誤マッチ）。
+        //
+        // 対策: history でヒットした msg の ts が要求 ts と不一致なら、
+        // それは thread reply の可能性が高い。親の thread_ts として conversations.replies
+        // を叩いて、要求 ts に一致する reply を探す。
         let resp = self
             .client
             .get("https://slack.com/api/conversations.history")
@@ -288,11 +295,28 @@ impl SlackClient {
         let data: serde_json::Value = resp.json().await.context("Failed to parse response")?;
         Self::check_ok(&data, "conversations.history")?;
 
-        data.get("messages")
+        let msg = data.get("messages")
             .and_then(|m| m.as_array())
             .and_then(|a| a.first())
             .cloned()
-            .context("No message found")
+            .context("No message found")?;
+
+        // ts 一致チェック: history が正しく要求 ts のメッセージを返したか
+        let returned_ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or_default();
+        if returned_ts == ts {
+            return Ok(msg);
+        }
+
+        // 不一致 → thread reply の可能性。返ってきた親の thread で replies を叩く
+        tracing::debug!(
+            "fetch_message: history returned ts={} for requested ts={}; treating as thread reply lookup",
+            returned_ts, ts
+        );
+        let replies = self.fetch_thread_replies(channel, returned_ts).await?;
+        replies
+            .into_iter()
+            .find(|r| r.get("ts").and_then(|t| t.as_str()) == Some(ts))
+            .with_context(|| format!("Message ts={} not found in thread {}", ts, returned_ts))
     }
 
     /// conversations.replies でスレッドの全メッセージを取得
