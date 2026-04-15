@@ -844,7 +844,10 @@ pub(crate) const ANTHROPIC_STATUS_HINT: &str = "\n_Anthropic 稼働状況: https
 
 /// エラーメッセージを見て適切なヒント文字列を返す。
 ///
-/// - 529 / overloaded / 5xx → journalctl ヒント + status.claude.com
+/// - Anthropic API 起因の 529 / overloaded / 5xx → journalctl ヒント + status.claude.com
+/// - Bedrock / AWS 起因エラーは Anthropic status ページ対象外なので除外
+///   (Claude Code 2.1.111 の同種修正: "Fixed 429 rate-limit errors on
+///   Bedrock/Vertex/Foundry referencing status.claude.com")
 /// - それ以外 → journalctl ヒントのみ
 ///
 /// Slack 通知で「Anthropic 側の障害か／自分の設定ミスか」を即判別できるようにする。
@@ -855,7 +858,15 @@ pub(crate) fn error_log_hint_for(err_msg: &str) -> String {
         || err_msg.contains("HTTP 500")
         || err_msg.contains("HTTP 502")
         || err_msg.contains("HTTP 503");
-    if upstream_issue {
+    // Bedrock / AWS 由来のエラーは status.claude.com の対象外
+    let is_aws_provider = err_msg.contains("Bedrock")
+        || err_msg.contains("aws_sdk")
+        || err_msg.contains("aws-sdk")
+        || err_msg.contains("ThrottlingException")
+        || err_msg.contains("ServiceUnavailableException")
+        || err_msg.contains("InternalServerException")
+        || err_msg.contains("ModelTimeoutException");
+    if upstream_issue && !is_aws_provider {
         format!("{ERROR_LOG_HINT}{ANTHROPIC_STATUS_HINT}")
     } else {
         ERROR_LOG_HINT.to_string()
@@ -979,6 +990,33 @@ mod error_hint_tests {
     #[test]
     fn generic_execution_error_has_no_status_link() {
         let hint = error_log_hint_for("command failed: exit 1");
+        assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn bedrock_converse_failure_does_not_reference_anthropic_status() {
+        // 実際の Bedrock エラーは "Bedrock Converse failed: {e}" 形式
+        let hint = error_log_hint_for(
+            "Bedrock Converse failed: service error: ThrottlingException"
+        );
+        assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn bedrock_internal_server_error_does_not_reference_anthropic_status() {
+        // InternalServerException を含んでいても Bedrock なので status.claude.com 不要
+        let hint = error_log_hint_for(
+            "InternalServerException: Encountered an internal error from aws_sdk_bedrockruntime"
+        );
+        assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn bedrock_service_unavailable_does_not_reference_anthropic_status() {
+        let hint = error_log_hint_for(
+            "Bedrock Converse failed: ServiceUnavailableException - model is overloaded"
+        );
+        // "overloaded" を含むが Bedrock なので status.claude.com は出さない
         assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
     }
 }
