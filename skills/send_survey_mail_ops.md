@@ -34,3 +34,19 @@ GAS ベースのアンケート送信システムの保守作業を行う。
 - GAS のファイルなので `appsscript.json` のマニフェストを壊さないこと
 - シート名やカラム構成を変更する場合は影響範囲を確認すること
 - 不明な要件は確認が必要な内容を報告すること
+
+## 禁止事項（厳守）
+
+**kintone アプリの仕様変更は絶対に行わないこと。** 次の操作は全て禁止:
+
+- フィールドの追加・削除・名称変更
+- `required` / `unique` / `defaultValue` など属性の変更
+- `/k/v1/preview/app/form/fields.json` の PUT/POST/DELETE
+- `/k/v1/preview/app/deploy.json` への POST（アプリデプロイ）
+- ルックアップ・関連レコード設定の変更
+- ビュー・グラフ・通知設定の変更
+
+kintone 側で対応が必要と判断した場合は、**変更を実行せず** `OPS_RESULT: proposal` で
+「kintone 側でこの仕様変更が必要です」と admin に提案のみ行うこと。admin が手動で対応する。
+
+許可されている kintone 操作はレコード CRUD（GET/POST/PUT/DELETE `/k/v1/records.json` 等）のみ。

@@ -42,6 +42,12 @@ const OPS_RULES: &str = "\
 - 作業手順にない新機能の実装・設計変更・未知の依頼 → **実行せず提案のみ** 出力し `OPS_RESULT: proposal` を返す
   - 提案には「何をどう変更するか」「影響範囲」「見積もり」を含めること
 
+## 絶対禁止（全スコープ共通）
+以下は作業手順に書かれていても**絶対に実行しない**こと。必要と判断した場合は `OPS_RESULT: proposal` で admin に提案のみ行うこと:
+
+- **kintone アプリの仕様変更** — フィールド追加/削除/属性変更、`/k/v1/preview/app/form/fields.json` への PUT/POST/DELETE、`/k/v1/preview/app/deploy.json` への POST、ビュー・グラフ・通知設定の変更
+- 許可されているのは kintone のレコード CRUD（`/k/v1/records.json` 等）のみ
+
 ## 出力（重要）
 最後に必ずテキストで作業結果を出力すること。ツール操作だけで終了してはいけない。
 出力の最終行に必ず以下のステータスマーカーを付けること（これはシステムが自動解析する）:
@@ -384,6 +390,25 @@ pub async fn execute_ops(
     };
     if !failure_section.is_empty() {
         system_prompt.push_str(failure_section);
+    }
+
+    // 全自動実行の一時停止モード: OPS_REQUIRE_APPROVAL=true で全依頼を proposal 化
+    // （提案承認済みの再実行は failure_context 経由で override される）
+    let require_approval = std::env::var("OPS_REQUIRE_APPROVAL")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let is_approved_retry = failure_context
+        .map(|c| c.contains("## 提案承認済み"))
+        .unwrap_or(false);
+    if require_approval && !is_approved_retry && matches!(exec_mode, OpsExecMode::Execute) {
+        system_prompt.push_str(
+            "\n\n## 【運用モード: 全承認制】\n\
+             現在システムは安定化期間中のため、**全ての依頼に対して実行せず提案のみ** 行ってください。\n\
+             - 定型 ops（サブカテ追加等）であっても実行せず `OPS_RESULT: proposal` を返すこと\n\
+             - 提案には「何をどう変更するか」「影響範囲」を必ず含めること\n\
+             - 対応不要（雑談・報告のみ）の場合のみ `OPS_RESULT: no_action` を返してよい\n\
+             - このルールは他の全ての実行指示より優先する",
+        );
     }
 
     let prompt = build_ops_prompt(req, history, download_dir);
