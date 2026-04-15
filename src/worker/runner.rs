@@ -371,7 +371,8 @@ impl Worker {
             let output_summary = truncate_for_slack(&result.output, 3700);
             let msg = format!(
                 ":x: 実行失敗\n```\n{}\n```{}",
-                output_summary, ERROR_LOG_HINT
+                output_summary,
+                error_log_hint_for(&result.output)
             );
             self.slack
                 .reply_thread(channel, thread_ts, &msg)
@@ -523,7 +524,11 @@ impl Worker {
                 self.db
                     .set_error(task.id, truncate_for_slack(&exec_result.output, 500))?;
                 let output_summary = truncate_for_slack(&exec_result.output, 3700);
-                let msg = format!(":x: 実行失敗\n```\n{}\n```{}", output_summary, ERROR_LOG_HINT);
+                let msg = format!(
+                    ":x: 実行失敗\n```\n{}\n```{}",
+                    output_summary,
+                    error_log_hint_for(&exec_result.output)
+                );
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
                     .await
@@ -531,9 +536,14 @@ impl Worker {
                 workspace::remove(ws).await.ok();
             }
             Err(e) => {
+                let err_str = format!("{e:#}");
                 self.db
                     .set_error(task.id, &format!("Execution error: {}", e))?;
-                let msg = format!(":x: 実行エラー\n```\n{}\n```{}", e, ERROR_LOG_HINT);
+                let msg = format!(
+                    ":x: 実行エラー\n```\n{}\n```{}",
+                    e,
+                    error_log_hint_for(&err_str)
+                );
                 self.slack
                     .reply_thread(channel, thread_ts, &msg)
                     .await
@@ -829,6 +839,29 @@ pub(crate) fn count_business_days(from: DateTime<Utc>, to: DateTime<Utc>) -> i64
 
 pub(crate) const ERROR_LOG_HINT: &str = "\n_詳細ログ: `journalctl --user -u sdtab-ambient-task-agent -n 50`_";
 
+/// Anthropic 上流障害（529 / overloaded）が疑われる場合に追加する Status ページ参照。
+pub(crate) const ANTHROPIC_STATUS_HINT: &str = "\n_Anthropic 稼働状況: https://status.claude.com_";
+
+/// エラーメッセージを見て適切なヒント文字列を返す。
+///
+/// - 529 / overloaded / 5xx → journalctl ヒント + status.claude.com
+/// - それ以外 → journalctl ヒントのみ
+///
+/// Slack 通知で「Anthropic 側の障害か／自分の設定ミスか」を即判別できるようにする。
+pub(crate) fn error_log_hint_for(err_msg: &str) -> String {
+    let upstream_issue = err_msg.contains("529")
+        || err_msg.contains("overloaded")
+        || err_msg.contains("Overloaded")
+        || err_msg.contains("HTTP 500")
+        || err_msg.contains("HTTP 502")
+        || err_msg.contains("HTTP 503");
+    if upstream_issue {
+        format!("{ERROR_LOG_HINT}{ANTHROPIC_STATUS_HINT}")
+    } else {
+        ERROR_LOG_HINT.to_string()
+    }
+}
+
 // ============================================================================
 // Block Kit ヘルパー（conversing / manual）
 // ============================================================================
@@ -904,5 +937,48 @@ impl Drop for RunningTaskGuard {
             Ok(mut set) => { set.remove(&self.task_id); }
             Err(poisoned) => { poisoned.into_inner().remove(&self.task_id); }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_hint_tests {
+    use super::{error_log_hint_for, ANTHROPIC_STATUS_HINT};
+
+    #[test]
+    fn overloaded_529_includes_status_link() {
+        let hint = error_log_hint_for("Anthropic API error: HTTP 529 Overloaded");
+        assert!(hint.contains(ANTHROPIC_STATUS_HINT));
+        assert!(hint.contains("journalctl"));
+    }
+
+    #[test]
+    fn lowercase_overloaded_includes_status_link() {
+        let hint = error_log_hint_for("stream error: overloaded_error - overloaded");
+        assert!(hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn http_500_includes_status_link() {
+        let hint = error_log_hint_for("HTTP 500 Internal Server Error");
+        assert!(hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn http_503_includes_status_link() {
+        let hint = error_log_hint_for("HTTP 503 Service Unavailable");
+        assert!(hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+
+    #[test]
+    fn non_upstream_error_has_no_status_link() {
+        let hint = error_log_hint_for("ConnectionError: DNS lookup failed");
+        assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
+        assert!(hint.contains("journalctl"));
+    }
+
+    #[test]
+    fn generic_execution_error_has_no_status_link() {
+        let hint = error_log_hint_for("command failed: exit 1");
+        assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
     }
 }

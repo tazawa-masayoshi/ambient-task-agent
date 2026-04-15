@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::db::CodingTask;
 
-use super::runner::{Worker, truncate_for_slack, ERROR_LOG_HINT};
+use super::runner::{Worker, error_log_hint_for, truncate_for_slack};
 use super::{context, executor, workspace};
 
 impl Worker {
@@ -98,7 +98,9 @@ impl Worker {
 
                     let msg = format!(
                         ":x: CI 失敗（リトライ上限 {} 回に到達）\n```\n{}\n```{}",
-                        max_retry, summary, ERROR_LOG_HINT
+                        max_retry,
+                        summary,
+                        error_log_hint_for(&summary)
                     );
                     self.slack
                         .reply_thread(channel, thread_ts, &msg)
@@ -245,7 +247,11 @@ impl Worker {
                     .reply_thread(
                         channel,
                         thread_ts,
-                        &format!(":x: CI 修正の実行中にエラー: {}{}", e, ERROR_LOG_HINT),
+                        &format!(
+                            ":x: CI 修正の実行中にエラー: {}{}",
+                            e,
+                            error_log_hint_for(&e.to_string())
+                        ),
                     )
                     .await
                     .ok();

@@ -306,6 +306,7 @@ slack_channel = "C..."
 - `AGENT_BACKEND` — `bedrock` 指定時のみ Bedrock
 - `AWS_REGION` / `AWS_DEFAULT_REGION` — Bedrock 用
 - `BEDROCK_MODEL` — デフォルト `us.anthropic.claude-sonnet-4-20250514-v1:0`
+- `ENABLE_PROMPT_CACHING_1H` — `1` / `true` で system block の prompt cache TTL を 5 分 → 1 時間に延長（Anthropic API / OAuth ルートのみ、Bedrock 未対応）。conversing で人間応答待ちが数時間にわたる用途では cache hit 率が向上し、再課金が減る
 
 ロード順: プロセス環境 → `~/.credentials/common.env` → `~/.credentials/ambient-task-agent.env` → `./.env`
 

@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::db::OpsQueueItem;
 use crate::repo_config::RepoEntry;
 
-use super::{context, ops::OpsExecMode, runner::{Worker, count_business_days, extract_slack_summary, ERROR_LOG_HINT}};
+use super::{context, ops::OpsExecMode, runner::{Worker, count_business_days, error_log_hint_for, extract_slack_summary}};
 
 /// `prepare_ops_execution` の戻り値。実行結果 + メタ情報を保持する。
 struct OpsExecutionResult {
@@ -110,7 +110,11 @@ impl Worker {
             Err(e) => {
                 let err_str = e.to_string();
                 if item.retry_count + 1 >= max_retries {
-                    let detail = format!(":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}", err_str, ERROR_LOG_HINT);
+                    let detail = format!(
+                        ":x: *ops 失敗*（リトライ上限到達）\n```\n{}\n```{}",
+                        err_str,
+                        error_log_hint_for(&err_str)
+                    );
                     slack.reply_thread(&item.channel, reply_ts, &detail).await.ok();
                     self.db.mark_ops_failed(item.id, &err_str)?;
                     self.db.set_ops_outcome(item.id, "error").ok();
