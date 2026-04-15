@@ -80,7 +80,7 @@ async fn handle_reaction_added(state: &Arc<AppState>, event: &ReactionAddedEvent
                         //  - いずれも無ければ単独メッセージ
                         let msg_thread_ts = msg.get("thread_ts").and_then(|t| t.as_str());
                         let has_replies = msg.get("reply_count").and_then(|c| c.as_u64()).unwrap_or(0) > 0;
-                        let thread_ts = msg_thread_ts.or_else(|| if has_replies { Some(message_ts.as_str()) } else { None });
+                        let thread_ts = msg_thread_ts.or(if has_replies { Some(message_ts.as_str()) } else { None });
                         tracing::info!("⚡ ops manual trigger in {} (thread_ts={:?}): {}", channel, thread_ts, crate::claude::truncate_str(text, 100));
                         enqueue_ops_request(state, &msg, channel, message_ts, thread_ts, text, repo_entry, "ready")?;
                     }

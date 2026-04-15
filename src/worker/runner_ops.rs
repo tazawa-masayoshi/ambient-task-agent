@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::db::OpsQueueItem;
 use crate::repo_config::RepoEntry;
 
-use super::{context, ops::OpsExecMode, runner::{Worker, count_business_days, error_log_hint_for, extract_slack_summary}};
+use super::{context, ops::OpsExecMode, runner::{Worker, count_business_days, error_log_hint_for, extract_ops_sections}};
 
 /// `prepare_ops_execution` の戻り値。実行結果 + メタ情報を保持する。
 struct OpsExecutionResult {
@@ -492,9 +492,10 @@ impl Worker {
         } else {
             "ops 完了"
         };
-        // 作業結果まとめセクションがあればそこだけ抽出
-        let slack_output = extract_slack_summary(output);
-        let truncated = crate::claude::truncate_str(slack_output, 2800);
+        // ## サマリ / ## 詳細 の 2 セクション構造で抽出
+        let sections = extract_ops_sections(output);
+        let truncated = crate::claude::truncate_str(&sections.summary, 2800);
+        let has_details = sections.details.is_some();
         // outcome を記録（self_improvement 分析用）
         let is_failed = last_line.contains("OPS_RESULT: failed");
         let outcome = if is_no_action {
@@ -544,37 +545,46 @@ impl Worker {
             self.db.resolve_ops(item.id).ok();
         } else if is_proposal {
             // 提案モード: 実行せず提案のみ → 承認ボタンで実行可能
+            let mut action_buttons = vec![
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f680} 承認して実行" },
+                    "style": "primary",
+                    "action_id": "ops_approve_proposal",
+                    "value": item.id.to_string()
+                }),
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                    "action_id": "ops_escalate",
+                    "value": item.id.to_string()
+                }),
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{274c} 却下" },
+                    "action_id": "ops_resolve",
+                    "value": item.id.to_string()
+                }),
+            ];
+            if has_details {
+                action_buttons.push(serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f50d} 詳細を見る" },
+                    "action_id": "ops_show_details",
+                    "value": item.id.to_string()
+                }));
+            }
             let blocks = serde_json::json!([
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
+                        "text": format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated)
                     }
                 },
                 {
                     "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": { "type": "plain_text", "text": "\u{1f680} 承認して実行" },
-                            "style": "primary",
-                            "action_id": "ops_approve_proposal",
-                            "value": item.id.to_string()
-                        },
-                        {
-                            "type": "button",
-                            "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
-                            "action_id": "ops_escalate",
-                            "value": item.id.to_string()
-                        },
-                        {
-                            "type": "button",
-                            "text": { "type": "plain_text", "text": "\u{274c} 却下" },
-                            "action_id": "ops_resolve",
-                            "value": item.id.to_string()
-                        }
-                    ]
+                    "elements": action_buttons
                 }
             ]);
             let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);
@@ -588,31 +598,40 @@ impl Worker {
                 }
             }
         } else {
+            let mut action_buttons = vec![
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{2705} 完了" },
+                    "style": "primary",
+                    "action_id": "ops_resolve",
+                    "value": item.id.to_string()
+                }),
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
+                    "action_id": "ops_escalate",
+                    "value": item.id.to_string()
+                }),
+            ];
+            if has_details {
+                action_buttons.push(serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f50d} 詳細を見る" },
+                    "action_id": "ops_show_details",
+                    "value": item.id.to_string()
+                }));
+            }
             let blocks = serde_json::json!([
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": format!("{} *{}*{}\n```\n{}\n```", emoji, label, admin_mention, truncated)
+                        "text": format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated)
                     }
                 },
                 {
                     "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": { "type": "plain_text", "text": "\u{2705} 完了" },
-                            "style": "primary",
-                            "action_id": "ops_resolve",
-                            "value": item.id.to_string()
-                        },
-                        {
-                            "type": "button",
-                            "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
-                            "action_id": "ops_escalate",
-                            "value": item.id.to_string()
-                        }
-                    ]
+                    "elements": action_buttons
                 }
             ]);
             let fallback = format!("{} *{}*{}\n{}", emoji, label, admin_mention, truncated);

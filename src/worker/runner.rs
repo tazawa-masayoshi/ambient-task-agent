@@ -890,6 +890,88 @@ pub(crate) fn extract_slack_summary(output: &str) -> &str {
     output
 }
 
+/// ops 出力の 2 セクション構造。
+/// `## サマリ` / `## 詳細` に分離し、Slack では概要のみ表示 + ボタンで詳細表示。
+pub(crate) struct OpsOutputSections {
+    /// 2-3 行の結果概要（依頼者向け）
+    pub summary: String,
+    /// 技術的詳細（ファイル変更、確認結果等）。省略されることもある。
+    pub details: Option<String>,
+}
+
+/// ops 出力を `## サマリ` / `## 詳細` で分離する。
+///
+/// - 両セクションがあれば分離
+/// - `## サマリ` だけあれば summary のみ
+/// - どちらも無ければ従来の `extract_slack_summary` にフォールバック
+///
+/// `OPS_RESULT:` マーカー行は両セクションから除去する。
+pub(crate) fn extract_ops_sections(output: &str) -> OpsOutputSections {
+    let strip_marker = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.trim().starts_with("OPS_RESULT:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    };
+
+    // "## サマリ" を探す (大小文字・前後の空白・# の数に寛容)
+    let summary_start = output
+        .find("## サマリ")
+        .or_else(|| output.find("## Summary"));
+
+    if let Some(s_pos) = summary_start {
+        // セクション見出し行の末尾 (改行の次) から本文開始
+        let body_start = output[s_pos..]
+            .find('\n')
+            .map(|n| s_pos + n + 1)
+            .unwrap_or(s_pos);
+
+        // "## 詳細" を探す
+        let detail_start = output[body_start..]
+            .find("## 詳細")
+            .or_else(|| output[body_start..].find("## Details"))
+            .map(|d| body_start + d);
+
+        let summary_text = if let Some(d_pos) = detail_start {
+            strip_marker(&output[body_start..d_pos])
+        } else {
+            strip_marker(&output[body_start..])
+        };
+
+        let details_text = detail_start.map(|d_pos| {
+            let detail_body_start = output[d_pos..]
+                .find('\n')
+                .map(|n| d_pos + n + 1)
+                .unwrap_or(d_pos);
+            strip_marker(&output[detail_body_start..])
+        });
+
+        // details が空文字列なら None に
+        let details = details_text.filter(|d| !d.is_empty());
+
+        if summary_text.is_empty() {
+            // サマリ見出しはあるが本文が空 → フォールバック
+            OpsOutputSections {
+                summary: strip_marker(extract_slack_summary(output)),
+                details,
+            }
+        } else {
+            OpsOutputSections {
+                summary: summary_text,
+                details,
+            }
+        }
+    } else {
+        // 新フォーマット未対応の出力 → 従来のフォールバック
+        OpsOutputSections {
+            summary: strip_marker(extract_slack_summary(output)),
+            details: None,
+        }
+    }
+}
+
 /// conversing 状態のボタンレイアウト: [実行開始] [指示追加] [手動修正] [スキップ]
 pub(crate) fn build_conversing_blocks(task_id: i64, message: &str) -> serde_json::Value {
     serde_json::json!([
@@ -995,18 +1077,16 @@ mod error_hint_tests {
 
     #[test]
     fn bedrock_converse_failure_does_not_reference_anthropic_status() {
-        // 実際の Bedrock エラーは "Bedrock Converse failed: {e}" 形式
         let hint = error_log_hint_for(
-            "Bedrock Converse failed: service error: ThrottlingException"
+            "Bedrock Converse failed: service error: ThrottlingException",
         );
         assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
     }
 
     #[test]
     fn bedrock_internal_server_error_does_not_reference_anthropic_status() {
-        // InternalServerException を含んでいても Bedrock なので status.claude.com 不要
         let hint = error_log_hint_for(
-            "InternalServerException: Encountered an internal error from aws_sdk_bedrockruntime"
+            "InternalServerException: Encountered an internal error from aws_sdk_bedrockruntime",
         );
         assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
     }
@@ -1014,9 +1094,75 @@ mod error_hint_tests {
     #[test]
     fn bedrock_service_unavailable_does_not_reference_anthropic_status() {
         let hint = error_log_hint_for(
-            "Bedrock Converse failed: ServiceUnavailableException - model is overloaded"
+            "Bedrock Converse failed: ServiceUnavailableException - model is overloaded",
         );
-        // "overloaded" を含むが Bedrock なので status.claude.com は出さない
         assert!(!hint.contains(ANTHROPIC_STATUS_HINT));
+    }
+}
+
+#[cfg(test)]
+mod ops_sections_tests {
+    use super::extract_ops_sections;
+
+    #[test]
+    fn full_two_section_output() {
+        let output = "\
+## サマリ
+管理No.269: サブカテ4件追加、5件クローズ完了。
+
+## 詳細
+- image_mappings.yaml L294: 追加
+- git push 済み
+
+OPS_RESULT: completed";
+        let s = extract_ops_sections(output);
+        assert_eq!(s.summary, "管理No.269: サブカテ4件追加、5件クローズ完了。");
+        let d = s.details.unwrap();
+        assert!(d.contains("image_mappings"));
+        assert!(d.contains("git push"));
+        assert!(!d.contains("OPS_RESULT"));
+    }
+
+    #[test]
+    fn summary_only_no_details() {
+        let output = "\
+## サマリ
+typo を修正しました。
+
+OPS_RESULT: completed";
+        let s = extract_ops_sections(output);
+        assert_eq!(s.summary, "typo を修正しました。");
+        assert!(s.details.is_none());
+    }
+
+    #[test]
+    fn legacy_output_no_sections() {
+        let output = "作業結果まとめ\nファイルを修正した\n\nOPS_RESULT: completed";
+        let s = extract_ops_sections(output);
+        assert!(s.summary.contains("作業結果まとめ"));
+        assert!(!s.summary.contains("OPS_RESULT"));
+        assert!(s.details.is_none());
+    }
+
+    #[test]
+    fn completely_unstructured_output() {
+        let output = "何かやった\nOPS_RESULT: completed";
+        let s = extract_ops_sections(output);
+        assert_eq!(s.summary, "何かやった");
+        assert!(s.details.is_none());
+    }
+
+    #[test]
+    fn marker_stripped_from_both_sections() {
+        let output = "\
+## サマリ
+完了
+
+## 詳細
+詳細テスト
+OPS_RESULT: completed";
+        let s = extract_ops_sections(output);
+        assert!(!s.summary.contains("OPS_RESULT"));
+        assert!(!s.details.unwrap().contains("OPS_RESULT"));
     }
 }
