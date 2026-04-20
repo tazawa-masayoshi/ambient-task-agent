@@ -209,6 +209,9 @@ async fn process_action(
         return process_ops_approve_proposal(state, action_value, channel, message_ts, thread_ts)
             .await;
     }
+    if action_id == "ops_revise_proposal" {
+        return process_ops_revise_proposal(state, action_value, channel, message_ts).await;
+    }
     // Inception モード 承認ゲート（admin 権限チェック）
     if action_id.starts_with("ops_inception_") {
         if let Some(admin) = state.repos_config.defaults.ops_admin_user.as_deref() {
@@ -815,6 +818,75 @@ async fn process_ops_inception_revise(
         )
         .await
         .ok();
+
+    Ok(())
+}
+
+/// ops_revise_proposal ボタンの処理: 提案に追加指示を出す。
+/// admin のスレッド返信は通常無視されるが、このボタン押下で 1 回だけ例外的に拾う。
+async fn process_ops_revise_proposal(
+    state: &AppState,
+    action_value: &str,
+    channel: &str,
+    message_ts: Option<&str>,
+) -> anyhow::Result<()> {
+    let ops_id: i64 = action_value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid ops_id: {}", action_value))?;
+
+    let item = match state.db.get_ops_item(ops_id)? {
+        Some(i) => i,
+        None => {
+            tracing::warn!("revise proposal: ops item {} not found", ops_id);
+            return Ok(());
+        }
+    };
+
+    // IDOR 防止: 押下チャンネルと ops アイテムのチャンネル一致を検証
+    if item.channel != channel {
+        tracing::warn!(
+            "revise proposal: channel mismatch ops_id={} (expected={}, got={})",
+            ops_id,
+            item.channel,
+            channel
+        );
+        return Ok(());
+    }
+
+    // 追加指示待ちマーク（次回の admin スレッド返信を 1 回だけ拾う）
+    state.db.mark_ops_awaiting_revision(ops_id)?;
+
+    // ボタン群を更新して「修正指示待ち」状態に差し替え
+    if let Some(msg_ts) = message_ts {
+        let slack = state.slack_client();
+        let updated_blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":speech_balloon: *追加指示待ち — スレッドに補足内容を返信してください*"
+                }
+            }
+        ]);
+        slack
+            .update_blocks(channel, msg_ts, &updated_blocks, "追加指示待ち...")
+            .await
+            .ok();
+    }
+
+    let reply_ts = item.thread_ts.as_deref().unwrap_or(&item.message_ts);
+    let slack = state.slack_client();
+    slack
+        .reply_thread(
+            channel,
+            reply_ts,
+            ":speech_balloon: 追加指示をこのスレッドに返信してください。内容を踏まえて提案をやり直します。",
+        )
+        .await
+        .ok();
+
+    // 提案は一旦解決扱いにしておく（新しい admin 返信で新規 ops_item が enqueue される）
+    state.db.resolve_ops(ops_id).ok();
 
     Ok(())
 }

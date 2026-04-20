@@ -432,9 +432,26 @@ async fn handle_message(state: &Arc<AppState>, event: &serde_json::Value) -> Res
                 );
                 enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
             }
-            (Some(_), false) => {
-                // admin のスレッド返信 → 無視（admin が自分で対応報告するケース）
-                tracing::debug!("ops thread reply from admin in {}: ignored", channel);
+            (Some(tts), false) => {
+                // admin のスレッド返信。
+                // 通常は無視（admin が自分で対応報告するケースをスパムにしないため）だが、
+                // 💬 追加指示ボタンが押されていた場合のみ例外的に 1 回だけ拾う。
+                match state.db.consume_ops_awaiting_revision(channel, tts) {
+                    Ok(Some(prev_ops_id)) => {
+                        tracing::info!(
+                            "ops admin thread reply consumed as revision for ops {}: {}",
+                            prev_ops_id,
+                            crate::claude::truncate_str(text, 100),
+                        );
+                        enqueue_ops_request(state, event, channel, message_ts, Some(tts), text, repo_entry, "ready")?;
+                    }
+                    Ok(None) => {
+                        tracing::debug!("ops thread reply from admin in {}: ignored", channel);
+                    }
+                    Err(e) => {
+                        tracing::warn!("consume_ops_awaiting_revision failed: {}", e);
+                    }
+                }
             }
         }
         return Ok(());

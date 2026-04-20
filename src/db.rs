@@ -371,6 +371,7 @@ impl Db {
             ("reminder_count", "INTEGER DEFAULT 0"),
             ("notify_ts", "TEXT"),
             ("outcome", "TEXT"),  // completed / no_action / error
+            ("awaiting_revision_since", "TEXT"),  // 💬 追加指示ボタン押下時刻。NULL=通常、値あり=admin 返信待ち
         ])?;
 
         // v7: 既存ステータスのマイグレーション（レガシーステータスが残っている場合のみ）
@@ -1158,6 +1159,46 @@ impl Db {
             params![id],
         )?;
         Ok(())
+    }
+
+    /// 💬 追加指示ボタン押下: admin の次のスレッド返信を例外的に拾うためのマーク。
+    /// 同一 channel+thread_ts に対する以降のスレッド返信を 1 回だけ admin 無視ルールの例外にする。
+    pub fn mark_ops_awaiting_revision(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ops_queue SET awaiting_revision_since = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// channel+thread_ts に、追加指示待ち (awaiting_revision_since) の ops アイテムがあれば返す。
+    /// 該当があればそのまま同じ行の awaiting_revision_since を NULL に戻す（消費は 1 回のみ）。
+    pub fn consume_ops_awaiting_revision(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+    ) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM ops_queue \
+                 WHERE channel = ?1 AND (thread_ts = ?2 OR message_ts = ?2) \
+                   AND awaiting_revision_since IS NOT NULL \
+                 ORDER BY id DESC LIMIT 1",
+                params![channel, thread_ts],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(ops_id) = id {
+            conn.execute(
+                "UPDATE ops_queue SET awaiting_revision_since = NULL, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![ops_id],
+            )?;
+        }
+        Ok(id)
     }
 
     /// ops アイテムの実行結果を記録（completed / no_action / error）

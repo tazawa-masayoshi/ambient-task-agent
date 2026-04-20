@@ -555,6 +555,12 @@ impl Worker {
                 }),
                 serde_json::json!({
                     "type": "button",
+                    "text": { "type": "plain_text", "text": "\u{1f4ac} 追加指示" },
+                    "action_id": "ops_revise_proposal",
+                    "value": item.id.to_string()
+                }),
+                serde_json::json!({
+                    "type": "button",
                     "text": { "type": "plain_text", "text": "\u{1f4cb} タスク化" },
                     "action_id": "ops_escalate",
                     "value": item.id.to_string()
