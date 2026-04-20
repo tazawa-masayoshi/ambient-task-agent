@@ -55,7 +55,7 @@ ops_request_examples = [
 - 須佐之男命
 - 月読命""",
 ]
-ops_skills = [".claude/commands/ops.md"]
+ops_skills = [".claude/skills/ops/SKILL.md"]
 ops_download_dir = "images"
 
 [[repo]]
@@ -75,7 +75,7 @@ ops_request_examples = [
     "新規サブカテゴリ追加お願いします。管理No.351 大和の神 → 天照大御神/須佐之男命/月読命",
     "アンケート設定変更 No.123 テンプレートURL更新",
 ]
-ops_skills = [".claude/commands/ops.md"]
+ops_skills = [".claude/skills/ops/SKILL.md"]
 ops_download_dir = "downloads"
 
 [[repo]]
@@ -93,7 +93,7 @@ ops_request_examples = [
     "favorite_pop に新しい取材タイプ「東の極」を追加してください",
     "新規取材 yaml 追加 — 管理No.269 ジャグリーグ取材",
 ]
-ops_skills = [".claude/commands/ops.md"]
+ops_skills = [".claude/skills/ops/SKILL.md"]
 
 [[repo]]
 key = "amu-tazawa-scripts"
