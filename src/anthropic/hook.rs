@@ -61,6 +61,19 @@ impl ToolHook for AmbientHookHandler {
             };
         }
 
+        // --no-verify による hook bypass（グローバル CLAUDE.md で禁止）
+        // pre-commit / pre-push hook を明示的にスキップする操作。lint/test/security
+        // チェックをすり抜けるので本番ではリスクが高い。hook 失敗なら原因を直す。
+        if command.contains("--no-verify")
+            && (command.contains("git commit") || command.contains("git push"))
+        {
+            return HookDecision::Deny {
+                reason: "--no-verify による hook bypass は禁止です。\
+                    hook が失敗したら原因を直してから再実行してください"
+                    .into(),
+            };
+        }
+
         // ~/.credentials/ への書き込み・削除
         if (command.contains("rm ") || command.contains(" > ") || command.contains(" >> "))
             && command.contains(".credentials")
@@ -131,6 +144,19 @@ mod tests {
     fn allows_hard_reset_to_known_commit() {
         // We only block the specific HEAD~ / origin patterns. SHA-based reset is allowed.
         allow("git reset --hard abc123");
+    }
+
+    #[test]
+    fn denies_no_verify_bypass() {
+        deny("git commit --no-verify -m 'wip'");
+        deny("git push --no-verify origin feature/x");
+        deny("git commit -m 'hotfix' --no-verify");
+    }
+
+    #[test]
+    fn allows_no_verify_outside_git_context() {
+        // --no-verify が git push/commit 以外に現れても deny しない
+        allow("some-other-tool --no-verify input.txt");
     }
 
     #[test]
