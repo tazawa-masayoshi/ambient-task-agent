@@ -96,6 +96,20 @@ ops_request_examples = [
 ops_skills = [".claude/skills/ops/SKILL.md"]
 
 [[repo]]
+key = "movie_management_system"
+github = "dmm-com/amu-movie-management-system"
+ops_channel = "C091LHAREB0"
+ops_monitor = true
+ops_description = "動画管理システムのシリーズ追加・管理。P-Town (DMM管理画面) の series_id ドロップダウンに新しい選択肢を追加し、data/series.yaml を更新する"
+ops_request_examples = [
+    "@channel おつかれさまです。新規のシリーズ追加を1つお願いいたします。\n・パチンコ・パチスロ 日本統一 3\n急ぎではありませんので、お手すきの際で構いません。よろしくお願いいたします。",
+    "シリーズ追加: 日本統一 3 を追加してください",
+    "新しいシリーズの value を確認して追加",
+    "シリーズ一覧を見せて",
+]
+ops_skills = [".claude/skills/ops/SKILL.md"]
+
+[[repo]]
 key = "amu-tazawa-scripts"
 github = "amu-tazawa-scripts"
 ops_channel = "amz_企画チーム_自動化支援"
